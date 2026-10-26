@@ -1071,7 +1071,8 @@ function render(st) {
   $("k-open").className = "v " + cls(dayOpen);
   const nDay = (st.positions || []).filter(isDay).length;
   $("k-open-s").innerHTML = `${nDay} position${nDay === 1 ? "" : "s"}` + (o.mixed ? ` · mixed <span class="${cls(o.mixed)}">${money(o.mixed)}</span>` : "") + " · futures not visible";
-  $("k-carry").textContent = money(o.carried);
+  $("k-carry").textContent = o.carried == null ? "hidden" : money(o.carried);
+  $("k-carry").className = o.carried == null ? "v mut" : "v";
   $("k-trades").innerHTML = `${st.summary.trades_closed}`;
   $("k-trades-s").innerHTML = `<span class="pos">${st.summary.wins} W</span> · <span class="neg">${st.summary.losses} L</span>`
     + (st.summary.unknown ? ` · <span class="amb">${st.summary.unknown} unknown</span>` : "");

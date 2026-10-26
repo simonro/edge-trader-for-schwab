@@ -23,11 +23,13 @@ from starlette.concurrency import run_in_threadpool
 from . import __version__
 from .poller import Poller
 from .trading import Trader
+from .view import private_view
 
 STATIC = Path(__file__).resolve().parent / "static"
 PORT = int(os.environ.get("COMPANION_PORT", "8770"))
 ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
 DEMO = os.environ.get("EDGE_TRADER_DEMO") == "1"     # synthetic data, no Schwab, no orders
+PRIVATE = os.environ.get("EDGE_TRADER_PRIVATE") == "1"   # hide carried positions and account value
 
 
 class DemoPoller:
@@ -126,7 +128,10 @@ UPDATE: dict = {"info": None}        # a newer release on GitHub, if any (notify
 
 @app.get("/api/state")
 def state():
-    return JSONResponse({**poller.snapshot(), "ui": UI, "update": UPDATE["info"], "demo": DEMO,
+    snap = poller.snapshot()
+    if PRIVATE:
+        snap = private_view(snap)
+    return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO,
                          "version": __version__}, headers={"Cache-Control": "no-store"})
 
 

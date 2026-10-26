@@ -66,6 +66,29 @@ def _order_row(p: PendingOrder, quotes: dict) -> dict:
     }
 
 
+def private_view(snap: dict) -> dict:
+    """The dashboard state without carried positions, for screen recordings (`--private`).
+
+    Display only: order actions read the poller directly. Positions held from before today
+    (CARRIED, and MIXED ones carried and traded today) are dropped with their working orders,
+    action log and tickets; the carried / mixed open P&L and the account value are blanked.
+    """
+    positions = snap.get("positions") or []
+    hidden = {p["symbol"] for p in positions if p.get("held") != "INTRADAY"}
+    out = {**snap, "private": True,
+           "positions": [p for p in positions if p["symbol"] not in hidden],
+           "orders": [o for o in snap.get("orders") or [] if o.get("symbol") not in hidden],
+           "brackets": [b for b in snap.get("brackets") or [] if b.get("symbol") not in hidden],
+           "action_log": {s: v for s, v in (snap.get("action_log") or {}).items() if s not in hidden},
+           "balances": {}}
+    summary = snap.get("summary")
+    if summary and summary.get("open_pnl"):
+        o = summary["open_pnl"]
+        out["summary"] = {**summary, "open_pnl": {**o, "mixed": 0.0, "carried": None,
+                                                   "positions": len(out["positions"])}}
+    return out
+
+
 def _held(p: dict, side: str, qty: float) -> str:
     prev = _f(p.get("previousSessionLongQuantity") if side == "LONG" else p.get("previousSessionShortQuantity"))
     if prev < 1e-9:
