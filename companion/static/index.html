@@ -1250,7 +1250,8 @@ async function submitTicket() {
                 expected_limit: p.limit, expected_qty: p.qty, expected_target: p.target,
                 split: p.split, t1_r: p.t1_r, expected_qty1: p.qty1 || 0, expected_target1: p.target1,
                 stop_type: req.stop_type, trail_unit: req.trail_unit, trail_value: req.trail_value,
-                trail_basis: req.trail_basis, expected_trail_offset: p.trail ? p.trail.offset : null};
+                trail_basis: req.trail_basis, expected_trail_offset: p.trail ? p.trail.offset : null,
+                expected_trail_start: p.trail ? p.trail_start : null};
   try {
     const r = await post("/api/ticket/submit", body);
     if (r.ok) {

@@ -6,8 +6,10 @@ Safety that is engineering, not coaching:
 - Intent is written to SQLite BEFORE sending; a ticket id can be sent once (double clicks).
 - One submission at a time. A timeout or 5xx is UNKNOWN, never retried: new submissions wait
   until the poller finds the order or the user marks it resolved after checking thinkorswim.
-- Fresh quote at click time; if the entry limit moved more than PRICE_MOVE_LIMIT from what the
-  ticket showed, nothing is sent and the ticket shows the new numbers.
+- Fresh quote at click time. Within LOCK_R of the risk per share (at least LOCK_MIN_TICKS), the
+  click sends exactly what the ticket showed (shares, limit, stop, targets); if price moved further
+  against the entry, or the stop is now at or through the bid / ask, nothing is sent and the
+  ticket shows the new numbers.
 - Regular hours only (stops do not trigger outside them).
 """
 from __future__ import annotations
@@ -19,15 +21,24 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal
 
 from . import schwab
-from .bracket import Plan, bracket_order, fmt, plan
+from .bracket import MIN_STOP_TICKS, Plan, bracket_order, fmt, plan, tick
 from .orders import LIVE, TERMINAL, PendingOrder, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
 
 log = logging.getLogger("companion.trading")
 
-PRICE_MOVE_LIMIT = Decimal("0.003")       # 0.3% between the ticket preview and the click
+LOCK_R = Decimal("0.1")       # the click keeps the displayed plan while price moved <= 0.1R against it
+LOCK_MIN_TICKS = 2            # ...and at least 2 ticks (2 cents above $1)
 RISK_CHOICES = (250, 375, 500, 750)      # defaults; the user edits them with the gear on the ticket
+
+
+def _dec(v) -> Decimal | None:
+    try:
+        d = Decimal(str(v))
+    except Exception:
+        return None
+    return d if d.is_finite() else None
 
 
 def _mask_account(obj):
@@ -218,14 +229,14 @@ class Trader:
         self._quote_cache[sym] = (time.monotonic(), out)
         return out
 
-    def make_plan(self, req: dict, fresh: bool = False) -> Plan:
-        q = self.quote(req["symbol"], max_age=0 if fresh else 1.0)
+    def make_plan(self, req: dict, fresh: bool = False, q: dict | None = None, limit_override=None) -> Plan:
+        q = q or self.quote(req["symbol"], max_age=0 if fresh else 1.0)
         return plan(req["symbol"], req["side"], req["stop"], req["risk"], req.get("r", 2),
                     q.get("bid"), q.get("ask"), split=req.get("split") or 0, t1_r=req.get("t1_r") or 1,
                     entry=req.get("entry") or "cross", target_price=req.get("target_price"),
                     t1_price=req.get("t1_price"), stop_type=req.get("stop_type") or "fixed",
                     trail_unit=req.get("trail_unit") or "R", trail_value=req.get("trail_value") or 1,
-                    trail_basis=req.get("trail_basis") or "MARK")
+                    trail_basis=req.get("trail_basis") or "MARK", limit_override=limit_override)
 
     # ---- actions -----------------------------------------------------------
 
@@ -292,48 +303,84 @@ class Trader:
             return False
 
     def _submit_locked(self, req: dict, ticket_id: str, state: dict) -> dict:
-        p = self.make_plan(req, fresh=True)
+        try:
+            exp_limit = Decimal(str(req.get("expected_limit") or 0))
+            exp_target = Decimal(str(req.get("expected_target") or 0))
+            exp_qty = int(req.get("expected_qty") or 0)
+        except Exception:
+            exp_limit = exp_target = Decimal(0)
+            exp_qty = 0
+        if not (exp_limit.is_finite() and exp_target.is_finite()) or exp_limit <= 0 or exp_target <= 0 or exp_qty <= 0:
+            return {"ok": False, "error": "ticket is missing the displayed plan; review and click again"}
+        q = self.quote(req["symbol"], max_age=0)
+        now = self.make_plan(req, q=q)          # what a fresh ticket would show
+        if not now.limit:
+            return {"ok": False, "error": "; ".join(now.errors) or "no valid quote", "plan": now.as_dict()}
+        # The plan the ticket showed, re-sized at the displayed entry price and checked against the
+        # current bid / ask (the stop must still be on the right side of the market).
+        p = self.make_plan(req, q=q, limit_override=exp_limit)
         if not p.ok:
-            return {"ok": False, "error": "; ".join(p.errors), "plan": p.as_dict()}
+            return {"ok": False, "error": "; ".join(p.errors), "plan": now.as_dict()}
         blocked = self._blocked(p.symbol, self._ensure())
         if blocked:
             return {"ok": False, "error": blocked["error"]}
-        exp_limit = Decimal(str(req.get("expected_limit") or 0))
-        exp_target = Decimal(str(req.get("expected_target") or 0))
-        exp_qty = int(req.get("expected_qty") or 0)
-        if exp_limit <= 0 or exp_target <= 0 or exp_qty <= 0:
-            return {"ok": False, "error": "ticket is missing the displayed plan; review and click again"}
-        if abs(p.limit - exp_limit) / exp_limit > PRICE_MOVE_LIMIT:
-            return {"ok": False, "error": f"Price moved: entry limit is now {fmt(p.limit)} (ticket showed "
-                    f"{fmt(exp_limit)}). Review and click again.", "plan": p.as_dict()}
+        # Lock: a move against the entry up to 0.1R keeps the displayed plan. For a limit entry the
+        # displayed limit caps the fill, so the risk cannot exceed what the ticket showed, and a
+        # move in favour fills at a better price. A Mkt entry has no price cap: the lock only
+        # refuses when the quote already sits more than 0.1R worse, and the fill can slip beyond.
+        lock = max(LOCK_R * p.per_share, LOCK_MIN_TICKS * tick(exp_limit))
+        long = p.side == "LONG"
+        against = now.limit - exp_limit if long else exp_limit - now.limit
+        if against > lock:
+            return {"ok": False, "error": f"Price moved: entry is now {fmt(now.limit)} (ticket showed "
+                    f"{fmt(exp_limit)}, more than {fmt(lock)} away). Review and click again.",
+                    "plan": now.as_dict()}
+        # After a move in favour the fill comes nearer the stop: keep the minimum stop distance
+        # from where it would fill now, not from the displayed price.
+        room = now.limit - p.stop if long else p.stop - now.limit
+        if room < MIN_STOP_TICKS * tick(now.limit):
+            return {"ok": False, "error": f"Price is within {MIN_STOP_TICKS} ticks of the stop {fmt(p.stop)}. "
+                    "Review and click again.", "plan": now.as_dict()}
         if p.qty < exp_qty:
             return {"ok": False, "error": f"Size changed to {p.qty} shares (ticket showed {exp_qty}). "
-                    "Review and click again.", "plan": p.as_dict()}
+                    "Review and click again.", "plan": now.as_dict()}
         # Never more shares than displayed; recompute the numbers for that size.
         p.qty = exp_qty
         p.planned_risk = p.per_share * p.qty
         p.notional = p.limit * p.qty
-        if abs(p.target - exp_target) / exp_target > PRICE_MOVE_LIMIT:
-            return {"ok": False, "error": f"Target moved to {fmt(p.target)}. Review and click again.",
-                    "plan": p.as_dict()}
+        # Same entry price and inputs give the same targets; a difference means the ticket's
+        # inputs changed after it was displayed.
+        if p.target != exp_target:
+            return {"ok": False, "error": f"Target is now {fmt(p.target)} (ticket showed {fmt(exp_target)}). "
+                    "Review and click again.", "plan": now.as_dict()}
         if p.two_targets:
             p.qty1 = int((p.qty * p.split).to_integral_value(rounding=ROUND_FLOOR))
             exp_qty1 = int(req.get("expected_qty1") or 0)
             exp_t1 = Decimal(str(req.get("expected_target1") or 0))
             if p.qty1 != exp_qty1 or p.qty1 < 1 or p.qty - p.qty1 < 1:
                 return {"ok": False, "error": f"Split changed to {p.qty1}/{p.qty - p.qty1} shares. "
-                        "Review and click again.", "plan": p.as_dict()}
-            if exp_t1 <= 0 or abs(p.target1 - exp_t1) / exp_t1 > PRICE_MOVE_LIMIT:
-                return {"ok": False, "error": f"Target 1 moved to {fmt(p.target1)}. Review and click again.",
-                        "plan": p.as_dict()}
+                        "Review and click again.", "plan": now.as_dict()}
+            if p.target1 != exp_t1:
+                return {"ok": False, "error": f"Target 1 is now {fmt(p.target1)}. Review and click again.",
+                        "plan": now.as_dict()}
         elif req.get("expected_qty1"):
             return {"ok": False, "error": "Ticket showed two targets but the plan has one. Review.",
-                    "plan": p.as_dict()}
+                    "plan": now.as_dict()}
         if p.trail:
             exp_off = Decimal(str(req.get("expected_trail_offset") or 0))
-            if exp_off <= 0 or abs(p.trail["offset"] - exp_off) / exp_off > PRICE_MOVE_LIMIT:
-                return {"ok": False, "error": f"Trail distance moved to {p.trail['offset']}. Review and click again.",
-                        "plan": p.as_dict()}
+            if p.trail["offset"] != exp_off:
+                return {"ok": False, "error": f"Trail distance is now {p.trail['offset']}. Review and click again.",
+                        "plan": now.as_dict()}
+            # The trail starts from Schwab's basis price after the fill: a wider spread or a moved
+            # basis can start it further away than the ticket showed with the same distance.
+            exp_start = _dec(req.get("expected_trail_start"))
+            if exp_start is None or exp_start <= 0:
+                return {"ok": False, "error": "Ticket is missing the trail start: reload the page.",
+                        "plan": now.as_dict()}
+            looser = exp_start - p.trail_start if long else p.trail_start - exp_start
+            if looser > lock:
+                return {"ok": False, "error": f"The trail would now start at {fmt(p.trail_start)} (ticket showed "
+                        f"{fmt(exp_start)}). Review and click again.", "plan": now.as_dict()}
         elif req.get("expected_trail_offset"):
             return {"ok": False, "error": "Ticket showed a trailing stop but the plan has a fixed one. Review.",
                     "plan": p.as_dict()}

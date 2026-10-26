@@ -162,12 +162,15 @@ def stop_leg(spec, legs: list[dict], duration: str = "DAY") -> dict:
 
 def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r=1, entry="cross",
          target_price=None, t1_price=None, stop_type="fixed", trail_unit="R", trail_value=1,
-         trail_basis="MARK") -> Plan:
+         trail_basis="MARK", limit_override=None) -> Plan:
     """Size a bracket. Never moves the user's prices: an off-tick stop or target is an error, not rounded.
 
     split > 0 makes it a two-target entry: floor(qty x split) shares exit at target 1, the runner
     at the target, each half with its own stop (Schwab OT2OCO). Each target is at R x the risk
     per share, or at the price the user typed (target_price / t1_price), which wins over R.
+
+    limit_override sizes from a given entry price instead of the quote (the click locks the price
+    the ticket showed); the stop is still checked against the current bid / ask.
     """
     side = side.upper()
     p = Plan(symbol.upper().strip(), side, Decimal(str(stop)), Decimal(str(risk)),
@@ -204,7 +207,13 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
         return p
 
     long = side == "LONG"
-    if p.entry in ("cross", "market"):
+    if limit_override is not None:
+        lo = _price(limit_override)
+        if lo is None or not lo.is_finite() or lo <= 0 or _to_tick(lo, ROUND_HALF_UP) != lo:
+            p.errors.append("the locked entry price is not a valid price")
+            return p
+        p.limit = lo
+    elif p.entry in ("cross", "market"):
         p.limit = (_to_tick(p.ask * (1 + ENTRY_OFFSET), ROUND_CEILING) if long
                    else _to_tick(p.bid * (1 - ENTRY_OFFSET), ROUND_FLOOR))
     elif p.entry == "mid":   # rounded toward a fill

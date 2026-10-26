@@ -93,6 +93,99 @@ def test_stale_ticket_is_refused(trader):
     assert not r["ok"] and "Price moved" in r["error"] and trader._client.placed == []
 
 
+def _quote(monkeypatch, trader, bid, ask):
+    monkeypatch.setattr(trader, "quote", lambda sym, max_age=1.0: {"bid": bid, "ask": ask})
+
+
+def test_small_move_against_sends_the_locked_plan(trader, monkeypatch):
+    # Ticket showed 170 @ 338.94 (1R = 2.94). The ask ticked up 18c (under 0.1R = 0.294): a fresh
+    # plan would size 160 shares, but the click sends exactly what was displayed.
+    _quote(monkeypatch, trader, 338.88, 338.95)
+    r = trader.submit(req())
+    assert r["ok"], r
+    (order,) = trader._client.placed
+    assert order["orderLegCollection"][0]["quantity"] == 170 and order["price"] == "338.94"
+    oco = order["childOrderStrategies"][0]["childOrderStrategies"]
+    assert {c.get("price") or c.get("stopPrice") for c in oco} == {"344.82", "336.00"}
+
+
+def test_move_against_beyond_the_lock_is_refused(trader, monkeypatch):
+    _quote(monkeypatch, trader, 339.20, 339.30)          # entry would now be 339.47: 0.53 > 0.294
+    r = trader.submit(req())
+    assert not r["ok"] and "Price moved" in r["error"] and trader._client.placed == []
+    assert r["plan"]["limit"] == "339.47"                # the ticket gets the new numbers
+
+
+def test_move_in_favour_keeps_the_displayed_plan(trader, monkeypatch):
+    _quote(monkeypatch, trader, 337.40, 337.50)          # long, price dropped: fills at or below 338.94
+    r = trader.submit(req())
+    assert r["ok"] and trader._client.placed[0]["price"] == "338.94"
+
+
+def test_stop_through_the_market_is_refused(trader, monkeypatch):
+    _quote(monkeypatch, trader, 335.90, 336.05)          # bid is now below the 336.00 stop
+    r = trader.submit(req())
+    assert not r["ok"] and "below the bid" in r["error"] and trader._client.placed == []
+
+
+def test_market_entry_keeps_the_displayed_size(trader, monkeypatch):
+    _quote(monkeypatch, trader, 338.88, 338.95)
+    r = trader.submit(req(entry="market"))
+    assert r["ok"]
+    (order,) = trader._client.placed
+    assert order["orderType"] == "MARKET" and order["orderLegCollection"][0]["quantity"] == 170
+
+
+def test_lock_is_at_least_two_ticks(trader, monkeypatch):
+    # Ticket showed 500 @ 338.94 at the ask with a 10c stop: 0.1R = 0.01, so the 2-tick floor applies.
+    base = dict(entry="ask", stop="338.84", risk=50, expected_qty=500, expected_target="339.14")
+    _quote(monkeypatch, trader, 338.90, 338.96)          # ask 2c higher: inside the floor
+    r = trader.submit(req(**base))
+    assert r["ok"], r
+    assert trader._client.placed[0]["price"] == "338.94"
+    _quote(monkeypatch, trader, 338.90, 338.97)          # 3c higher: refused
+    r = trader.submit(req(ticket_id="ticket-0002", **base))
+    assert not r["ok"] and "Price moved" in r["error"]
+
+
+def test_short_lock_mirrors_the_long(trader, monkeypatch):
+    # Short 202 @ 338.53 (bid 338.70 less 0.05%), stop 341.00: 1R = 2.47, lock 0.247.
+    base = dict(side="SHORT", stop="341.00", expected_limit="338.53", expected_qty=202,
+                expected_target="333.59")
+    _quote(monkeypatch, trader, 338.50, 338.57)          # entry would be 338.33: 0.20 against
+    r = trader.submit(req(**base))
+    assert r["ok"], r
+    assert trader._client.placed[0]["price"] == "338.53"
+    _quote(monkeypatch, trader, 338.40, 338.47)          # 338.23: 0.30 against, refused
+    r = trader.submit(req(ticket_id="ticket-0002", **base))
+    assert not r["ok"] and "Price moved" in r["error"]
+
+
+def test_favourable_move_into_the_stop_is_refused(trader, monkeypatch):
+    # Long at the bid 338.70, stop 336.00. Price fell to one tick above the stop.
+    base = dict(entry="bid", expected_limit="338.70", expected_qty=185, expected_target="344.10")
+    _quote(monkeypatch, trader, 336.01, 336.02)
+    r = trader.submit(req(**base))
+    assert not r["ok"] and "within 2 ticks of the stop" in r["error"] and trader._client.placed == []
+
+
+def test_trail_that_would_start_looser_is_refused(trader, monkeypatch):
+    # Auto B/E (1R trail on the mark) showed a start of 335.80 at 338.70 / 338.77.
+    base = dict(stop_type="autobe", expected_trail_offset=2.94, expected_trail_start="335.80")
+    r = trader.submit(req(**base))
+    assert r["ok"], r
+    _quote(monkeypatch, trader, 337.50, 338.77)          # spread widened: the mark drops, start 335.20
+    r = trader.submit(req(ticket_id="ticket-0002", **base))
+    assert not r["ok"] and "trail would now start at 335.20" in r["error"]
+    r = trader.submit(req(ticket_id="ticket-0003", stop_type="autobe", expected_trail_offset=2.94))
+    assert not r["ok"] and "reload" in r["error"]
+
+
+def test_changed_target_is_refused(trader):
+    r = trader.submit(req(expected_target="344.80"))
+    assert not r["ok"] and "Target is now 344.82" in r["error"] and trader._client.placed == []
+
+
 def test_fewer_shares_than_fresh_plan_sends_the_displayed_size(trader):
     r = trader.submit(req(expected_qty=100))
     assert r["ok"] and trader._client.placed[0]["orderLegCollection"][0]["quantity"] == 100
@@ -689,7 +782,8 @@ def test_set_target_keeps_the_trailing_stop(trader, monkeypatch):
 
 def test_autobe_ticket_sends_a_trailing_stop_and_checks_its_distance(trader):
     assert "trail" in trader.submit(req(stop_type="autobe"))["error"].lower()     # offset not displayed
-    r = trader.submit(req(ticket_id="ticket-0002", stop_type="autobe", expected_trail_offset=2.94))
+    r = trader.submit(req(ticket_id="ticket-0002", stop_type="autobe", expected_trail_offset=2.94,
+                          expected_trail_start="335.80"))
     assert r["ok"], r
     stop = trader._client.placed[0]["childOrderStrategies"][0]["childOrderStrategies"][1]
     assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceOffset"] == 2.94
