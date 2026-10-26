@@ -17,3 +17,4 @@ venv/
 
 # windows shortcuts
 *.lnk
+node_modules/
