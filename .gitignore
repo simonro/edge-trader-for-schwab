@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# runtime data: SQLite evidence store, logs, tokens, window positions (account data)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# windows shortcuts
+*.lnk

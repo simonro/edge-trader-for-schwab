@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/simonro/edge-trader-for-schwab/discussions
+    about: Setup help, how-to questions and ideas go in Discussions.
+  - name: Report a security problem
+    url: https://github.com/simonro/edge-trader-for-schwab/security/advisories/new
+    about: Report it privately, never in a public issue. See SECURITY.md.

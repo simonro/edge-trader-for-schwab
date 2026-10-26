@@ -1,0 +1,57 @@
+name: Bug report
+description: Something is broken or a number looks wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Do not paste account numbers, API keys, or real statements.**
+        Invented or redacted values are fine.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Dashboard (positions, P&L, orders)
+        - New trade ticket
+        - Position actions (stop, target, trail, partial, close)
+        - Floating windows
+        - Schwab sign-in
+        - Install or startup
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release you downloaded, or the commit if you cloned.
+      placeholder: v1.0.0
+  - type: input
+    id: system
+    attributes:
+      label: System
+      placeholder: Windows 11, Python 3.12, Node 22
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors or logs
+      description: The message in the app, the backend window, or the browser console.
+      render: text
