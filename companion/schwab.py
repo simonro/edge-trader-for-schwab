@@ -15,13 +15,22 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
+
+
+def _fill_from(path: Path) -> None:
+    """Take values from a shared .env wherever ours is unset or empty. .env.example ships
+    `SCHWAB_APP_KEY=` blank, and load_dotenv never overrides a variable that is already set."""
+    for k, v in dotenv_values(path).items():
+        if v and not os.environ.get(k):
+            os.environ[k] = v
+
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 SHARED_ENV = Path(os.path.expanduser(os.environ["SCHWAB_ENV_FILE"])) if os.environ.get("SCHWAB_ENV_FILE") else None
 if SHARED_ENV:
-    load_dotenv(SHARED_ENV)       # keys shared with another app (optional)
+    _fill_from(SHARED_ENV)        # keys shared with another app (optional)
 
 TOKENS_DB = Path(os.path.expanduser(os.environ.get("SCHWAB_TOKENS_DB", "~/.schwabdev/tokens.db")))
 REFRESH_TOKEN_DAYS = 7
