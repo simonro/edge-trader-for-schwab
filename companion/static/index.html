@@ -677,7 +677,9 @@ function stopRow(p, sym, noR) {
   }
   const one = trailStartInfo(p, {unit: "R", value: 1, basis: "MARK"}), half = trailStartInfo(p, {unit: "R", value: 0.5, basis: "MARK"});
   const loose = [one?.looser ? "1R" : null, half?.looser ? "0.5R" : null].filter(Boolean);
-  return `<div class="arow"><div class="al">Stop<small>${p.stop_price != null ? `${px(p.stop_price)} · ${qty(p.stop_qty || 0)}/${qty(p.qty)}` : "none seen"}</small></div>
+  const ab = p.auto_be, abTxt = !ab ? "" : ab.state === "PENDING" ? `auto B/E at ${px(ab.trigger)}`
+    : ab.state === "SENDING" ? "auto B/E sending" : ab.state === "DONE" ? "auto B/E done" : `auto B/E ${ab.state.toLowerCase()}, see log`;
+  return `<div class="arow"><div class="al">Stop<small>${p.stop_price != null ? `${px(p.stop_price)} · ${qty(p.stop_qty || 0)}/${qty(p.qty)}` : "none seen"}${abTxt ? `<br><span class="${ab.state === "FAILED" ? "neg" : ab.state === "PENDING" ? "amb" : ""}">${esc(abTxt)}</span>` : ""}</small></div>
     <div class="ctl">${actionBtn(`be:${sym}`, "Stop to B/E", "be", {symbol: sym}, "", false, "act", kbd("be"))}
       ${actionBtn(`trl1:${sym}`, "Trail 1R", "trail", {symbol: sym, unit: "R", value: 1, basis: "MARK"}, "", noR, "act", kbd("trl1"))}
       ${actionBtn(`trl05:${sym}`, "Trail 0.5R", "trail", {symbol: sym, unit: "R", value: 0.5, basis: "MARK"}, "", noR, "act", kbd("trl05"))}
@@ -1213,9 +1215,9 @@ function renderTicket() {
     const tR = (v, r) => r != null ? `${r.toFixed(2)}R` : "";
     calc.innerHTML = `
       <div class="pr"><span class="mut">${verb} ${qty(p.qty)} ${esc(p.symbol)}, ${ENTRY_TXT[p.entry] || "limit"}</span><span class="num">${p.market ? "~" : ""}${esc(p.limit)}</span></div>
-      ${p.trail ? `<div class="pr"><span class="mut">Stop: ${p.stop_type === "autobe" ? "auto B/E, " : ""}trailing ${p.trail.link === "PERCENT" ? p.trail.offset + "%" : "$" + p.trail.offset.toFixed(2)} from ${p.trail.basis.toLowerCase()} · ${qty(p.qty)}</span><span class="num neg">starts ${esc(p.trail_start)}</span></div>
-        ${p.stop_type === "autobe" ? `<div class="pr"><span class="mut">reaches B/E when price is at</span><span class="num">${px(p.side === "LONG" ? Number(p.limit) + p.trail.offset : Number(p.limit) - p.trail.offset)}</span></div>` : ""}`
+      ${p.trail ? `<div class="pr"><span class="mut">Stop: trailing ${p.trail.link === "PERCENT" ? p.trail.offset + "%" : "$" + p.trail.offset.toFixed(2)} from ${p.trail.basis.toLowerCase()} · ${qty(p.qty)}</span><span class="num neg">starts ${esc(p.trail_start)}</span></div>`
       : `<div class="pr"><span class="mut">Stop (market) ${qty(p.qty)}</span><span class="num neg">${esc(p.stop)}</span></div>`}
+      ${p.be_trigger ? `<div class="pr"><span class="mut">Moves to B/E once, when the app sees the mark at +1R of your fill (checks every 3 s, app must be running)</span><span class="num">~${esc(p.be_trigger)}</span></div>` : ""}
       ${p.qty1 ? `<div class="pr"><span class="mut">Target 1 · ${tR(p.target1, p.target1_r)} · ${qty(p.qty1)}</span><span class="num pos">${esc(p.target1)}</span></div>
         <div class="pr"><span class="mut">Target 2 · ${tR(p.target, p.target_r)} · ${qty(p.qty2)}</span><span class="num pos">${esc(p.target)}</span></div>`
       : `<div class="pr"><span class="mut">Target · ${tR(p.target, p.target_r)} · ${qty(p.qty)}</span><span class="num pos">${esc(p.target)}</span></div>`}

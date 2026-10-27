@@ -10,9 +10,10 @@ Schwab holds the exits, so protection does not depend on the companion noticing 
 
 Planned risk is not a maximum loss: a stop-market can fill past its price on a gap or halt.
 
-The stop can also be a Schwab-held TRAILING_STOP (stop_type "autobe" = trail 1R behind, which starts
-at the original stop and reaches entry at +1R, or "trail" = R / $ / % behind). Shares are still sized
-from the typed stop; a trail wider than the typed stop starts further away, so the plan warns.
+The stop can also be a Schwab-held TRAILING_STOP (stop_type "trail" = R / $ / % behind). Shares are
+still sized from the typed stop; a trail wider than the typed stop starts further away, so the plan
+warns. stop_type "autobe" sends the same fixed stop as "fixed"; the companion then moves it to
+break-even once, when the mark first touches +1R (the poller watches it; be_trigger shows where).
 """
 from __future__ import annotations
 
@@ -62,6 +63,7 @@ class Plan:
     stop_type: str = "fixed"              # fixed | autobe | trail
     trail: dict | None = None             # {"offset": Decimal, "link": VALUE|PERCENT, "basis": MARK|...}
     trail_start: Decimal = Decimal(0)     # where the trail starts if the entry fills at the limit
+    be_trigger: Decimal = Decimal(0)      # autobe: +1R from the limit (the real one uses the fill)
     warnings: list[str] = field(default_factory=list)
     target_price: Decimal | None = None   # the user typed the runner's price (overrides R)
     t1_price: Decimal | None = None       # and/or target 1's price
@@ -96,6 +98,7 @@ class Plan:
             "trail": ({"offset": float(self.trail["offset"]), "link": self.trail["link"], "basis": self.trail["basis"]}
                       if self.trail else None),
             "trail_start": fmt(self.trail_start) if self.trail_start else None, "warnings": self.warnings,
+            "be_trigger": fmt(self.be_trigger) if self.be_trigger else None,
             "target_r": float(self._r_of(self.target)) if self.target else None,
             "target1_r": float(self._r_of(self.target1)) if self.target1 else None,
             "errors": self.errors, "ok": self.ok,
@@ -261,18 +264,17 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
     p.notional = p.limit * qty
     if p.split > 0:
         _two_targets(p)
-    if p.ok and p.stop_type != "fixed":
+    if p.ok and p.stop_type == "trail":
         _trailing_stop(p, trail_unit, trail_value, trail_basis)
+    elif p.ok and p.stop_type == "autobe":
+        p.be_trigger = p.limit + p.per_share if long else p.limit - p.per_share
+    elif p.stop_type != "fixed":
+        p.errors.append("stop type must be fixed, autobe or trail")
+        p.qty = 0
     return p
 
 
 def _trailing_stop(p: Plan, unit, value, basis) -> None:
-    if p.stop_type == "autobe":
-        unit, value = "R", 1
-    elif p.stop_type != "trail":
-        p.errors.append("stop type must be fixed, autobe or trail")
-        p.qty = 0
-        return
     spec, err = trail_spec(unit, value, p.per_share, basis)
     if err:
         p.errors.append(err)

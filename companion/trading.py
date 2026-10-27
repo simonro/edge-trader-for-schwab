@@ -1,7 +1,9 @@
 """The order ticket service: one click = one Schwab bracket (entry + stop + target).
 
 Safety that is engineering, not coaching:
-- Off until the user arms it in the dashboard (persisted). It never places orders on its own.
+- Off until the user arms it in the dashboard (persisted). It never places orders on its own, with
+  one exception the user opts into per ticket: Auto B/E moves that ticket's stop to break-even
+  once, when the mark touches +1R (auto_breakeven, called by the poller).
 - Separate Schwab client that can only preview and place; it cannot cancel or replace.
 - Intent is written to SQLite BEFORE sending; a ticket id can be sent once (double clicks).
 - One submission at a time. A timeout or 5xx is UNKNOWN, never retried: new submissions wait
@@ -18,11 +20,11 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from . import schwab
-from .bracket import MIN_STOP_TICKS, Plan, bracket_order, fmt, plan, tick
-from .orders import LIVE, TERMINAL, PendingOrder, stop_coverage, terminal_ids
+from .bracket import MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, tick
+from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
 
@@ -412,6 +414,8 @@ class Trader:
         intent = {"ticket_id": ticket_id, "symbol": p.symbol, "side": p.side, "qty": p.qty,
                   "limit": fmt(p.limit), "stop": fmt(p.stop), "target": fmt(p.target),
                   "risk": float(p.planned_risk), "request": order}
+        if p.stop_type == "autobe":
+            self.store.add_auto_be(ticket_id, p.symbol)     # Simon's consent for one stop move
         if not self.store.insert_ticket(intent):
             return {"ok": False, "error": "This ticket was already sent. Check thinkorswim."}
         log.warning("PLACE %s %s %s @ %s stop %s target %s", p.side, p.qty, p.symbol, p.limit,
@@ -834,7 +838,12 @@ class Trader:
         b = self.r_basis(orders_today).get(symbol.upper().strip())
         return b["entry"] if b else position_avg
 
-    def _move_stop_locked(self, symbol: str, new_stop, orders: list[dict], known_terminal: set[int]) -> dict:
+    def _move_stop_locked(self, symbol: str, new_stop, orders: list[dict], known_terminal: set[int],
+                          only: str | None = None, allowed: set[int] | None = None) -> dict:
+        """only = "LONG" | "SHORT": the automatic B/E move. Then nothing but an in-place replace of
+        fixed stops on that side, each one inside the ticket's own order tree (allowed): no stop
+        created, no trail rebuilt, and a stop that is already at or past the new price (checked on
+        the final read of each stop) is left alone."""
         from .bracket import _to_tick
         from decimal import ROUND_HALF_UP
         client = self._ensure()
@@ -845,6 +854,8 @@ class Trader:
         if abs(qty) < 1e-9:
             return {"ok": False, "symbol": symbol, "error": f"No open {symbol} position."}
         side = "LONG" if qty > 0 else "SHORT"
+        if only and side != only:
+            return {"ok": False, "symbol": symbol, "error": f"The position is {side} now, not {only}. Not moved."}
         price = Decimal(str(new_stop))
         price = _to_tick(price, ROUND_HALF_UP)
         q = self.quote(symbol, max_age=0)
@@ -860,6 +871,10 @@ class Trader:
         from .orders import pending_orders
         stops = [p for p in pending_orders(fresh, terminal)
                  if p.symbol == symbol and p.role == "STOP" and p.live and p.legs == 1 and p.exits(side)]
+        if only and (not stops or any(p.order_type.startswith("TRAILING") for p in stops)):
+            return {"ok": False, "symbol": symbol, "error": "No fixed stop to move (none, or a trailing stop). Not moved."}
+        if only and any(p.order_id not in (allowed or set()) for p in stops):
+            return {"ok": False, "symbol": symbol, "error": "A working stop is not from this ticket's order. Not moved."}
         if not stops:
             return self._create_stop(client, symbol, side, qty, asset, price, fresh, terminal)
         if any(p.order_type.startswith("TRAILING") for p in stops):
@@ -883,6 +898,14 @@ class Trader:
             if cur.get("status") not in LIVE:
                 results.append({"order_id": p.order_id, "ok": False, "note": f"stop is {cur.get('status')}"})
                 continue
+            if only:
+                was = _dec(cur.get("stopPrice"))
+                if cur.get("orderType") not in ("STOP", "STOP_LIMIT") or was is None:
+                    results.append({"order_id": p.order_id, "ok": False, "note": f"it is a {cur.get('orderType')} order now"})
+                    continue
+                if was >= price if side == "LONG" else was <= price:
+                    results.append({"order_id": p.order_id, "ok": False, "note": f"already at {fmt(was)}, not loosened"})
+                    continue
             legs = cur.get("orderLegCollection") or []
             body = {
                 "orderStrategyType": "SINGLE", "orderType": cur.get("orderType", "STOP"),
@@ -944,6 +967,78 @@ class Trader:
                               " ".join(notes)[:900])
         return {"ok": ok, "symbol": symbol, "stop": fmt(price), "moved": moved, "of": len(stops),
                 "oco_kept": oco_kept, "message": " ".join(notes), "error": None if ok else " ".join(notes)}
+
+    # ---- auto B/E: the ticket's one stop move at +1R ------------------------------------------
+
+    def auto_breakeven(self, ticket_id: str, symbol: str, side: str, entry: float,
+                       orders: list[dict], known_terminal: set[int]) -> dict:
+        """Move the stop to break-even once, for a ticket sent with Auto B/E (Simon's consent for
+        this one move). The poller calls it after claiming the ticket (PENDING -> SENDING), so it
+        never runs twice. Only "another action holds the lock" or "market closed" put it back to
+        PENDING (nothing was sent); every other outcome is final, never retried."""
+        symbol = symbol.upper().strip()
+        long = side == "LONG"
+        be = _to_tick(Decimal(str(entry)), ROUND_CEILING if long else ROUND_FLOOR)   # never below entry
+
+        def done(state: str, text: str, ok: bool = False) -> dict:
+            self.store.set_auto_be(ticket_id, state, text)
+            self.store.log_action("auto_be", symbol, None, state, text)
+            return {"ok": ok, "state": state, "message": text}
+
+        if not market_open():
+            self.store.set_auto_be(ticket_id, "PENDING", "market closed")
+            return {"ok": False, "state": "PENDING"}
+        if not self._send_lock.acquire(timeout=10):
+            self.store.set_auto_be(ticket_id, "PENDING", "another order action was running")
+            return {"ok": False, "state": "PENDING"}
+        try:
+            client = self._ensure()
+            qty, _ = self._position(client, symbol)
+            if abs(qty) < 1e-9 or (qty > 0) != long:
+                return done("SKIPPED", f"no {side.lower()} {symbol} position any more")
+            fresh = self._fresh_orders(client, orders)
+            terminal = terminal_ids(fresh) | known_terminal
+            # Only stops inside this ticket's own order tree (Schwab keeps a replaced stop there):
+            # a re-entry or a stop rebuilt in a new OCO is not what Simon consented to move.
+            t = self.store.get_ticket(ticket_id) or {}
+            tree = self._find_in(fresh, t["order_id"]) if t.get("order_id") else None
+            for _ in range(10):
+                if not tree or tree.get("status") != "REPLACED":
+                    break
+                tree = _replacement(tree, fresh)
+            allowed: set[int] = set()
+
+            def walk(o):
+                if o.get("orderId") is not None:
+                    allowed.add(o["orderId"])
+                for ch in o.get("childOrderStrategies") or []:
+                    walk(ch)
+            if tree:
+                walk(tree)
+            stops = [p for p in pending_orders(fresh, terminal)
+                     if p.symbol == symbol and p.role == "STOP" and p.live and p.exits(side)]
+            if not stops:
+                return done("SKIPPED", "no working stop to move")
+            if any(p.order_id not in allowed for p in stops):
+                return done("SKIPPED", "the working stop is not from this ticket's order (a new trade, or a "
+                                       "stop rebuilt in a new OCO): left as it is")
+            if any(p.order_type.startswith("TRAILING") for p in stops):
+                return done("SKIPPED", "the stop is a trailing stop now: left as it is")
+            past = [p for p in stops if p.stop is not None
+                    and (Decimal(str(p.stop)) >= be if long else Decimal(str(p.stop)) <= be)]
+            if len(past) == len(stops):
+                return done("DONE", f"stop already at or past B/E {fmt(be)}", ok=True)
+            if past:
+                return done("SKIPPED", f"a stop is already past B/E {fmt(be)}: moving all would loosen it")
+            self.store.log_action("auto_be", symbol, None, "SENDING", f"+1R touched: stop to B/E {fmt(be)}")
+            r = self._move_stop_locked(symbol, be, fresh, terminal, only=side, allowed=allowed)
+            return done("DONE" if r["ok"] else "FAILED",
+                        (r.get("message") or r.get("error") or "")[:900], ok=r["ok"])
+        except Exception as e:
+            log.exception("auto B/E failed")
+            return done("FAILED", f"{e}. Check thinkorswim."[:300])
+        finally:
+            self._send_lock.release()
 
     # ---- trailing stop (Schwab-held) -----------------------------------------------------------
 

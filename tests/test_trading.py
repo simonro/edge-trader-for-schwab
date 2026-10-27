@@ -1,4 +1,6 @@
 """Order ticket service with a fake Schwab client: nothing here talks to Schwab."""
+from decimal import Decimal
+
 import pytest
 
 from companion import trading
@@ -170,14 +172,14 @@ def test_favourable_move_into_the_stop_is_refused(trader, monkeypatch):
 
 
 def test_trail_that_would_start_looser_is_refused(trader, monkeypatch):
-    # Auto B/E (1R trail on the mark) showed a start of 335.80 at 338.70 / 338.77.
-    base = dict(stop_type="autobe", expected_trail_offset=2.94, expected_trail_start="335.80")
+    # A 1R trail on the mark showed a start of 335.80 at 338.70 / 338.77.
+    base = dict(stop_type="trail", expected_trail_offset=2.94, expected_trail_start="335.80")
     r = trader.submit(req(**base))
     assert r["ok"], r
     _quote(monkeypatch, trader, 337.50, 338.77)          # spread widened: the mark drops, start 335.20
     r = trader.submit(req(ticket_id="ticket-0002", **base))
     assert not r["ok"] and "trail would now start at 335.20" in r["error"]
-    r = trader.submit(req(ticket_id="ticket-0003", stop_type="autobe", expected_trail_offset=2.94))
+    r = trader.submit(req(ticket_id="ticket-0003", stop_type="trail", expected_trail_offset=2.94))
     assert not r["ok"] and "reload" in r["error"]
 
 
@@ -792,13 +794,102 @@ def test_set_target_keeps_the_trailing_stop(trader, monkeypatch):
     assert target["price"] == "898.00" and stop["orderType"] == "TRAILING_STOP"
 
 
-def test_autobe_ticket_sends_a_trailing_stop_and_checks_its_distance(trader):
-    assert "trail" in trader.submit(req(stop_type="autobe"))["error"].lower()     # offset not displayed
-    r = trader.submit(req(ticket_id="ticket-0002", stop_type="autobe", expected_trail_offset=2.94,
-                          expected_trail_start="335.80"))
+def test_autobe_ticket_sends_a_fixed_stop_and_records_one_move(trader):
+    r = trader.submit(req(stop_type="autobe"))
     assert r["ok"], r
     stop = trader._client.placed[0]["childOrderStrategies"][0]["childOrderStrategies"][1]
-    assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceOffset"] == 2.94
+    assert stop["orderType"] == "STOP" and stop["stopPrice"] == "336.00"
+    assert r["plan"]["be_trigger"] == "341.88"                       # 338.94 + 1R (2.94)
+    assert trader.store.auto_be("ticket-0001")["state"] == "PENDING"
+    trader.submit(req(ticket_id="ticket-0002"))
+    assert trader.store.auto_be("ticket-0002") is None              # a fixed ticket never moves
+
+
+def _ticket_tree(oco, oid=40):
+    """The ticket's filled entry order with its exits underneath, as Schwab returns it."""
+    return {"orderId": oid, "orderStrategyType": "TRIGGER", "status": "FILLED", "filledQuantity": 57,
+            "orderLegCollection": [{"instruction": "SELL_SHORT", "positionEffect": "OPENING", "quantity": 57,
+                                    "instrument": {"symbol": "MXR", "assetType": "EQUITY"}}],
+            "childOrderStrategies": [oco]}
+
+
+def _claimed(trader, tid="t-mxr"):
+    trader.store.insert_ticket({"ticket_id": tid, "symbol": "MXR", "side": "SHORT", "qty": 57, "limit": "908.00",
+                                "stop": "913.23", "target": "900.18", "risk": 300.0, "request": {}})
+    trader.store.update_ticket(tid, "ACCEPTED", order_id=40)
+    trader.store.add_auto_be(tid, "MXR")
+    assert trader.store.set_auto_be(tid, "SENDING", only_from="PENDING")
+    assert not trader.store.set_auto_be(tid, "SENDING", only_from="PENDING")   # claimed once only
+    return tid
+
+
+def test_auto_breakeven_moves_the_stop_once_never_below_entry(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_ticket_tree(_mu_oco())])              # MXR short 57, stop 913.23
+    r = trader.auto_breakeven(_claimed(trader), "MXR", "SHORT", 908.004, [], set())
+    assert r["ok"] and r["state"] == "DONE", r
+    (oid, body), = trader._client.replaced
+    assert oid == 51 and body["stopPrice"] == "908.00"        # short rounds down: never a locked-in loss
+    assert trader.store.auto_be("t-mxr")["state"] == "DONE"
+    assert any(a["kind"] == "auto_be" for a in trader.store.actions_since("2000-01-01"))
+
+
+def test_auto_breakeven_never_loosens_or_replaces_a_trail(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_ticket_tree(_mu_oco())])              # stop 913.23 already past B/E 914
+    r = trader.auto_breakeven(_claimed(trader), "MXR", "SHORT", 914.0, [], set())
+    assert r["state"] == "DONE" and not getattr(trader._client, "replaced", [])
+    trader._client = Broker([_ticket_tree(_mu_trailing())])
+    r = trader.auto_breakeven(_claimed(trader, "t2"), "MXR", "SHORT", 908.0, [], set())
+    assert r["state"] == "SKIPPED" and "trailing" in r["message"] and trader._client.placed == []
+    trader._client = Broker([_mu_oco()], position=("MXR", 0.0, "EQUITY"))
+    r = trader.auto_breakeven(_claimed(trader, "t3"), "MXR", "SHORT", 908.0, [], set())
+    assert r["state"] == "SKIPPED" and not getattr(trader._client, "replaced", [])
+
+
+def test_auto_move_checks_the_final_read_of_each_stop(trader, monkeypatch):
+    # The stop is tightened in thinkorswim between the snapshot and the final read: left alone.
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_oco()])
+    real = trader._client.order_details
+
+    def tightened(h, oid):
+        if oid == 51:
+            return JsonResp(200, {**trader._client._find(51), "stopPrice": 905.0})
+        return real(h, oid)
+    trader._client.order_details = tightened
+    r = trader._move_stop_locked("MXR", Decimal("908.00"), [], set(), only="SHORT", allowed={50, 51, 52})
+    assert not r["ok"] and "not loosened" in r["error"] and not getattr(trader._client, "replaced", [])
+    # The automatic move never creates a stop or rebuilds a trail, and checks the side.
+    trader._client = Broker([])
+    r = trader._move_stop_locked("MXR", Decimal("908.00"), [], set(), only="SHORT")
+    assert not r["ok"] and trader._client.placed == []
+    trader._client = Broker([_mu_trailing()])
+    r = trader._move_stop_locked("MXR", Decimal("908.00"), [], set(), only="SHORT")
+    assert not r["ok"] and trader._client.placed == []
+    trader._client = Broker([_mu_oco()])
+    r = trader._move_stop_locked("MXR", Decimal("908.00"), [], set(), only="LONG")
+    assert not r["ok"] and "SHORT now" in r["error"]
+
+
+def test_auto_breakeven_leaves_a_stop_from_another_order_alone(trader, monkeypatch):
+    # Closed and re-entered in thinkorswim: the working stop belongs to the new order, not the ticket.
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    old = _ticket_tree({"orderId": 45, "orderStrategyType": "OCO", "status": "CANCELED", "childOrderStrategies": [
+        {**_leaf(46, "STOP", 57, stopPrice=913.23), "status": "CANCELED"}]})
+    trader._client = Broker([old, _mu_oco()])
+    r = trader.auto_breakeven(_claimed(trader), "MXR", "SHORT", 908.0, [], set())
+    assert r["state"] == "SKIPPED" and "not from this ticket" in r["message"]
+    assert not getattr(trader._client, "replaced", [])
+    r = trader._move_stop_locked("MXR", Decimal("908.00"), [], set(), only="SHORT", allowed={40, 45, 46})
+    assert not r["ok"] and not getattr(trader._client, "replaced", [])
+
+
+def test_auto_breakeven_waits_when_the_market_is_closed(trader, monkeypatch):
+    monkeypatch.setattr(trading, "market_open", lambda now=None: False)
+    trader._client = Broker([_mu_oco()])
+    r = trader.auto_breakeven(_claimed(trader), "MXR", "SHORT", 908.0, [], set())
+    assert r["state"] == "PENDING" and trader.store.auto_be("t-mxr")["state"] == "PENDING"
 
 
 def test_trail_verification_ignores_an_old_trailing_order(trader, monkeypatch):

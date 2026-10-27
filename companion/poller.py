@@ -71,7 +71,7 @@ class Poller:
         self.quotes: dict = {}
         self.trail_best: dict[int, float] = {}   # trailing stop order id -> best price seen
         self.hours: dict = {}       # today's and the next regular session (Schwab, holidays and early closes)
-        self.trader = None   # set by the app; the poller itself never sends orders
+        self.trader = None   # set by the app; the poller never sends orders (Auto B/E hands its one move to it)
         # Every order id ever seen finished. Schwab's WORKING sweep can return a frozen
         # stand-alone copy of an order that actually filled inside an OCO.
         self.terminal: set[int] = terminal_ids(self.store.all_orders())
@@ -377,6 +377,7 @@ class Poller:
                 today, pending_orders(self._merged_orders(), self.terminal), positions,
                 self._orders_fresh() and self._fresh("account"))
             self._add_r_and_log(st, today, txns)
+            self._auto_be(st)
         self._trail_estimates(st)
         with self._lock:
             self.state = st
@@ -424,6 +425,46 @@ class Poller:
             if oid not in live_ids:
                 del self.trail_best[oid]
 
+    def _auto_be(self, st: dict) -> None:
+        """Tickets sent with Auto B/E: show where each one fires, and when the mark touches +1R
+        (frozen R of the ticket that opened the position) claim it and hand the one stop move to the
+        trader in its own thread. The poller itself never waits on an order."""
+        from .trading import market_open
+        live = (self._fresh("quotes") and self._fresh("account") and self._fresh("transactions")
+                and self._orders_fresh() and market_open())
+        now_ms = time.time() * 1000
+        for p in st.get("positions") or []:
+            r = p.get("r")
+            ab = self.trader.store.auto_be(r["ticket_id"]) if r else None
+            if not ab:
+                continue
+            long = p["side"] == "LONG"
+            trigger = round(r["entry"] + r["rps"] if long else r["entry"] - r["rps"], 4)
+            p["auto_be"] = {"state": ab["state"], "trigger": trigger, "detail": ab["detail"]}
+            if ab["state"] != "PENDING" or not live:
+                continue
+            entry = self.quotes.get(p["symbol"]) or {}
+            q = entry.get("quote") or {}
+            mark = q.get("mark")
+            if entry.get("realtime") is False:
+                continue
+            try:   # only a real-time quote from after the entry fill and under 15 s old counts
+                filled = datetime.strptime(r.get("first_fill") or "", "%Y-%m-%dT%H:%M:%S%z").timestamp() * 1000
+            except ValueError:
+                continue
+            qt = q.get("quoteTime")
+            if not mark or not qt or qt < filled or now_ms - qt > 15_000:
+                continue
+            if mark < trigger - 1e-9 if long else mark > trigger + 1e-9:
+                continue
+            if not self.trader.store.set_auto_be(r["ticket_id"], "SENDING", f"mark {mark:g} touched +1R {trigger:g}",
+                                                 only_from="PENDING"):
+                continue
+            p["auto_be"]["state"] = "SENDING"
+            threading.Thread(target=self.trader.auto_breakeven, name=f"auto-be-{p['symbol']}", daemon=True,
+                             args=(r["ticket_id"], p["symbol"], p["side"], r["entry"],
+                                   self._merged_orders(), set(self.terminal))).start()
+
     def _add_r_and_log(self, st: dict, orders_today: list[dict], txns: list[dict]) -> None:
         """Live R on each position (frozen basis from the companion ticket) and a per-symbol
         action log: tickets sent, cancels/closes requested and confirmed, and fills."""
@@ -459,7 +500,8 @@ class Poller:
                 f"stop {t['stop']} target {t['target']}: {t['status']}", "ticket")
         for a in self.store.actions_since(start.isoformat()):
             if a["symbol"]:
-                add(a["symbol"], a["created"], f"{a['kind'].replace('_', ' ')} "
+                kind = "auto B/E" if a["kind"] == "auto_be" else a["kind"].replace("_", " ")
+                add(a["symbol"], a["created"], f"{kind} "
                     f"{a['order_id'] or ''}: {a['status']} {a['detail'] or ''}".strip(), "action")
         today = session_day(datetime.now(timezone.utc), "EQUITY")
         for f in fills_from_transactions(txns):

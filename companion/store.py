@@ -46,6 +46,8 @@ create table if not exists tickets (
 create table if not exists settings (key text primary key, value text);
 create table if not exists actions (
     created text, kind text, symbol text, order_id integer, status text, detail text);
+create table if not exists auto_be (
+    ticket_id text primary key, symbol text, state text, created text, updated text, detail text);
 create index if not exists ix_tx_time on transactions(time);
 create index if not exists ix_quotes on quotes(symbol, seen_at);
 """
@@ -204,6 +206,32 @@ class Store:
             cols = [c[0] for c in cur.description]
             row = cur.fetchone()
         return dict(zip(cols, row)) if row else None
+
+    # ---- auto B/E: one stop move per ticket, PENDING -> SENDING -> DONE | FAILED | SKIPPED ----
+
+    def add_auto_be(self, ticket_id: str, symbol: str) -> None:
+        ts = now_iso()
+        with self._lock, self._con:
+            self._con.execute("insert or ignore into auto_be values (?,?,?,?,?,?)",
+                              (ticket_id, symbol, "PENDING", ts, ts, None))
+
+    def auto_be(self, ticket_id: str) -> dict | None:
+        with self._lock:
+            cur = self._con.execute("select ticket_id, symbol, state, created, updated, detail "
+                                    "from auto_be where ticket_id=?", (ticket_id,))
+            cols = [c[0] for c in cur.description]
+            row = cur.fetchone()
+        return dict(zip(cols, row)) if row else None
+
+    def set_auto_be(self, ticket_id: str, state: str, detail: str | None = None,
+                    only_from: str | None = None) -> bool:
+        """Change the state; with only_from, only if it still is that state (an atomic claim)."""
+        with self._lock, self._con:
+            cur = self._con.execute(
+                "update auto_be set state=?, detail=?, updated=? where ticket_id=?"
+                + (" and state=?" if only_from else ""),
+                (state, (detail or "")[:1000] or None, now_iso(), ticket_id) + ((only_from,) if only_from else ()))
+        return cur.rowcount == 1
 
     def claimed_order_ids(self) -> set[int]:
         with self._lock:

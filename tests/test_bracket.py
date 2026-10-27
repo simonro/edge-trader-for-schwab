@@ -155,15 +155,16 @@ def test_bad_typed_target_blocks_instead_of_using_r():
         assert not p.ok, bad
 
 
-def test_autobe_bracket_is_a_1r_trailing_stop():
+def test_autobe_bracket_is_a_fixed_stop_with_a_1r_trigger():
     from companion.bracket import plan, bracket_order
     p = plan("TSX", "LONG", stop="414.73", risk=375, r_multiple=2, bid="417.80", ask="417.86", entry="mid",
              stop_type="autobe")
-    assert p.ok and p.trail == {"offset": p.per_share, "link": "VALUE", "basis": "MARK"}
-    assert p.trail_start == p.stop and not p.warnings                     # starts exactly at the typed stop
+    assert p.ok and p.trail is None and p.be_trigger == p.limit + p.per_share
     stop = bracket_order(p)["childOrderStrategies"][0]["childOrderStrategies"][1]
-    assert stop["orderType"] == "TRAILING_STOP" and "stopPrice" not in stop
-    assert stop["stopPriceOffset"] == float(p.per_share) and stop["stopPriceLinkType"] == "VALUE"
+    assert stop["orderType"] == "STOP" and stop["stopPrice"] == "414.73"
+    q = plan("TSX", "SHORT", stop="420.00", risk=375, r_multiple=2, bid="417.80", ask="417.86", entry="mid",
+             stop_type="autobe")
+    assert q.be_trigger == q.limit - q.per_share
 
 
 def test_trail_wider_than_the_stop_warns_and_percent_works():
