@@ -651,6 +651,18 @@ def test_r_basis_uses_entry_fill_and_original_stop(trader):
     assert abs(b["rps"] - 2.8588) < 1e-3 and b["side"] == "LONG"
 
 
+def test_r_basis_follows_an_entry_replaced_in_thinkorswim(trader):
+    trader.submit(req())                                         # ticket order 555, stop 336.00
+    old = {**_tree(555), "status": "REPLACED", "closeTime": "2099-01-01T14:00:19+0000"}
+    new = {**_tree(777, price=339.10, entered="2099-01-01T14:00:19+0000"), "status": "FILLED",
+           "orderActivityCollection": [{"executionType": "FILL", "executionLegs": [
+               {"quantity": 170, "price": 339.00, "time": "2099-01-01T14:00:20+0000"}]}]}
+    b = trader.r_basis([old, new])["BRVO"]
+    assert b["entry"] == 339.0 and b["stop"] == 336.0 and b["first_fill"] == "2099-01-01T14:00:20+0000"
+    other = {**new, "orderId": 778}                               # two candidates: no guess
+    assert "BRVO" not in trader.r_basis([old, new, other])
+
+
 def test_accepted_but_not_recorded_is_unknown(trader, monkeypatch):
     monkeypatch.setattr(trader, "_safe_update", lambda *a, **k: False)
     r = trader.submit(req())

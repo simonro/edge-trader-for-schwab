@@ -91,6 +91,30 @@ def _symbol(o: dict) -> str | None:
     return (legs[0].get("instrument") or {}).get("symbol") if legs else None
 
 
+def _replacement(tree: dict, orders: list[dict]) -> dict | None:
+    """The order that replaced a REPLACED one (an edit in thinkorswim). Schwab gives no link
+    field: the new order is entered the second the old one closes, same symbol and instruction.
+    Returns None unless exactly one order fits."""
+    try:
+        closed = datetime.strptime(tree.get("closeTime") or "", "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+    legs = tree.get("orderLegCollection") or [{}]
+    hits = []
+    for o in orders:
+        ol = o.get("orderLegCollection") or [{}]
+        if (o.get("orderId") == tree.get("orderId") or _symbol(o) != _symbol(tree)
+                or ol[0].get("instruction") != legs[0].get("instruction")):
+            continue
+        try:
+            entered = datetime.strptime(o.get("enteredTime") or "", "%Y-%m-%dT%H:%M:%S%z")
+        except ValueError:
+            continue
+        if abs((entered - closed).total_seconds()) <= 2:
+            hits.append(o)
+    return hits[0] if len(hits) == 1 else None
+
+
 def market_open(now: datetime | None = None) -> bool:
     et = (now or datetime.now(timezone.utc)).astimezone(ET)
     if et.weekday() >= 5:
@@ -1581,7 +1605,8 @@ class Trader:
 
     def r_basis(self, orders_today: list[dict]) -> dict[str, dict]:
         """Frozen R per symbol from the latest filled companion ticket today: the entry's average
-        fill and the ORIGINAL stop. Later stop moves or adds never redefine R."""
+        fill and the ORIGINAL stop. Later stop moves or adds never redefine R. An entry edited in
+        thinkorswim before it filled is followed to the order that replaced it."""
         by_id = {o["orderId"]: o for o in orders_today}
         start = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         out: dict[str, dict] = {}
@@ -1589,6 +1614,10 @@ class Trader:
             if t["symbol"] in out or t["status"] != "ACCEPTED" or not t["order_id"]:
                 continue
             tree = by_id.get(t["order_id"])
+            for _ in range(10):
+                if not tree or tree.get("status") != "REPLACED":
+                    break
+                tree = _replacement(tree, orders_today)
             legs = [e for a in (tree or {}).get("orderActivityCollection") or []
                     if a.get("executionType") == "FILL" for e in a.get("executionLegs") or []]
             qty = sum(float(e.get("quantity") or 0) for e in legs)
