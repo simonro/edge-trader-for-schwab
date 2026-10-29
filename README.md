@@ -98,15 +98,24 @@ risk before you send.
 
 ## Your Schwab app
 
-Edge Trader uses your own Schwab developer app. You need it once:
+Edge Trader uses your own Schwab developer app. You set it up once (Schwabdev's
+[setup guide](https://tylerebowers.github.io/Schwabdev/?source=pages%2Fsetupguide.html) covers the same
+steps with a video):
 
-1. Sign in at [developer.schwab.com](https://developer.schwab.com) with your Schwab login and create an
-   app with the **Accounts and Trading Production** product (the Trader API).
-2. Set its **Callback URL** to `https://127.0.0.1` (or any URL you also put in `.env`).
-3. Wait for the app's status to show **Ready For Use** (Schwab reviews new apps; it can take a few days).
-4. Open the app (**Modify App**) and check its **Order Limit** is above 0. With 0, every order is
+1. **Create a developer account** at [developer.schwab.com](https://developer.schwab.com). It is a
+   separate registration from your brokerage login; use the same email as your Schwab account.
+2. **Request access** to the **Trader API - Individual** product.
+3. **Create an app** with the Callback URL `https://127.0.0.1` (or any `https` localhost URL you also put
+   in `.env`) and add both API products: **Accounts and Trading Production** (account, orders) and
+   **Market Data Production** (quotes).
+4. **Wait for the status "Ready For Use".** Schwab reviews new apps and it can take a few days;
+   "Approved - Pending" does not work yet.
+5. **thinkorswim must be enabled** on your Schwab account (sign in to thinkorswim once); Schwab needs it
+   for orders through the API.
+6. Open the app (**Modify App**) and check its **Order Limit** is above 0. With 0, every order is
    refused with HTTP 429 even though everything else works.
-5. Copy the **App Key** and **Secret** into `.env`.
+7. Copy the **App Key** and **Secret** into `.env`. On your first `login.bat`, Schwab asks you to agree
+   to the terms and pick the account(s) the app may use.
 
 ## Quick start
 
@@ -168,6 +177,10 @@ folder across, run `setup.bat` once, then `launch.bat`.
   around that: partials, target changes and trails send one new bracket for the remaining shares.
 - **Planned risk is not maximum loss:** a stop becomes a market order when it triggers and can fill
   past its price on a gap or a halt.
+- **Recording mode:** `.venv\Scripts\python.exe -m companion --private` hides positions carried from
+  earlier sessions, their orders, the carried P&L and the account value, so you can record or share your
+  screen while showing only today's trades. It only changes what is displayed; orders work as usual.
+  `--demo` runs on invented data with no Schwab connection, and refuses every order.
 
 ## Contributing
 
