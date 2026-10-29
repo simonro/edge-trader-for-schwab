@@ -3,7 +3,7 @@
 [![CI](https://github.com/simonro/edge-trader-for-schwab/actions/workflows/ci.yml/badge.svg)](https://github.com/simonro/edge-trader-for-schwab/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/simonro/edge-trader-for-schwab)](https://github.com/simonro/edge-trader-for-schwab/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Watch the walkthrough on YouTube](https://img.shields.io/badge/YouTube-Watch_the_walkthrough-FF0000?logo=youtube&logoColor=white)](VIDEO_URL)
+[![Watch the walkthrough on YouTube](https://img.shields.io/badge/YouTube-Watch_the_walkthrough-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/@tapetoedge)
 
 A local day-trading dashboard and one-click order ticket for a Charles Schwab account, built on the
 Schwab Trader API. It shows your open positions with live R, open and realized P&L and every working
@@ -24,9 +24,9 @@ Charles Schwab. Every screenshot below is invented demo data, not anyone's real 
 
 ![The dashboard: day trades on the left, the selected trade with its R ruler and actions in the middle, the New trade ticket on the right](docs/screenshot-dashboard.png)
 
-[![Watch on YouTube: This Free Tool Is a Game Changer for thinkorswim Day Traders](docs/video-thumbnail.jpg)](VIDEO_URL)
+[![Watch on YouTube: This Free Tool Is a Game Changer for thinkorswim Day Traders](docs/video-thumbnail.jpg)](https://www.youtube.com/@tapetoedge)
 
-**[Watch the walkthrough first](VIDEO_URL)**: a full tour on a live account, from sizing the shares from your risk and sending the bracket to partials that rebuild your stop and target, then the setup and the limits.
+**[Watch the walkthrough first](https://www.youtube.com/@tapetoedge)** on the Tape to Edge YouTube channel: a full tour on a live account, from sizing the shares from your risk and sending the bracket to partials that rebuild your stop and target, then the setup and the limits.
 
 ## Built on Schwabdev
 
