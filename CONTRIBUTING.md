@@ -11,8 +11,10 @@ GitHub's private vulnerability reporting.
 These decide most review questions:
 
 1. **Every order is the user's click.** Nothing places, replaces or cancels an order on its own: no
-   automation, no retries of an order request, no background jobs that trade. A change that would act
-   without a click will not be merged.
+   automation, no retries of an order request, no background jobs that trade. The one exception is
+   "Auto B/E 1R", chosen per ticket by the user: it moves that ticket's own fixed stop to break-even
+   once at +1R, never loosens a stop and is never retried. Any other change that would act without a
+   click will not be merged.
 2. **Protection is never removed first.** Schwab cancels a symbol's working orders when a new order
    for it is entered, so exits are replaced by sending the new bracket (Schwab drops the old one),
    never by cancelling the stop and then sending a new one.

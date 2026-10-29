@@ -12,7 +12,7 @@ want to risk) and manage it with one click: stop to break-even, move the stop, t
 target, take partials, cancel or close. It runs on your own computer, next to thinkorswim or your charts.
 
 - **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks only to Schwab.
-- **Every order is your click.** Nothing is sent on its own: no automation, no signals, no auto-trading.
+- **Every order is your click.** No signals, no auto-trading. The one exception is opt-in per trade: pick "Auto B/E 1R" on the ticket and the app moves that trade's stop to break-even once, when price reaches +1R.
 - **Protection first.** Entries go in as one Schwab bracket, so the stop and target live at Schwab even if the app or your PC is off.
 - **Honest numbers.** P&L comes from your own fills, and anything incomplete is labeled as such, never shown as complete.
 - **Free and MIT licensed.** No paid tier.
@@ -64,8 +64,10 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
   STALE, DISCONNECTED) that disables every order button when data is not current.
 - **New trade:** symbol, side, stop, risk in dollars (four buttons you set yourself), entry at the mid,
-  market, ask or bid, one or two targets by R or by price, and a fixed, trailing or "auto break-even at
-  1R" stop. One click sends one Schwab bracket. Entries must be armed each session.
+  market, ask or bid, one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
+  B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
+  (it checks every 3 seconds and only while the app is running; it never loosens a stop). One click
+  sends one Schwab bracket. Entries must be armed each session.
 - **Workbench for the selected trade:** an R ruler (original stop, current stop, entry, 1R, targets,
   price), stop to break-even, move stop, Schwab-held trailing stop (R, dollars or percent), replace
   target, partials at the mid, market, ask or bid (the stop and target are rebuilt on the rest), cancel
