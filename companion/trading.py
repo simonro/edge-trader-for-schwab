@@ -357,7 +357,7 @@ class Trader:
                     trail_basis=req.get("trail_basis") or "MARK", limit_override=limit_override,
                     asset=asset, multiplier=mult, ticks=q.get("ticks") or ticks_for(asset),
                     size_mode=req.get("size_mode") or "risk", qty=req.get("qty"),
-                    target=req.get("targets", 1) not in (0, "0"))
+                    target=req.get("targets", 1) not in (0, "0"), limit_price=req.get("limit_price"))
 
     # ---- option chain picker (only on a click in the ticket's Option mode) ---------------------
 

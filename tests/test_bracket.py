@@ -373,3 +373,33 @@ def test_option_quantity_without_a_stop():
     assert order["orderStrategyType"] == "SINGLE" and order["orderLegCollection"][0]["instruction"] == "BUY_TO_OPEN"
     short = _opt(size_mode="qty", qty=2, side="SHORT", stop_type="none", target=False)
     assert any("no limit on the loss" in w for w in short.warnings)
+
+
+# ---- your own limit price ------------------------------------------------------------------
+
+def test_typed_limit_is_sent_as_typed():
+    p = plan("NVDA", "LONG", stop="186.50", risk=500, r_multiple=2, bid="188.62", ask="188.68",
+             entry="limit", limit_price="188.00")
+    assert p.ok, p.errors
+    assert p.limit == Decimal("188.00") and p.per_share == Decimal("1.50") and p.qty == 333
+    assert p.target == Decimal("191.00") and not p.warnings
+    assert bracket_order(p)["price"] == "188.00"
+
+
+def test_typed_limit_checks():
+    kw = dict(symbol="NVDA", side="LONG", stop="186.50", risk=500, r_multiple=2, bid="188.62", ask="188.68", entry="limit")
+    assert "type the limit price" in plan(**kw).errors[0]
+    assert "steps" in plan(**kw, limit_price="188.005").errors[0]
+    assert "must be below the entry" in plan(**kw, limit_price="186.40").errors[0]
+    marketable = plan(**kw, limit_price="189.00")
+    assert marketable.ok and "fills at once" in marketable.warnings[0]
+    short = plan(**{**kw, "side": "SHORT", "stop": "190.00"}, limit_price="189.50")
+    assert short.ok and short.limit == Decimal("189.50") and not short.warnings
+
+
+def test_typed_limit_on_an_option_grid():
+    from companion.bracket import OPT_NICKEL
+    p = _opt(entry="limit", limit_price="0.80", ticks=OPT_NICKEL, stop="0.50", bid="0.75", ask="0.85")
+    assert p.ok and p.limit == Decimal("0.80")
+    assert "0.05 steps" in _opt(entry="limit", limit_price="0.82", ticks=OPT_NICKEL, stop="0.50",
+                                bid="0.75", ask="0.85").errors[0]

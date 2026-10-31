@@ -1430,3 +1430,16 @@ def test_reconcile_matches_the_new_order_shapes():
         assert Trader._matches(as_schwab(sent), {"request": sent}), sent
     a, b = bracket_order(plan(**kw, target=False)), bracket_order(plan(**{**kw, "qty": 99}, target=False))
     assert not Trader._matches(as_schwab(a), {"request": b})
+
+
+def test_typed_limit_does_not_follow_the_quote(trader, monkeypatch):
+    req = {"ticket_id": "lmt-ticket-01", "symbol": "BRVO", "side": "LONG", "stop": "336.00", "risk": 500, "r": 2,
+           "entry": "limit", "limit_price": "338.00", "expected_limit": "338.00", "expected_qty": 250,
+           "expected_target": "342.00"}
+    _quote(monkeypatch, trader, 339.40, 339.50)          # the market moved up: your limit stays your limit
+    r = trader.submit(req)
+    assert r["ok"], r
+    assert trader._client.placed[0]["price"] == "338.00"
+    _quote(monkeypatch, trader, 335.90, 336.00)          # now the stop is at the bid: refused, nothing sent
+    r = trader.submit({**req, "ticket_id": "lmt-ticket-02"})
+    assert not r["ok"] and len(trader._client.placed) == 1

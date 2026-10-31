@@ -236,7 +236,7 @@ def stop_leg(spec, legs: list[dict], duration: str = "DAY", ticks: str = EQUITY)
 def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r=1, entry="cross",
          target_price=None, t1_price=None, stop_type="fixed", trail_unit="R", trail_value=1,
          trail_basis="MARK", limit_override=None, asset="EQUITY", multiplier=1, ticks=None,
-         size_mode="risk", qty=None, target=True) -> Plan:
+         size_mode="risk", qty=None, target=True, limit_price=None) -> Plan:
     """Size a bracket. Never moves the user's prices: an off-tick stop or target is an error, not rounded.
 
     split > 0 makes it a two-target entry: floor(qty x split) shares exit at target 1, the runner
@@ -253,6 +253,9 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
     size_mode="qty" sends the user's own quantity instead of sizing it from the risk. Only then may
     the ticket go without a stop (stop_type "none"); target=False sends no target. A missing exit can
     be added later from the position (Move stop / Replace target pair them into one OCO).
+
+    entry="limit" sends the entry at the user's own limit_price (on the instrument's grid, never
+    rounded); it does not follow the quote. A buy limit at or above the ask fills at once.
     """
     side = side.upper()
     stop_v = _price(stop)
@@ -276,8 +279,8 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
     if side not in ("LONG", "SHORT"):
         p.errors.append("side must be LONG or SHORT")
         return p
-    if p.entry not in ("mid", "bid", "ask", "market", "cross"):
-        p.errors.append("entry must be mid, bid, ask, market or cross")
+    if p.entry not in ("mid", "bid", "ask", "market", "cross", "limit"):
+        p.errors.append("entry must be mid, bid, ask, limit, market or cross")
         return p
     if p.option and p.entry in ("market", "cross"):
         p.errors.append("options enter with a limit: pick Mid, Ask or Bid")
@@ -330,6 +333,15 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
             p.errors.append("the locked entry price is not a valid price")
             return p
         p.limit = lo
+    elif p.entry == "limit":
+        lp = _price(limit_price)
+        if lp is None:
+            p.errors.append("type the limit price")
+            return p
+        if not lp.is_finite() or lp <= 0 or _to_tick(lp, ROUND_HALF_UP, tk) != lp:
+            p.errors.append(f"limit must be a valid price in {f(tick(lp if lp.is_finite() and lp > 0 else Decimal(1), tk))} steps")
+            return p
+        p.limit = lp
     elif p.entry in ("cross", "market"):
         p.limit = (_to_tick(p.ask * (1 + ENTRY_OFFSET), ROUND_CEILING, tk) if long
                    else _to_tick(p.bid * (1 - ENTRY_OFFSET), ROUND_FLOOR, tk))
@@ -353,6 +365,9 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
 
     if p.limit <= 0:
         p.errors.append("entry price rounds to zero")
+        return p
+    if p.stop and p.per_share <= 0:
+        p.errors.append(f"stop {f(p.stop)} must be {'below' if long else 'above'} the entry {f(p.limit)}")
         return p
     if p.stop and p.per_share < MIN_STOP_TICKS * tick(p.limit, tk):
         p.errors.append(f"stop is less than {MIN_STOP_TICKS} ticks from the entry")
@@ -408,6 +423,9 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
             return p
     p.planned_risk = p.per_share * qty * p.multiplier
     p.notional = p.limit * qty * p.multiplier
+    if p.entry == "limit" and (p.limit >= p.ask if long else p.limit <= p.bid):
+        p.warnings.append(f"Your limit {f(p.limit)} is through the {'ask' if long else 'bid'} "
+                          f"{f(p.ask if long else p.bid)}: it fills at once, at that price or better.")
     if p.option:
         _option_warnings(p)
     if p.split > 0:

@@ -355,8 +355,9 @@
       <div class="row2">
         <div class="fld"><span class="lbl" id="t-stoplbl">Stop price</span><input class="in" id="t-stop" inputmode="decimal" autocomplete="off" placeholder="$$$"></div>
         <div class="fld"><span class="lbl">Entry price</span><div class="seg full" id="t-entry">
-          <button type="button" data-v="mid" class="on">Mid</button><button type="button" data-v="market">Mkt</button><button type="button" data-v="ask">Ask</button><button type="button" data-v="bid">Bid</button></div></div>
+          <button type="button" data-v="mid" class="on">Mid</button><button type="button" data-v="market">Mkt</button><button type="button" data-v="ask">Ask</button><button type="button" data-v="bid">Bid</button><button type="button" data-v="limit" title="Your own limit price">Lmt</button></div></div>
       </div>
+      <div class="fld" id="t-lmtfld" style="display:none"><span class="lbl">Limit price (entry)</span><input class="in" id="t-lmt" inputmode="decimal" autocomplete="off" placeholder="limit price"></div>
       <div class="fld"><span class="lbl">Stop type</span><div class="seg full" id="t-stoptype">
         <button type="button" data-v="fixed" class="on">Fixed</button><button type="button" data-v="autobe">Auto B/E 1R</button><button type="button" data-v="trail">Trail</button><button type="button" data-v="none" title="Only when sizing by quantity">None</button></div></div>
       <div class="chips" id="t-trailbox" style="display:none"><span class="chips" id="t-trailunit"></span><input class="in" id="t-trailval" inputmode="decimal" value="1"><span class="chips" id="t-trailbasis"></span></div>
@@ -1148,7 +1149,7 @@ function optName(sym) {          // "AAPL  261120C00230000" -> "AAPL 20 Nov 26 2
   return m ? `${m[1]} ${+m[4]} ${MONTHS[+m[3] - 1]} ${m[2]} ${+m[6] / 1000}${m[5]}` : sym;
 }
 const isOpt = () => T.asset === "OPTION";
-const ENTRY_TXT = {mid: "limit at mid", bid: "limit at bid", ask: "limit at ask", market: "market"};
+const ENTRY_TXT = {mid: "limit at mid", bid: "limit at bid", ask: "limit at ask", market: "market", limit: "limit"};
 // Every POST gives up after 25 s, so a button never hangs on "Working..." if the server is gone.
 const post = (url, body, ms = 25000) => {
   const ctl = new AbortController();
@@ -1171,17 +1172,17 @@ function ticketReq() {
           split: two ? T.split : 0, t1_r: two ? T.t1r : 0, t1_price: two ? priceBox("t-t1p") : null,
           stop_type: T.stopType, trail_unit: T.trailUnit, trail_value: parseFloat($("t-trailval").value) || 0,
           trail_basis: T.trailBasis, size_mode: T.sizeMode, qty: T.sizeMode === "qty" ? ($("t-qty").value.trim() || null) : null,
-          targets: T.targets};
+          targets: T.targets, limit_price: T.entry === "limit" ? ($("t-lmt").value.trim() || null) : null};
 }
 function ticketReady() {
   const q = ticketReq();
-  if (!q.symbol) return false;
+  if (!q.symbol || (q.entry === "limit" && !q.limit_price)) return false;
   if (q.size_mode === "risk") return q.stop && q.risk > 0;
   const stopOk = q.stop || q.stop_type === "none" || (q.stop_type === "trail" && q.trail_unit !== "R");
   return parseInt(q.qty) > 0 && stopOk;
 }
 const keyOf = q => [q.symbol, q.side, q.stop, q.risk, q.r, q.entry, q.target_price, q.split, q.t1_r, q.t1_price,
-                    q.stop_type, q.trail_unit, q.trail_value, q.trail_basis, q.size_mode, q.qty, q.targets].join("|");
+                    q.stop_type, q.trail_unit, q.trail_value, q.trail_basis, q.size_mode, q.qty, q.targets, q.limit_price].join("|");
 let lookupSeq = 0, lookupTimer = null, LAST_Q = null;
 function showName(q) {
   const el = $("t-name");
@@ -1275,7 +1276,7 @@ function setAsset(a) {
   const mkt = $("t-entry").querySelector('[data-v="market"]');
   mkt.style.display = o ? "none" : "";
   if (o && T.entry === "market") { T.entry = "mid"; [...$("t-entry").children].forEach(x => x.classList.toggle("on", x.dataset.v === "mid")); }
-  $("t-stop").value = ""; $("t-tp").value = ""; $("t-t1p").value = "";   // a stock price is never an option price
+  $("t-stop").value = ""; $("t-tp").value = ""; $("t-t1p").value = ""; $("t-lmt").value = "";   // a stock price is never an option price
   if (o) { T.und = ""; loadExpirations(); } else { T.opt = null; showName(null); lookupSymbol(); }
   $("t-optsel").innerHTML = "";
   onTicketEdit();
@@ -1296,7 +1297,7 @@ $("t-pc").addEventListener("click", e => {
 $("t-chain").addEventListener("click", e => {
   const tr = e.target.closest("tr.row"); if (!tr) return;
   const row = (T.chain?.rows || []).find(r => r.symbol === tr.dataset.sym); if (!row) return;
-  if (!T.opt || T.opt.symbol !== row.symbol) { $("t-stop").value = ""; $("t-tp").value = ""; $("t-t1p").value = ""; }
+  if (!T.opt || T.opt.symbol !== row.symbol) { $("t-stop").value = ""; $("t-tp").value = ""; $("t-t1p").value = ""; $("t-lmt").value = ""; }
   T.opt = row; renderChain(); showOptName(); onTicketEdit();
 });
 function lookupSymbol() {
@@ -1406,6 +1407,8 @@ function renderTicket() {
   go.disabled = !(current && !sent && T.armed && open && !blocked && !T.busy && live);
   go.title = !live ? "Waiting for live data" : !T.armed ? "Arm entries first" : !open ? "Regular hours only" : blocked ? "Resolve the unconfirmed order first" : "";
   $("t-hint").textContent = !T.armed ? "Entries are disarmed: click Entries disarmed to arm until the close."
+    : T.entry === "limit" ? (p && p.ok && (p.side === "LONG" ? +p.limit >= p.ask : +p.limit <= p.bid) ? ""
+        : "Your limit rests until the price reaches it, and may not fill. An unfilled entry shows in Pending orders with Cancel entry.")
     : T.entry === "mid" || (T.entry === "bid" && T.side === "LONG") || (T.entry === "ask" && T.side === "SHORT")
       ? "This entry rests and may not fill. An unfilled entry shows in Pending orders with Cancel entry."
       : T.entry === "market" ? (T.sizeMode === "qty" ? "Market entry: fills at once at the market price." : "Market entry: fills at once; shares are sized from the quote, so the risk is an estimate.") : "";
@@ -1423,6 +1426,7 @@ async function submitTicket() {
   const body = {ticket_id: T.ticketId, symbol: p.symbol, side: p.side, stop: p.stop || "", risk: p.risk,
                 r: p.r_multiple, entry: p.entry, target_price: req.target_price, t1_price: req.t1_price,
                 size_mode: p.size_mode, qty: p.size_mode === "qty" ? p.qty : null, targets: req.targets,
+                limit_price: p.entry === "limit" ? p.limit : null,
                 confirm_no_stop: !p.has_stop,
                 expected_limit: p.limit, expected_qty: p.qty, expected_target: p.has_target ? p.target : null,
                 split: p.split, t1_r: p.t1_r, expected_qty1: p.qty1 || 0, expected_target1: p.target1,
@@ -1491,7 +1495,15 @@ $("t-entry").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
   T.entry = b.dataset.v;
   [...$("t-entry").children].forEach(x => x.classList.toggle("on", x === b));
+  const lmt = T.entry === "limit";
+  $("t-lmtfld").style.display = lmt ? "" : "none";
+  if (lmt && !$("t-lmt").value.trim()) {
+    // Start from the mid of what the ticket last saw; you then type your own price.
+    const q = T.plan && T.plan.bid ? T.plan : isOpt() ? T.opt : null;
+    if (q && q.bid > 0 && q.ask > 0) $("t-lmt").value = ((q.bid + q.ask) / 2).toFixed(2);
+  }
   onTicketEdit();
+  if (lmt) $("t-lmt").focus();
 });
 $("t-risk").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
@@ -1542,7 +1554,7 @@ $("t-trailval").addEventListener("input", () => onTicketEdit());
 $("t-split").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.split = parseFloat(b.dataset.v); onTicketEdit(); });
 $("t-r").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.r = parseFloat(b.dataset.v); $("t-tp").value = ""; onTicketEdit(); });
 $("t-t1r").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.t1r = parseFloat(b.dataset.v); $("t-t1p").value = ""; onTicketEdit(); });
-["t-sym", "t-stop", "t-risk-custom", "t-tp", "t-t1p", "t-qty"].forEach(id => $(id).addEventListener("input", () => {
+["t-sym", "t-stop", "t-risk-custom", "t-tp", "t-t1p", "t-qty", "t-lmt"].forEach(id => $(id).addEventListener("input", () => {
   if (id === "t-risk-custom") { T.risk = null; [...$("t-risk").children].forEach(x => x.classList.remove("on")); }
   if (id === "t-sym") lookupSymbol();
   onTicketEdit();

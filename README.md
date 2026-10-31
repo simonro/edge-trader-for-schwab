@@ -64,7 +64,7 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
   STALE, DISCONNECTED) that disables every order button when data is not current.
 - **New trade:** symbol, side, stop, risk in dollars (four buttons you set yourself), entry at the mid,
-  market, ask or bid, one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
+  market, ask, bid or your own limit price (Lmt), one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
   (it checks every 3 seconds and only while the app is running; it never loosens a stop). One click
   sends one Schwab bracket. Entries must be armed each session.
