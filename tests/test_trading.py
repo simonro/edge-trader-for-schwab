@@ -1341,3 +1341,92 @@ def test_only_the_order_client_may_read_option_chains():
     assert not ({"option_chains", "option_expiration_chain"} & schwab._ALLOWED)
     assert trading.OCC_RE.match(CALL) and trading.OCC_RE.match("SPY   261120P00600000")
     assert not trading.OCC_RE.match("AAPL")
+
+
+# ---- size by quantity, no stop, no target ------------------------------------------------------
+
+def qty_req(**kw):
+    # Fixture quote 338.70 / 338.77: the mid entry is 338.74.
+    base = {"ticket_id": "qty-ticket-01", "symbol": "BRVO", "side": "LONG", "stop": "336.00", "risk": 0, "r": 2,
+            "entry": "mid", "size_mode": "qty", "qty": 50, "targets": 0,
+            "expected_limit": "338.74", "expected_qty": 50, "expected_target": None}
+    return {**base, **kw}
+
+
+def test_quantity_ticket_with_stop_only(trader):
+    r = trader.submit(qty_req())
+    assert r["ok"], r
+    (order,) = trader._client.placed
+    assert order["orderStrategyType"] == "TRIGGER" and order["orderLegCollection"][0]["quantity"] == 50
+    (stop,) = order["childOrderStrategies"]
+    assert stop["orderType"] == "STOP" and stop["stopPrice"] == "336.00"
+    t = trader.store.get_ticket("qty-ticket-01")
+    assert t["target"] == "" and t["stop"] == "336.00" and t["risk"] == 137.0      # 50 x 2.74
+
+
+def test_no_stop_ticket_needs_the_confirmation(trader):
+    req = qty_req(stop="", stop_type="none")
+    r = trader.submit(req)
+    assert not r["ok"] and "confirmation" in r["error"] and trader._client.placed == []
+    r = trader.submit({**req, "confirm_no_stop": True})
+    assert r["ok"], r
+    (order,) = trader._client.placed
+    assert order["orderStrategyType"] == "SINGLE" and "childOrderStrategies" not in order
+    t = trader.store.get_ticket("qty-ticket-01")
+    assert t["stop"] == "" and t["target"] == ""
+    assert trader.r_basis([]) == {}                     # no stop, no R
+
+
+def test_no_stop_lock_is_a_tenth_of_a_percent(trader, monkeypatch):
+    req = qty_req(stop="", stop_type="none", confirm_no_stop=True)
+    _quote(monkeypatch, trader, 338.80, 338.95)           # mid 338.875: 0.135 against, under 0.1% (0.339)
+    assert trader.submit(req)["ok"]
+    _quote(monkeypatch, trader, 339.05, 339.20)           # mid 339.125: 0.385 against, refused
+    r = trader.submit({**req, "ticket_id": "qty-ticket-02"})
+    assert not r["ok"] and "Price moved" in r["error"]
+
+
+def test_quantity_ticket_refuses_a_changed_quantity_or_target(trader):
+    r = trader.submit(qty_req(expected_qty=40))
+    assert not r["ok"] and "now says 50 shares" in r["error"]
+    r = trader.submit(qty_req(targets=1))                 # the plan has a target, the page showed none
+    assert not r["ok"] and "ticket showed none" in r["error"]
+    r = trader.submit(qty_req(expected_target="344.22"))  # the page showed a target, the plan has none
+    assert not r["ok"] and "plan has none" in r["error"]
+    assert trader._client.placed == []
+
+
+def test_target_only_ticket(trader):
+    r = trader.submit(qty_req(stop="", stop_type="none", targets=1, target_price="342.00",
+                              expected_target="342.00", confirm_no_stop=True))
+    assert r["ok"], r
+    (tgt,) = trader._client.placed[0]["childOrderStrategies"]
+    assert tgt["orderType"] == "LIMIT" and tgt["price"] == "342.00"
+
+
+def test_reconcile_matches_the_new_order_shapes():
+    from companion.bracket import bracket_order, plan
+    kw = dict(symbol="NVDA", side="LONG", stop="186.50", risk=0, r_multiple=2, bid="188.62", ask="188.68",
+              entry="mid", size_mode="qty", qty=100)
+
+    def as_schwab(o):
+        """What Schwab reports back: ids, statuses, numbers instead of strings."""
+        import copy
+        o = copy.deepcopy(o)
+        ids = iter(range(100, 200))
+
+        def walk(n):
+            n["orderId"], n["status"] = next(ids), "WORKING"
+            for k in ("price", "stopPrice"):
+                if k in n:
+                    n[k] = float(n[k])
+            for ch in n.get("childOrderStrategies") or []:
+                walk(ch)
+        walk(o)
+        return o
+    for p in (plan(**kw, target=False), plan(**{**kw, "stop_type": "none"}, target=False),
+              plan(**{**kw, "stop_type": "none"}, target_price="195.00")):
+        sent = bracket_order(p)
+        assert Trader._matches(as_schwab(sent), {"request": sent}), sent
+    a, b = bracket_order(plan(**kw, target=False)), bracket_order(plan(**{**kw, "qty": 99}, target=False))
+    assert not Trader._matches(as_schwab(a), {"request": b})

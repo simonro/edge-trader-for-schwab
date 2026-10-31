@@ -297,3 +297,79 @@ def test_stock_plan_is_unchanged_by_the_option_fields():
     p = plan("avgo", "LONG", stop="336.00", risk=500, r_multiple=2, bid="338.70", ask="338.77")
     assert p.asset == "EQUITY" and p.multiplier == 1 and p.unit_risk == p.per_share
     assert bracket_order(p)["orderLegCollection"][0]["instrument"] == {"symbol": "AVGO", "assetType": "EQUITY"}
+
+
+# ---- size by quantity, no stop, no target ------------------------------------------------
+
+def _stk(**kw):
+    base = dict(symbol="NVDA", side="LONG", stop="186.50", risk=0, r_multiple=2, bid="188.62", ask="188.68",
+                entry="mid", size_mode="qty", qty=100)
+    base.update(kw)
+    return plan(**base)
+
+
+def test_quantity_mode_sends_the_typed_size_with_risk_shown():
+    p = _stk()
+    assert p.ok, p.errors
+    assert p.qty == 100 and p.limit == Decimal("188.65") and p.per_share == Decimal("2.15")
+    assert p.planned_risk == Decimal("215.00") and p.target == Decimal("192.95")
+    assert bracket_order(p)["childOrderStrategies"][0]["orderStrategyType"] == "OCO"   # full bracket, as before
+
+
+def test_quantity_mode_refuses_bad_or_too_big_sizes():
+    assert "whole number" in _stk(qty="2.5").errors[0]
+    assert "whole number" in _stk(qty=None).errors[0]
+    assert "at most 10000" in _stk(qty=10001).errors[0]
+    assert "notional cap" in _stk(qty=2000).errors[0]               # 2000 x 188.65 > $250,000
+    assert "at most 100 contracts" in _opt(size_mode="qty", qty=101).errors[0]
+
+
+def test_no_stop_only_when_sizing_by_quantity():
+    p = _stk(stop_type="none", stop="186.50", target_price="195.00")
+    assert p.ok, p.errors
+    assert p.stop == 0 and p.per_share == 0 and p.planned_risk == 0      # the typed stop is ignored
+    assert p.warnings[0].startswith("NO STOP")
+    assert "sizing by risk needs a stop" in _stk(size_mode="risk", risk=500, stop_type="none").errors[0]
+    assert "type a stop price (or pick None)" in _stk(stop="").errors[0]
+
+
+def test_no_stop_means_no_r():
+    assert "type the target price" in _stk(stop_type="none").errors[0]
+    assert "two targets need a stop" in _stk(stop_type="none", target_price="195.00", split=0.5).errors[0]
+    assert "two targets need a stop" in _stk(target=False, split=0.5).errors[0]
+
+
+def test_the_four_order_shapes():
+    full = bracket_order(_stk())
+    stop_only = bracket_order(_stk(target=False))
+    tgt_only = bracket_order(_stk(stop_type="none", target_price="195.00"))
+    bare = bracket_order(_stk(stop_type="none", target=False))
+    assert full["orderStrategyType"] == "TRIGGER" and full["childOrderStrategies"][0]["orderStrategyType"] == "OCO"
+    (s,) = stop_only["childOrderStrategies"]
+    assert stop_only["orderStrategyType"] == "TRIGGER" and s["orderType"] == "STOP" and s["stopPrice"] == "186.50"
+    assert s["orderLegCollection"][0]["instruction"] == "SELL" and s["orderLegCollection"][0]["quantity"] == 100
+    (t,) = tgt_only["childOrderStrategies"]
+    assert t["orderType"] == "LIMIT" and t["price"] == "195.00" and t["orderLegCollection"][0]["instruction"] == "SELL"
+    assert bare["orderStrategyType"] == "SINGLE" and "childOrderStrategies" not in bare
+    assert bare["orderType"] == "LIMIT" and bare["price"] == "188.65"
+    mkt = bracket_order(_stk(stop_type="none", target=False, entry="market"))
+    assert mkt["orderType"] == "MARKET" and "price" not in mkt
+
+
+def test_trail_without_a_stop_price_in_quantity_mode():
+    p = _stk(stop="", stop_type="trail", trail_unit="$", trail_value=1.5, target=False)
+    assert p.ok, p.errors
+    assert p.trail["offset"] == Decimal("1.50") and p.per_share == 0
+    (s,) = bracket_order(p)["childOrderStrategies"]
+    assert s["orderType"] == "TRAILING_STOP"
+    assert "type a stop price" in _stk(stop="", stop_type="trail", trail_unit="R").errors[0]
+    assert "type a stop price" in _stk(stop="", stop_type="autobe").errors[0]
+
+
+def test_option_quantity_without_a_stop():
+    p = _opt(size_mode="qty", qty=5, stop_type="none", target=False)
+    assert p.ok, p.errors
+    order = bracket_order(p)
+    assert order["orderStrategyType"] == "SINGLE" and order["orderLegCollection"][0]["instruction"] == "BUY_TO_OPEN"
+    short = _opt(size_mode="qty", qty=2, side="SHORT", stop_type="none", target=False)
+    assert any("no limit on the loss" in w for w in short.warnings)

@@ -33,6 +33,7 @@ log = logging.getLogger("companion.trading")
 
 LOCK_R = Decimal("0.1")       # the click keeps the displayed plan while price moved <= 0.1R against it
 LOCK_MIN_TICKS = 2            # ...and at least 2 ticks (2 cents above $1; 2 option ticks for an option)
+NO_STOP_LOCK = Decimal("0.001")   # no stop, no R: the lock is 0.1% of the price instead
 RISK_CHOICES = (250, 375, 500, 750)      # defaults; the user edits them with the gear on the ticket
 EXPIRATIONS_TTL = 300.0       # the option chain picker's expiry list, seconds
 CHAIN_TTL = 5.0               # one expiry's strikes (bid / ask move; the click re-quotes anyway)
@@ -354,7 +355,9 @@ class Trader:
                     t1_price=req.get("t1_price"), stop_type=req.get("stop_type") or "fixed",
                     trail_unit=req.get("trail_unit") or "R", trail_value=req.get("trail_value") or 1,
                     trail_basis=req.get("trail_basis") or "MARK", limit_override=limit_override,
-                    asset=asset, multiplier=mult, ticks=q.get("ticks") or ticks_for(asset))
+                    asset=asset, multiplier=mult, ticks=q.get("ticks") or ticks_for(asset),
+                    size_mode=req.get("size_mode") or "risk", qty=req.get("qty"),
+                    target=req.get("targets", 1) not in (0, "0"))
 
     # ---- option chain picker (only on a click in the ticket's Option mode) ---------------------
 
@@ -470,7 +473,7 @@ class Trader:
         except Exception:
             exp_limit = exp_target = Decimal(0)
             exp_qty = 0
-        if not (exp_limit.is_finite() and exp_target.is_finite()) or exp_limit <= 0 or exp_target <= 0 or exp_qty <= 0:
+        if not (exp_limit.is_finite() and exp_target.is_finite()) or exp_limit <= 0 or exp_target < 0 or exp_qty <= 0:
             return {"ok": False, "error": "ticket is missing the displayed plan; review and click again"}
         q = self.quote(req["symbol"], max_age=0)
         now = self.make_plan(req, q=q)          # what a fresh ticket would show
@@ -489,7 +492,9 @@ class Trader:
         # move in favour fills at a better price. A Mkt entry has no price cap: the lock only
         # refuses when the quote already sits more than 0.1R worse, and the fill can slip beyond.
         f, unit_w = p.f, ("contracts" if p.option else "shares")
-        lock = max(LOCK_R * p.per_share, LOCK_MIN_TICKS * tick(exp_limit, p.ticks))
+        # Without a stop there is no R: the lock is 0.1% of the price (at least the 2 ticks).
+        lock = max(LOCK_R * p.per_share if p.per_share else exp_limit * NO_STOP_LOCK,
+                   LOCK_MIN_TICKS * tick(exp_limit, p.ticks))
         long = p.side == "LONG"
         against = now.limit - exp_limit if long else exp_limit - now.limit
         if against > lock:
@@ -498,21 +503,30 @@ class Trader:
                     "plan": now.as_dict()}
         # After a move in favour the fill comes nearer the stop: keep the minimum stop distance
         # from where it would fill now, not from the displayed price.
-        room = now.limit - p.stop if long else p.stop - now.limit
-        if room < MIN_STOP_TICKS * tick(now.limit, p.ticks):
+        room = (now.limit - p.stop if long else p.stop - now.limit) if p.stop else None
+        if room is not None and room < MIN_STOP_TICKS * tick(now.limit, p.ticks):
             return {"ok": False, "error": f"Price is within {MIN_STOP_TICKS} ticks of the stop {f(p.stop)}. "
+                    "Review and click again.", "plan": now.as_dict()}
+        if p.size_mode == "qty" and p.qty != exp_qty:
+            return {"ok": False, "error": f"The ticket now says {p.qty} {unit_w} (it showed {exp_qty}). "
                     "Review and click again.", "plan": now.as_dict()}
         if p.qty < exp_qty:
             return {"ok": False, "error": f"Size changed to {p.qty} {unit_w} (ticket showed {exp_qty}). "
                     "Review and click again.", "plan": now.as_dict()}
+        if not p.has_stop and not req.get("confirm_no_stop"):
+            # The page asks "Send without a stop?" on every click; a request without that answer is refused.
+            return {"ok": False, "error": "Sending without a stop needs your confirmation. Click again and confirm.",
+                    "plan": now.as_dict()}
         # Never more shares (contracts) than displayed; recompute the numbers for that size.
         p.qty = exp_qty
         p.planned_risk = p.per_share * p.qty * p.multiplier
         p.notional = p.limit * p.qty * p.multiplier
         # Same entry price and inputs give the same targets; a difference means the ticket's
         # inputs changed after it was displayed.
-        if p.target != exp_target:
-            return {"ok": False, "error": f"Target is now {f(p.target)} (ticket showed {f(exp_target)}). "
+        if not p.has_target and exp_target:
+            return {"ok": False, "error": "Ticket showed a target but the plan has none. Review.", "plan": now.as_dict()}
+        if p.has_target and p.target != exp_target:
+            return {"ok": False, "error": f"Target is now {f(p.target)} (ticket showed {f(exp_target) if exp_target else 'none'}). "
                     "Review and click again.", "plan": now.as_dict()}
         if p.two_targets:
             p.qty1 = int((p.qty * p.split).to_integral_value(rounding=ROUND_FLOOR))
@@ -556,7 +570,7 @@ class Trader:
                 return {"ok": False, "error": head.rstrip(".") + ". Nothing was sent: use a fixed stop or Auto B/E.",
                         "plan": now.as_dict()}
         intent = {"ticket_id": ticket_id, "symbol": p.symbol, "side": p.side, "qty": p.qty,
-                  "limit": f(p.limit), "stop": f(p.stop), "target": f(p.target),
+                  "limit": f(p.limit), "stop": f(p.stop) if p.stop else "", "target": f(p.target) if p.has_target else "",
                   "risk": float(p.planned_risk), "request": order}
         if p.stop_type == "autobe":
             self.store.add_auto_be(ticket_id, p.symbol)     # Simon's consent for one stop move
@@ -1813,14 +1827,36 @@ class Trader:
             except (TypeError, ValueError):
                 return None
 
+        def stop_of(k):
+            if k.get("orderType") in ("STOP", "STOP_LIMIT"):
+                return num(k.get("stopPrice"))
+            if k.get("orderType") == "TRAILING_STOP":
+                return ("TRAIL", k.get("stopPriceLinkType"), k.get("stopPriceLinkBasis"), num(k.get("stopPriceOffset")))
+            return None
+
         legs = o.get("orderLegCollection") or []
-        if o.get("orderStrategyType") != "TRIGGER" or len(legs) != 1:
+        if o.get("orderStrategyType") not in ("TRIGGER", "SINGLE") or len(legs) != 1:
             return None
         entry = (legs[0].get("instruction"), (legs[0].get("instrument") or {}).get("symbol"),
                  num(legs[0].get("quantity") or o.get("quantity")), num(o.get("price")))
+        if o.get("orderStrategyType") == "SINGLE":
+            # An entry sent without stop or target: only an opening order can be a ticket's entry.
+            return ((entry, ()) if not o.get("childOrderStrategies") and entry[0] in OPENING_INSTRUCTIONS | {"BUY"}
+                    else None)
         exits = []
         for oco in o.get("childOrderStrategies") or []:
             kids = oco.get("childOrderStrategies") or []
+            if oco.get("orderStrategyType") == "SINGLE":
+                # A stop alone or a target alone under the entry.
+                leg = (oco.get("orderLegCollection") or [{}])[0]
+                q = num(oco.get("quantity") or leg.get("quantity"))
+                if oco.get("orderType") == "LIMIT":
+                    exits.append((q, leg.get("instruction"), num(oco.get("price")), None))
+                elif stop_of(oco) is not None:
+                    exits.append((q, leg.get("instruction"), None, stop_of(oco)))
+                else:
+                    return None
+                continue
             if oco.get("orderStrategyType") != "OCO" or len(kids) != 2:
                 return None
             kl = [(k.get("orderLegCollection") or [{}])[0] for k in kids]
@@ -1834,7 +1870,7 @@ class Trader:
             if len(qtys) != 1 or len(stops) != 1 or len(targets) != 1:
                 return None
             exits.append((qtys.pop(), kl[0].get("instruction"), targets[0], stops[0]))
-        return (entry, tuple(sorted(exits))) if exits else None
+        return (entry, tuple(sorted(exits, key=repr))) if exits else None
 
     @classmethod
     def _matches(cls, o: dict, t: dict) -> bool:
@@ -1938,6 +1974,8 @@ class Trader:
             if qty <= 0:
                 continue
             entry = sum(float(e["price"]) * float(e["quantity"]) for e in legs) / qty
+            if not _dec(t["stop"]):
+                continue                  # a ticket sent without a stop price has no R
             stop = float(t["stop"])
             rps = abs(entry - stop)
             first_fill = min((e.get("time") for e in legs if e.get("time")), default=None)

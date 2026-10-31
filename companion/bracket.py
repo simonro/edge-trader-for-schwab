@@ -110,6 +110,12 @@ class Plan:
     asset: str = "EQUITY"                 # EQUITY | OPTION
     multiplier: Decimal = Decimal(1)
     ticks: str = EQUITY
+    size_mode: str = "risk"               # risk: qty from risk / stop distance; qty: the user's number
+    has_target: bool = True               # False: no target is sent (add one later from the position)
+
+    @property
+    def has_stop(self) -> bool:
+        return self.stop_type != "none"
 
     @property
     def option(self) -> bool:
@@ -141,7 +147,7 @@ class Plan:
     def as_dict(self) -> dict:
         f = self.f
         return {
-            "symbol": self.symbol, "side": self.side, "stop": f(self.stop), "risk": float(self.risk),
+            "symbol": self.symbol, "side": self.side, "stop": f(self.stop) if self.stop else None, "risk": float(self.risk),
             "r_multiple": float(self.r_multiple), "bid": float(self.bid), "ask": float(self.ask),
             "limit": f(self.limit) if self.limit else None, "qty": self.qty,
             "per_share": float(self.per_share), "target": f(self.target) if self.target else None,
@@ -155,8 +161,9 @@ class Plan:
             "trail_start": f(self.trail_start) if self.trail_start else None, "warnings": self.warnings,
             "be_trigger": f(self.be_trigger) if self.be_trigger else None,
             "asset": self.asset, "multiplier": float(self.multiplier), "unit_risk": float(self.unit_risk),
-            "target_r": float(self._r_of(self.target)) if self.target else None,
-            "target1_r": float(self._r_of(self.target1)) if self.target1 else None,
+            "size_mode": self.size_mode, "has_stop": self.has_stop, "has_target": self.has_target,
+            "target_r": float(self._r_of(self.target)) if self.target and self.per_share else None,
+            "target1_r": float(self._r_of(self.target1)) if self.target1 and self.per_share else None,
             "errors": self.errors, "ok": self.ok,
         }
 
@@ -228,7 +235,8 @@ def stop_leg(spec, legs: list[dict], duration: str = "DAY", ticks: str = EQUITY)
 
 def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r=1, entry="cross",
          target_price=None, t1_price=None, stop_type="fixed", trail_unit="R", trail_value=1,
-         trail_basis="MARK", limit_override=None, asset="EQUITY", multiplier=1, ticks=None) -> Plan:
+         trail_basis="MARK", limit_override=None, asset="EQUITY", multiplier=1, ticks=None,
+         size_mode="risk", qty=None, target=True) -> Plan:
     """Size a bracket. Never moves the user's prices: an off-tick stop or target is an error, not rounded.
 
     split > 0 makes it a two-target entry: floor(qty x split) shares exit at target 1, the runner
@@ -241,9 +249,14 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
     asset="OPTION": a single call or put, LONG = buy to open, SHORT = sell to open. Stop and targets
     are option prices on the contract's grid (ticks); contracts are sized from risk / (risk per
     unit x multiplier). Options enter with a limit only (mid, bid or ask): no market or cross.
+
+    size_mode="qty" sends the user's own quantity instead of sizing it from the risk. Only then may
+    the ticket go without a stop (stop_type "none"); target=False sends no target. A missing exit can
+    be added later from the position (Move stop / Replace target pair them into one OCO).
     """
     side = side.upper()
-    p = Plan(symbol.upper().strip(), side, Decimal(str(stop)), Decimal(str(risk)),
+    stop_v = _price(stop)
+    p = Plan(symbol.upper().strip(), side, stop_v if stop_v is not None else Decimal(0), Decimal(str(risk or 0)),
              Decimal(str(r_multiple or 0)), Decimal(str(bid or 0)), Decimal(str(ask or 0)),
              split=Decimal(str(split or 0)), t1_r=Decimal(str(t1_r or 0)), entry=(entry or "cross").lower(),
              target_price=_price(target_price), t1_price=_price(t1_price),
@@ -251,6 +264,8 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
     p.asset = (asset or "EQUITY").upper()
     p.multiplier = Decimal(str(multiplier or 1))
     p.ticks = ticks or ticks_for(p.asset)
+    p.size_mode = (size_mode or "risk").lower()
+    p.has_target = bool(target)
     tk, f = p.ticks, p.f
     if p.asset not in ("EQUITY", "OPTION"):
         p.errors.append(f"{p.asset} cannot be traded from the ticket")
@@ -267,26 +282,45 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
     if p.option and p.entry in ("market", "cross"):
         p.errors.append("options enter with a limit: pick Mid, Ask or Bid")
         return p
-    typed = [v for v in (p.target_price, p.t1_price) if v is not None]
-    if any(not v.is_finite() for v in typed):
-        p.errors.append("a typed target price is not a number")
+    if p.size_mode not in ("risk", "qty"):
+        p.errors.append("size must be by risk or by quantity")
         return p
-    if not all(v.is_finite() for v in (p.stop, p.risk, p.r_multiple, p.bid, p.ask, p.split, p.t1_r)):
+    if p.stop_type not in ("fixed", "autobe", "trail", "none"):
+        p.errors.append("stop type must be fixed, autobe, trail or none")
+        return p
+    if p.stop_type == "none":
+        p.stop = Decimal(0)                     # a typed stop is ignored when the ticket says no stop
+        if p.size_mode == "risk":
+            p.errors.append("sizing by risk needs a stop: type a stop, or size by quantity")
+            return p
+    # A stop price is needed to size by risk, for a fixed or Auto B/E stop, and for a trail in R.
+    trail_r = p.stop_type == "trail" and (trail_unit or "R").upper() == "R"
+    if p.stop_type != "none" and stop_v is None and (p.size_mode == "risk" or p.stop_type in ("fixed", "autobe") or trail_r):
+        p.errors.append("type a stop price" + (" (or pick None)" if p.size_mode == "qty" else ""))
+        return p
+    typed = [v for v in (p.target_price, p.t1_price, stop_v) if v is not None]
+    if any(not v.is_finite() for v in typed):
+        p.errors.append("a typed price is not a number")
+        return p
+    if not all(v.is_finite() for v in (p.risk, p.r_multiple, p.bid, p.ask, p.split, p.t1_r)):
         p.errors.append("all numbers must be finite")
         return p
     if p.bid <= 0 or p.ask <= 0 or p.ask < p.bid:
         p.errors.append("no valid bid/ask quote")
         return p
-    if p.risk <= 0:
+    if p.size_mode == "risk" and p.risk <= 0:
         p.errors.append("risk must be above $0")
-    if p.r_multiple <= 0 and p.target_price is None:
+    if p.has_target and p.r_multiple <= 0 and p.target_price is None:
         p.errors.append("target multiple must be above 0")
-    for name, v in (("target", p.target_price), ("target 1", p.t1_price)):
+    for name, v in (("target", p.target_price if p.has_target else None), ("target 1", p.t1_price)):
         if v is not None and (v <= 0 or _to_tick(v, ROUND_HALF_UP, tk) != v):
             p.errors.append(f"{name} must be a valid price in {f(tick(v if v > 0 else Decimal(1), tk))} steps")
             return p
-    if p.stop <= 0 or _to_tick(p.stop, ROUND_HALF_UP, tk) != p.stop:
+    if p.stop and (p.stop <= 0 or _to_tick(p.stop, ROUND_HALF_UP, tk) != p.stop):
         p.errors.append(f"stop must be a valid price in {f(tick(p.stop if p.stop > 0 else Decimal(1), tk))} steps")
+        return p
+    if stop_v is not None and stop_v <= 0 and p.stop_type != "none":
+        p.errors.append("stop must be above 0")
         return p
 
     long = side == "LONG"
@@ -305,66 +339,96 @@ def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r
         # Literal bid / ask, put on a valid tick BEFORE sizing (a sub-penny quote would otherwise
         # be sized at one price and sent at another): the bid rounds down, the ask up.
         p.limit = _to_tick(p.bid, ROUND_FLOOR, tk) if p.entry == "bid" else _to_tick(p.ask, ROUND_CEILING, tk)
-    if long:
-        if p.stop >= p.bid:
-            p.errors.append(f"stop {f(p.stop)} must be below the bid {f(p.bid)}")
-            return p
-        p.per_share = p.limit - p.stop
-    else:
-        if p.stop <= p.ask:
-            p.errors.append(f"stop {f(p.stop)} must be above the ask {f(p.ask)}")
-            return p
-        p.per_share = p.stop - p.limit
+    if p.stop:
+        if long:
+            if p.stop >= p.bid:
+                p.errors.append(f"stop {f(p.stop)} must be below the bid {f(p.bid)}")
+                return p
+            p.per_share = p.limit - p.stop
+        else:
+            if p.stop <= p.ask:
+                p.errors.append(f"stop {f(p.stop)} must be above the ask {f(p.ask)}")
+                return p
+            p.per_share = p.stop - p.limit
 
     if p.limit <= 0:
         p.errors.append("entry price rounds to zero")
         return p
-    if p.per_share < MIN_STOP_TICKS * tick(p.limit, tk):
+    if p.stop and p.per_share < MIN_STOP_TICKS * tick(p.limit, tk):
         p.errors.append(f"stop is less than {MIN_STOP_TICKS} ticks from the entry")
         return p
 
-    qty = int((p.risk / p.unit_risk).to_integral_value(rounding=ROUND_FLOOR))
-    qty = min(qty, MAX_CONTRACTS if p.option else MAX_SHARES,
-              int((MAX_NOTIONAL / (p.limit * p.multiplier)).to_integral_value(rounding=ROUND_FLOOR)))
-    p.qty = qty
-    if qty < 1:
-        one = "contract" if p.option else "share"
-        p.errors.append(f"risk ${p.risk} is less than one {one}'s risk (${p.unit_risk:.2f})")
-        return p
-    if p.target_price is not None:
-        p.target = p.target_price
+    cap = MAX_CONTRACTS if p.option else MAX_SHARES
+    by_notional = int((MAX_NOTIONAL / (p.limit * p.multiplier)).to_integral_value(rounding=ROUND_FLOOR))
+    unit_word = "contracts" if p.option else "shares"
+    if p.size_mode == "qty":
+        try:
+            n = Decimal(str(qty))
+        except Exception:
+            n = Decimal("NaN")
+        if not n.is_finite() or n != n.to_integral_value() or n < 1:
+            p.errors.append(f"type how many {unit_word} (a whole number, at least 1)")
+            return p
+        n = int(n)
+        if n > cap:
+            p.errors.append(f"at most {cap} {unit_word} per ticket")
+            return p
+        if n > by_notional:
+            p.errors.append(f"{n} {unit_word} is over the ${MAX_NOTIONAL:,.0f} notional cap (at most {by_notional})")
+            return p
+        p.qty = n
     else:
-        move = p.per_share * p.r_multiple
-        # Round the target toward the entry, so it is never further than R x risk.
-        p.target = (_to_tick(p.limit + move, ROUND_FLOOR, tk) if side == "LONG"
-                    else _to_tick(p.limit - move, ROUND_CEILING, tk))
-    if p.target <= 0 and p.target_price is None:
-        p.errors.append(f"a {p.r_multiple:g}R target would be at or below $0, not a valid price on the profitable side: "
-                        "pick a smaller R or type a target price")
-        p.qty = 0
-        return p
-    if p.target <= 0 or (p.target <= p.limit if side == "LONG" else p.target >= p.limit):
-        p.errors.append(f"target {f(p.target) if p.target > 0 else p.target} is not a valid price on the profitable side")
-        p.qty = 0
-        return p
+        n = int((p.risk / p.unit_risk).to_integral_value(rounding=ROUND_FLOOR))
+        p.qty = min(n, cap, by_notional)
+        if p.qty < 1:
+            one = "contract" if p.option else "share"
+            p.errors.append(f"risk ${p.risk} is less than one {one}'s risk (${p.unit_risk:.2f})")
+            return p
+    qty = p.qty
+    if p.has_target:
+        if p.target_price is not None:
+            p.target = p.target_price
+        elif not p.per_share:
+            p.errors.append("with no stop there is no R: type the target price")
+            p.qty = 0
+            return p
+        else:
+            move = p.per_share * p.r_multiple
+            # Round the target toward the entry, so it is never further than R x risk.
+            p.target = (_to_tick(p.limit + move, ROUND_FLOOR, tk) if side == "LONG"
+                        else _to_tick(p.limit - move, ROUND_CEILING, tk))
+        if p.target <= 0 and p.target_price is None:
+            p.errors.append(f"a {p.r_multiple:g}R target would be at or below $0, not a valid price on the profitable side: "
+                            "pick a smaller R or type a target price")
+            p.qty = 0
+            return p
+        if p.target <= 0 or (p.target <= p.limit if side == "LONG" else p.target >= p.limit):
+            p.errors.append(f"target {f(p.target) if p.target > 0 else p.target} is not a valid price on the profitable side")
+            p.qty = 0
+            return p
     p.planned_risk = p.per_share * qty * p.multiplier
     p.notional = p.limit * qty * p.multiplier
     if p.option:
         _option_warnings(p)
     if p.split > 0:
+        if not p.has_target or p.stop_type == "none":
+            p.errors.append("two targets need a stop and a target")
+            p.qty = 0
+            return p
         _two_targets(p)
     if p.ok and p.stop_type == "trail":
         _trailing_stop(p, trail_unit, trail_value, trail_basis)
     elif p.ok and p.stop_type == "autobe":
         p.be_trigger = p.limit + p.per_share if long else p.limit - p.per_share
-    elif p.stop_type != "fixed":
-        p.errors.append("stop type must be fixed, autobe or trail")
-        p.qty = 0
+    if p.ok and p.stop_type == "none":
+        p.warnings.insert(0, "NO STOP: nothing protects this position at Schwab until you add one in Manage.")
+        if p.option and p.side == "SHORT":
+            p.warnings.insert(1, "A short option with no stop has no limit on the loss.")
     return p
 
 
 def _trailing_stop(p: Plan, unit, value, basis) -> None:
-    spec, err = trail_spec(unit, value, p.per_share, basis, p.ticks)
+    spec, err = trail_spec(unit, value, p.per_share or None, basis, p.ticks)
     if err:
         p.errors.append(err)
         p.qty = 0
@@ -375,7 +439,7 @@ def _trailing_stop(p: Plan, unit, value, basis) -> None:
     ref = {"MARK": (p.bid + p.ask) / 2, "BID": p.bid, "ASK": p.ask, "LAST": p.limit}[spec["basis"]]
     ref = min(ref, p.limit) if p.side == "LONG" else max(ref, p.limit)
     p.trail_start = trail_level(ref, spec, p.side, p.ticks)
-    wider = p.trail_start < p.stop if p.side == "LONG" else p.trail_start > p.stop
+    wider = bool(p.stop) and (p.trail_start < p.stop if p.side == "LONG" else p.trail_start > p.stop)
     if wider:
         extra = abs(p.trail_start - p.stop) * p.qty * p.multiplier
         p.warnings.append(f"The trail starts at {p.f(p.trail_start)}, beyond your stop {p.f(p.stop)}: "
@@ -431,6 +495,9 @@ def bracket_order(p: Plan, exit_duration: str = "DAY") -> dict:
 
     Two targets (OT2OCO): entry LIMIT -> [OCO(target1, stop) for qty1, OCO(runner, stop) for
     the rest]. Each half has its own stop, so taking target 1 never cancels the runner's stop.
+
+    Without a target the entry triggers the stop alone; without a stop, the target alone; with
+    neither, the entry is a plain SINGLE order.
     """
     if not p.ok:
         raise ValueError("cannot build an order from an invalid plan: " + "; ".join(p.errors))
@@ -453,16 +520,26 @@ def bracket_order(p: Plan, exit_duration: str = "DAY") -> dict:
             ],
         }
 
-    exits = ([oco(p.qty1, p.target1), oco(p.qty - p.qty1, p.target)] if p.two_targets
-             else [oco(p.qty, p.target)])
+    if p.two_targets:
+        exits = [oco(p.qty1, p.target1), oco(p.qty - p.qty1, p.target)]
+    elif p.has_stop and p.has_target:
+        exits = [oco(p.qty, p.target)]
+    elif p.has_stop:
+        exits = [stop_leg(p.trail or p.stop, leg(exit_instr, p.qty), exit_duration, p.ticks)]
+    elif p.has_target:
+        exits = [{"orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
+                  "duration": exit_duration, "price": p.f(p.target), "orderLegCollection": leg(exit_instr, p.qty)}]
+    else:
+        exits = []
     order = {
-        "orderStrategyType": "TRIGGER",
+        "orderStrategyType": "TRIGGER" if exits else "SINGLE",
         "orderType": "MARKET" if p.market else "LIMIT",
         "session": "NORMAL",
         "duration": "DAY",
         "orderLegCollection": leg(entry_instr, p.qty),
-        "childOrderStrategies": exits,
     }
+    if exits:
+        order["childOrderStrategies"] = exits
     if not p.market:
         order["price"] = p.f(p.limit)
     return order

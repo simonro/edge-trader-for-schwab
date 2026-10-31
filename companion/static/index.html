@@ -358,21 +358,23 @@
           <button type="button" data-v="mid" class="on">Mid</button><button type="button" data-v="market">Mkt</button><button type="button" data-v="ask">Ask</button><button type="button" data-v="bid">Bid</button></div></div>
       </div>
       <div class="fld"><span class="lbl">Stop type</span><div class="seg full" id="t-stoptype">
-        <button type="button" data-v="fixed" class="on">Fixed</button><button type="button" data-v="autobe">Auto B/E 1R</button><button type="button" data-v="trail">Trail</button></div></div>
+        <button type="button" data-v="fixed" class="on">Fixed</button><button type="button" data-v="autobe">Auto B/E 1R</button><button type="button" data-v="trail">Trail</button><button type="button" data-v="none" title="Only when sizing by quantity">None</button></div></div>
       <div class="chips" id="t-trailbox" style="display:none"><span class="chips" id="t-trailunit"></span><input class="in" id="t-trailval" inputmode="decimal" value="1"><span class="chips" id="t-trailbasis"></span></div>
-      <div class="fld"><span class="lbl" style="display:flex;align-items:center;gap:6px">Risk $
+      <div class="fld"><span class="lbl">Size by</span><div class="seg full" id="t-size"><button type="button" data-v="risk" class="on">Risk $</button><button type="button" data-v="qty">Quantity</button></div></div>
+      <div class="fld" id="t-qtyfld" style="display:none"><span class="lbl" id="t-qtylbl">Shares</span><input class="in" id="t-qty" inputmode="numeric" autocomplete="off" placeholder="how many"></div>
+      <div class="fld" id="t-riskfld"><span class="lbl" style="display:flex;align-items:center;gap:6px">Risk $
         <button type="button" class="gear" id="t-risk-gear" title="Change the risk buttons">⚙</button></span>
         <div class="riskedit" id="t-risk-edit" style="display:none">
           <input class="in" inputmode="decimal"><input class="in" inputmode="decimal"><input class="in" inputmode="decimal"><input class="in" inputmode="decimal">
           <button type="button" class="btn primary" id="t-risk-save">Save</button><button type="button" class="btn" id="t-risk-cancel">Cancel</button>
           <span class="tk-msg" id="t-risk-msg"></span></div>
         <div class="chips" id="t-risk-row"><span id="t-risk" class="chips" style="flex:1"></span><input class="in" id="t-risk-custom" inputmode="decimal" placeholder="other $"></div></div>
-      <div class="fld"><span class="lbl">Targets</span><div class="seg full" id="t-targets"><button type="button" data-v="1" class="on">One target</button><button type="button" data-v="2">Two targets</button></div></div>
+      <div class="fld"><span class="lbl">Targets</span><div class="seg full" id="t-targets"><button type="button" data-v="0">None</button><button type="button" data-v="1" class="on">One target</button><button type="button" data-v="2">Two targets</button></div></div>
       <div class="tgt" id="t-t1box" style="display:none">
         <div class="th"><span class="t">Target 1</span>size<div class="chips sz" id="t-split"><button type="button" class="btn" data-v="0.25">25%</button><button type="button" class="btn on" data-v="0.5">50%</button><button type="button" class="btn" data-v="0.75">75%</button></div></div>
         <div class="chips"><span class="chips" id="t-t1r" style="flex:1"></span><input class="in" id="t-t1p" inputmode="decimal" placeholder="or price"></div>
       </div>
-      <div class="tgt">
+      <div class="tgt" id="t-t2box">
         <div class="th"><span class="t" id="t-t2title">Target</span><span id="t-t2sub"></span><span class="ovr" id="t-t2ovr"></span></div>
         <div class="chips"><span class="chips" id="t-r" style="flex:1"></span><input class="in" id="t-tp" inputmode="decimal" placeholder="or price"></div>
       </div>
@@ -710,7 +712,7 @@ function stopRow(p, sym, noR) {
       <button type="button" class="btn act${TRAIL_OPEN[sym] ? " on" : ""}" data-trailopen="${esc(sym)}">Trail ${TRAIL_OPEN[sym] ? "▴" : "▾"}</button>
       <span class="gap"></span>
       <input class="in ms-input" data-symbol="${esc(sym)}" inputmode="decimal" placeholder="price" value="${esc(MS_INPUT[sym] || "")}">
-      ${actionBtn(`ms:${sym}`, "Move stop", "move", {symbol: sym}, "", false, "act", kbd("@stop"))}</div>
+      ${actionBtn(`ms:${sym}`, p.stop_price == null ? "Set stop" : "Move stop", "move", {symbol: sym}, "", false, "act", kbd("@stop"))}</div>
     ${loose.length && !TRAIL_OPEN[sym] ? `<div class="warnline">Trail ${loose.join(" and ")} would start looser than your stop ${px(p.stop_price)} (${loose.map(u => `${u} at ${px((u === "1R" ? one : half).start)}`).join(", ")}).</div>` : ""}
     ${noR ? `<div class="warnline mut" style="color:var(--muted)">Trail in R needs a companion entry; use Trail ▾ with $ or %.</div>` : ""}
     ${TRAIL_OPEN[sym] ? trailPanel(p, sym, noR) : ""}</div>`;
@@ -791,8 +793,9 @@ function renderWorkspace(p, st) {
       <div class="arow"><div class="al">Target<small>${tgtNote}</small></div>
         <div class="ctl">${[1, 1.5, 2, 3].map(v => actionBtn(`tr${v}:${sym}`, `${v}R`, "target", {symbol: sym, r: v}, "", noR, "act", kbd(`tr${v}`))).join("")}<span class="gap"></span>
           <input class="in ms-input tg-input" data-symbol="${esc(sym)}" inputmode="decimal" placeholder="price" value="${esc(TG_INPUT[sym] || "")}">
-          ${actionBtn(`tg:${sym}`, "Replace target", "target", {symbol: sym, custom: 1}, "", false, "act", kbd("@target"))}
-          ${noR ? `<span class="why">R needs a companion entry: type a price</span>` : ""}</div></div>
+          ${actionBtn(`tg:${sym}`, nT ? "Replace target" : "Set target", "target", {symbol: sym, custom: 1}, "", false, "act", kbd("@target"))}
+          ${noR ? `<span class="why">R needs a companion entry: type a price</span>` : ""}</div>
+        ${(p.stop_price == null && !p.trail) !== !nT ? `<div class="warnline mut" style="color:var(--muted)">${!nT ? "No target yet: Set target pairs it with the stop as one OCO." : "No stop yet: Set stop pairs it with the target as one OCO."}</div>` : ""}</div>
       <div class="arow"><div class="al">Partial<small>${PART_MODE === "market" ? "at market" : `limit at ${PART_MODE}, then market after 3 s`}</small></div>
         <div class="ctl"><div class="seg">${[["mid", "Mid"], ["market", "Mkt"], ["ask", "Ask"], ["bid", "Bid"]].map(([v, t]) =>
             `<button type="button" data-pmode="${v}" class="${PART_MODE === v ? "on" : ""}">${t}</button>`).join("")}</div>
@@ -1137,7 +1140,8 @@ function render(st) {
 const T = {stopType: "fixed", trailUnit: "R", trailBasis: "MARK", side: "LONG", entry: "mid", risk: null, targets: 1, r: 2, t1r: 1, split: 0.5,
            plan: null, ticketId: null, intentKey: null, sentKey: null, seq: 0, busy: false, timer: null, armed: false,
            // Option mode: the underlying typed in the symbol box, its expiries, the chain shown and the contract picked.
-           asset: "EQUITY", und: "", exps: [], exp: null, pc: "CALL", chain: null, opt: null, chainSeq: 0};
+           asset: "EQUITY", und: "", exps: [], exp: null, pc: "CALL", chain: null, opt: null, chainSeq: 0,
+           sizeMode: "risk"};      // risk: size from the stop; qty: the number typed in the box
 const MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
 function optName(sym) {          // "AAPL  261120C00230000" -> "AAPL 20 Nov 26 230C" (same as the dashboard)
   const m = /^([A-Z0-9.]+)\s*(\d\d)(\d\d)(\d\d)([CP])(\d{8})$/.exec(sym || "");
@@ -1160,18 +1164,24 @@ function riskValue() {
 const priceBox = id => $(id).value.trim() || null;   // blank = use R; anything typed is sent and validated
 function ticketReq() {
   const two = T.targets === 2;
-  return {symbol: isOpt() ? (T.opt ? T.opt.symbol : "") : $("t-sym").value.trim().toUpperCase(), side: T.side, stop: $("t-stop").value.trim(),
-          risk: riskValue(), r: T.r, entry: T.entry, target_price: priceBox("t-tp"),
+  const noTgt = T.targets === 0;
+  return {symbol: isOpt() ? (T.opt ? T.opt.symbol : "") : $("t-sym").value.trim().toUpperCase(), side: T.side,
+          stop: T.stopType === "none" ? "" : $("t-stop").value.trim(),
+          risk: T.sizeMode === "risk" ? riskValue() : 0, r: noTgt ? 0 : T.r, entry: T.entry, target_price: noTgt ? null : priceBox("t-tp"),
           split: two ? T.split : 0, t1_r: two ? T.t1r : 0, t1_price: two ? priceBox("t-t1p") : null,
           stop_type: T.stopType, trail_unit: T.trailUnit, trail_value: parseFloat($("t-trailval").value) || 0,
-          trail_basis: T.trailBasis};
+          trail_basis: T.trailBasis, size_mode: T.sizeMode, qty: T.sizeMode === "qty" ? ($("t-qty").value.trim() || null) : null,
+          targets: T.targets};
 }
 function ticketReady() {
   const q = ticketReq();
-  return q.symbol && q.stop && q.risk > 0;
+  if (!q.symbol) return false;
+  if (q.size_mode === "risk") return q.stop && q.risk > 0;
+  const stopOk = q.stop || q.stop_type === "none" || (q.stop_type === "trail" && q.trail_unit !== "R");
+  return parseInt(q.qty) > 0 && stopOk;
 }
 const keyOf = q => [q.symbol, q.side, q.stop, q.risk, q.r, q.entry, q.target_price, q.split, q.t1_r, q.t1_price,
-                    q.stop_type, q.trail_unit, q.trail_value, q.trail_basis].join("|");
+                    q.stop_type, q.trail_unit, q.trail_value, q.trail_basis, q.size_mode, q.qty, q.targets].join("|");
 let lookupSeq = 0, lookupTimer = null, LAST_Q = null;
 function showName(q) {
   const el = $("t-name");
@@ -1259,6 +1269,7 @@ function setAsset(a) {
   $("t-symlbl").textContent = o ? "Underlying" : "Symbol";
   $("t-sidelbl").textContent = o ? "Action" : "Side";
   $("t-stoplbl").textContent = o ? "Stop (option price)" : "Stop price";
+  $("t-qtylbl").textContent = o ? "Contracts" : "Shares";
   const [lb, sb] = $("t-side").children;
   lb.textContent = o ? "Buy to open" : "Long"; sb.textContent = o ? "Sell to open" : "Short";
   const mkt = $("t-entry").querySelector('[data-v="market"]');
@@ -1330,11 +1341,19 @@ async function refreshPlan() {
   scheduleRefresh(document.hasFocus() ? 5000 : 30000);   // fresh price while you work the ticket
 }
 // Target chips: clicking an R clears that target's price box; typing a price overrides the R.
-function chipRow(id, values, current, priced) {
-  $(id).innerHTML = values.map(v => `<button type="button" class="btn${!priced && v === current ? " on" : ""}" data-v="${v}">${v}R</button>`).join("");
+function chipRow(id, values, current, priced, off = false) {
+  $(id).innerHTML = values.map(v => `<button type="button" class="btn${!priced && !off && v === current ? " on" : ""}" data-v="${v}"${off ? ' disabled title="R needs a stop price: type the target price"' : ""}>${v}R</button>`).join("");
 }
+// No stop price (Quantity mode with None, or a trail in $ / %): there is no R to price targets from.
+const noStopPrice = () => T.stopType === "none" || (T.sizeMode === "qty" && !$("t-stop").value.trim());
 function renderTargets() {
-  const two = T.targets === 2;
+  const two = T.targets === 2, none = T.targets === 0, noR = noStopPrice();
+  [...$("t-targets").children].forEach(b => {
+    b.classList.toggle("on", Number(b.dataset.v) === T.targets);
+    b.disabled = b.dataset.v === "2" && T.stopType === "none";
+    b.title = b.disabled ? "Two targets need a stop" : "";
+  });
+  $("t-t2box").style.display = none ? "none" : "";
   $("t-t1box").style.display = two ? "" : "none";
   $("t-t2title").textContent = two ? "Target 2" : "Target";
   const u = isOpt() ? "contracts" : "shares";
@@ -1342,14 +1361,17 @@ function renderTargets() {
   const tp = !!priceBox("t-tp"), t1p = !!priceBox("t-t1p");
   $("t-t2ovr").textContent = tp ? "price set, R ignored" : "";
   $("t-tp").classList.toggle("set", tp); $("t-t1p").classList.toggle("set", t1p);
-  chipRow("t-r", two ? [1.5, 2, 3, 4] : [1, 1.5, 2, 3], T.r, tp);
-  chipRow("t-t1r", [1, 1.5, 2, 3], T.t1r, t1p);
+  chipRow("t-r", two ? [1.5, 2, 3, 4] : [1, 1.5, 2, 3], T.r, tp, noR);
+  chipRow("t-t1r", [1, 1.5, 2, 3], T.t1r, t1p, noR);
+  if (noR && !tp) $("t-t2ovr").textContent = "no stop: type the target price";
   [...$("t-split").children].forEach(b => b.classList.toggle("on", parseFloat(b.dataset.v) === T.split));
 }
 function renderTicket() {
   const p = T.plan, calc = $("t-calc"), go = $("t-go");
   const opt = isOpt();
-  if (!p) { calc.innerHTML = `<span class="mut">${opt ? (T.opt ? "Enter the stop (option price) and risk." : "Pick a contract, then the stop and risk.") : "Enter symbol, stop and risk."}</span>`; }
+  const sizeTxt = T.sizeMode === "qty" ? (opt ? "contracts" : "shares") : "risk";
+  const stopTxt = T.stopType === "none" ? "" : T.sizeMode === "qty" ? "stop (or None), " : "stop, ";
+  if (!p) { calc.innerHTML = `<span class="mut">${opt && !T.opt ? `Pick a contract, then the ${stopTxt}${sizeTxt}.` : `Enter ${opt ? "the " : "symbol, "}${stopTxt}${sizeTxt}.`}</span>`; }
   else if (!p.ok) { calc.innerHTML = `<div class="err">${esc((p.errors || []).join("; ") || "invalid")}</div>`; }
   else {
     const o = p.asset === "OPTION";
@@ -1359,14 +1381,17 @@ function renderTicket() {
     const exitTxt = o ? (p.side === "LONG" ? "SELL_TO_CLOSE" : "BUY_TO_CLOSE") : "";
     calc.innerHTML = `
       <div class="pr"><span class="mut">${verb} ${qty(p.qty)} ${esc(name)}, ${ENTRY_TXT[p.entry] || "limit"}</span><span class="num">${p.market ? "~" : ""}${esc(p.limit)}</span></div>
-      ${p.trail ? `<div class="pr"><span class="mut">Stop: trailing ${p.trail.link === "PERCENT" ? p.trail.offset + "%" : "$" + p.trail.offset.toFixed(2)} from ${p.trail.basis.toLowerCase()} · ${qty(p.qty)}</span><span class="num neg">starts ${esc(p.trail_start)}</span></div>`
+      ${!p.has_stop ? `<div class="pr"><span class="mut">No stop: add one later in Manage</span><span class="num neg">none</span></div>`
+      : p.trail ? `<div class="pr"><span class="mut">Stop: trailing ${p.trail.link === "PERCENT" ? p.trail.offset + "%" : "$" + p.trail.offset.toFixed(2)} from ${p.trail.basis.toLowerCase()} · ${qty(p.qty)}</span><span class="num neg">starts ${esc(p.trail_start)}</span></div>`
       : `<div class="pr"><span class="mut">Stop (market) ${qty(p.qty)}${o ? ` · ${exitTxt}, held at Schwab` : ""}</span><span class="num neg">${esc(p.stop)}</span></div>`}
       ${p.be_trigger ? `<div class="pr"><span class="mut">Moves to B/E once, when the app sees the mark at +1R of your fill (checks every 3 s, app must be running)</span><span class="num">~${esc(p.be_trigger)}</span></div>` : ""}
       ${p.qty1 ? `<div class="pr"><span class="mut">Target 1 · ${tR(p.target1, p.target1_r)} · ${qty(p.qty1)}</span><span class="num pos">${esc(p.target1)}</span></div>
         <div class="pr"><span class="mut">Target 2 · ${tR(p.target, p.target_r)} · ${qty(p.qty2)}</span><span class="num pos">${esc(p.target)}</span></div>`
-      : `<div class="pr"><span class="mut">Target · ${tR(p.target, p.target_r)} · ${qty(p.qty)}</span><span class="num pos">${esc(p.target)}</span></div>`}
-      <div class="pr tot"><span>Risk${p.market ? " (estimate)" : ""} · ${o ? `${px(p.per_share)}/ct × ${p.multiplier} · ${p.side === "LONG" ? "cost" : "credit"}` : `${px(p.per_share)}/sh · notional`} ${money(p.notional, false)}</span><span class="num">${money(p.planned_risk, false)}</span></div>
-      ${(p.warnings || []).map(w => `<div class="pr amb" style="font-size:12px">${esc(w)}</div>`).join("")}`;
+      : !p.has_target ? `<div class="pr"><span class="mut">No target: add one later in Manage</span><span class="num">none</span></div>`
+      : `<div class="pr"><span class="mut">Target${p.target_r != null ? " · " + tR(p.target, p.target_r) : ""} · ${qty(p.qty)}</span><span class="num pos">${esc(p.target)}</span></div>`}
+      ${p.per_share ? `<div class="pr tot"><span>Risk${p.market ? " (estimate)" : ""} · ${o ? `${px(p.per_share)}/ct × ${p.multiplier} · ${p.side === "LONG" ? "cost" : "credit"}` : `${px(p.per_share)}/sh · notional`} ${money(p.notional, false)}</span><span class="num">${money(p.planned_risk, false)}</span></div>`
+      : `<div class="pr tot"><span>Risk · ${p.has_stop ? "set by the trail (no stop price)" : "undefined (no stop)"} · ${o ? (p.side === "LONG" ? "cost" : "credit") : "notional"} ${money(p.notional, false)}</span><span class="num ${p.has_stop ? "" : "neg"}">${p.has_stop ? "trail" : "—"}</span></div>`}
+      ${(p.warnings || []).map(w => `<div class="pr ${w.startsWith("NO STOP") || w.startsWith("A short option with no stop") ? "neg" : "amb"}" style="font-size:12px${w.startsWith("NO STOP") ? ";font-weight:700" : ""}">${esc(w)}</div>`).join("")}`;
     if (LAST_Q) showName(LAST_Q);
   }
   const current = p && p.ok && p.key === keyOf(ticketReq());
@@ -1383,19 +1408,23 @@ function renderTicket() {
   $("t-hint").textContent = !T.armed ? "Entries are disarmed: click Entries disarmed to arm until the close."
     : T.entry === "mid" || (T.entry === "bid" && T.side === "LONG") || (T.entry === "ask" && T.side === "SHORT")
       ? "This entry rests and may not fill. An unfilled entry shows in Pending orders with Cancel entry."
-      : T.entry === "market" ? "Market entry: fills at once; shares are sized from the quote, so the risk is an estimate." : "";
+      : T.entry === "market" ? (T.sizeMode === "qty" ? "Market entry: fills at once at the market price." : "Market entry: fills at once; shares are sized from the quote, so the risk is an estimate.") : "";
 }
 async function submitTicket() {
   const p = T.plan;
   if (T.busy || !p?.ok || p.key !== keyOf(ticketReq()) || HEALTH !== "live") return;
+  // A ticket without a stop is confirmed every time: nothing protects the position until a stop is added.
+  if (!p.has_stop && !confirm("Send without a stop?\nNothing protects this position at Schwab until you add a stop in Manage.")) return;
   T.busy = true; clearTimeout(T.timer); renderTicket();
   const msg = $("t-msg");
   msg.className = "tk-msg warn"; msg.textContent = "Sending to Schwab...";
   // Send the displayed plan itself, not whatever the inputs say now.
   const req = ticketReq();
-  const body = {ticket_id: T.ticketId, symbol: p.symbol, side: p.side, stop: p.stop, risk: p.risk,
+  const body = {ticket_id: T.ticketId, symbol: p.symbol, side: p.side, stop: p.stop || "", risk: p.risk,
                 r: p.r_multiple, entry: p.entry, target_price: req.target_price, t1_price: req.t1_price,
-                expected_limit: p.limit, expected_qty: p.qty, expected_target: p.target,
+                size_mode: p.size_mode, qty: p.size_mode === "qty" ? p.qty : null, targets: req.targets,
+                confirm_no_stop: !p.has_stop,
+                expected_limit: p.limit, expected_qty: p.qty, expected_target: p.has_target ? p.target : null,
                 split: p.split, t1_r: p.t1_r, expected_qty1: p.qty1 || 0, expected_target1: p.target1,
                 stop_type: req.stop_type, trail_unit: req.trail_unit, trail_value: req.trail_value,
                 trail_basis: req.trail_basis, expected_trail_offset: p.trail ? p.trail.offset : null,
@@ -1406,7 +1435,7 @@ async function submitTicket() {
       T.sentKey = T.intentKey;
       msg.className = "tk-msg ok";
       msg.textContent = r.duplicate ? `Already sent: order ${r.order_id ?? "(id pending)"}.`
-        : `Sent: order ${r.order_id ?? "(id pending)"}, ${r.plan.asset === "OPTION" ? (r.plan.side === "LONG" ? "buy to open" : "sell to open") : r.plan.side} ${r.plan.qty} ${r.plan.asset === "OPTION" ? optName(r.plan.symbol) : r.plan.symbol} ${r.plan.market ? "at market" : "@ " + r.plan.limit}, stop ${r.plan.stop}, target ${r.plan.target}.`;
+        : `Sent: order ${r.order_id ?? "(id pending)"}, ${r.plan.asset === "OPTION" ? (r.plan.side === "LONG" ? "buy to open" : "sell to open") : r.plan.side} ${r.plan.qty} ${r.plan.asset === "OPTION" ? optName(r.plan.symbol) : r.plan.symbol} ${r.plan.market ? "at market" : "@ " + r.plan.limit}, stop ${r.plan.has_stop ? (r.plan.stop || "trailing") : "none"}, target ${r.plan.has_target ? r.plan.target : "none"}.`;
     } else {
       if (r.status === "RATE_LIMITED") T.ticketId = crypto.randomUUID();   // nothing placed: retry allowed
       else if (r.status || r.duplicate) T.sentKey = T.intentKey;   // reached Schwab: this intent is spent
@@ -1471,20 +1500,41 @@ $("t-risk").addEventListener("click", e => {
   onTicketEdit();
 });
 $("t-targets").addEventListener("click", e => {
-  const b = e.target.closest("button"); if (!b) return;
+  const b = e.target.closest("button"); if (!b || b.disabled) return;
   T.targets = Number(b.dataset.v);
   if (T.targets === 2 && T.r <= T.t1r) T.r = 2;
-  [...$("t-targets").children].forEach(x => x.classList.toggle("on", x === b));
   onTicketEdit();
 });
+function renderSize() {
+  const q = T.sizeMode === "qty";
+  [...$("t-size").children].forEach(b => b.classList.toggle("on", b.dataset.v === T.sizeMode));
+  $("t-qtyfld").style.display = q ? "" : "none";
+  $("t-riskfld").style.display = q ? "none" : "";
+}
+$("t-size").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b || b.dataset.v === T.sizeMode) return;
+  T.sizeMode = b.dataset.v;
+  if (T.sizeMode === "risk" && T.stopType === "none") T.stopType = "fixed";    // risk sizing needs a stop
+  renderSize(); renderStopType(); onTicketEdit();
+  if (T.sizeMode === "qty") $("t-qty").focus();
+});
 function renderStopType() {
-  [...$("t-stoptype").children].forEach(b => b.classList.toggle("on", b.dataset.v === T.stopType));
+  [...$("t-stoptype").children].forEach(b => {
+    b.classList.toggle("on", b.dataset.v === T.stopType);
+    if (b.dataset.v === "none") { b.disabled = T.sizeMode !== "qty"; b.style.opacity = b.disabled ? ".45" : ""; }
+  });
+  const none = T.stopType === "none";
+  $("t-stop").disabled = none;
+  if (none) $("t-stop").value = "";
+  $("t-stop").placeholder = none ? "no stop" : T.sizeMode === "qty" && T.stopType === "trail" ? "optional" : "$$$";
   $("t-trailbox").style.display = T.stopType === "trail" ? "" : "none";
   $("t-trailunit").innerHTML = ["R", "$", "%"].map(u => `<button type="button" class="btn${T.trailUnit === u ? " on" : ""}" data-v="${u}">${u}</button>`).join("");
   $("t-trailbasis").innerHTML = [["MARK", "Mark"], ["LAST", "Last"], ["BID", "Bid"], ["ASK", "Ask"]].map(([v, t]) =>
     `<button type="button" class="btn${T.trailBasis === v ? " on" : ""}" data-v="${v}">${t}</button>`).join("");
 }
-$("t-stoptype").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.stopType = b.dataset.v; renderStopType(); onTicketEdit(); });
+$("t-stoptype").addEventListener("click", e => { const b = e.target.closest("button"); if (!b || b.disabled) return; T.stopType = b.dataset.v;
+  if (T.stopType === "none" && T.targets === 2) T.targets = 1;               // two targets need a stop
+  renderStopType(); onTicketEdit(); });
 $("t-trailunit").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.trailUnit = b.dataset.v;
   $("t-trailval").value = T.trailUnit === "%" ? "0.5" : T.trailUnit === "$" ? (isOpt() ? "0.10" : "1.00") : "1"; renderStopType(); onTicketEdit(); });
 $("t-trailbasis").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.trailBasis = b.dataset.v; renderStopType(); onTicketEdit(); });
@@ -1492,7 +1542,7 @@ $("t-trailval").addEventListener("input", () => onTicketEdit());
 $("t-split").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.split = parseFloat(b.dataset.v); onTicketEdit(); });
 $("t-r").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.r = parseFloat(b.dataset.v); $("t-tp").value = ""; onTicketEdit(); });
 $("t-t1r").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.t1r = parseFloat(b.dataset.v); $("t-t1p").value = ""; onTicketEdit(); });
-["t-sym", "t-stop", "t-risk-custom", "t-tp", "t-t1p"].forEach(id => $(id).addEventListener("input", () => {
+["t-sym", "t-stop", "t-risk-custom", "t-tp", "t-t1p", "t-qty"].forEach(id => $(id).addEventListener("input", () => {
   if (id === "t-risk-custom") { T.risk = null; [...$("t-risk").children].forEach(x => x.classList.remove("on")); }
   if (id === "t-sym") lookupSymbol();
   onTicketEdit();

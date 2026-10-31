@@ -13,7 +13,7 @@ target, take partials, cancel or close. It runs on your own computer, next to th
 
 - **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks only to Schwab.
 - **Every order is your click.** No signals, no auto-trading. The one exception is opt-in per trade: pick "Auto B/E 1R" on the ticket and the app moves that trade's stop to break-even once, when price reaches +1R.
-- **Protection first.** Entries go in as one Schwab bracket, so the stop and target live at Schwab even if the app or your PC is off.
+- **Protection first.** Entries go in as one Schwab bracket, so the stop and target live at Schwab even if the app or your PC is off. Leaving out the stop is possible only when you size by quantity, and the ticket asks you to confirm it every time.
 - **Honest numbers.** P&L comes from your own fills, and anything incomplete is labeled as such, never shown as complete.
 - **Free and MIT licensed.** No paid tier.
 
@@ -68,6 +68,11 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
   (it checks every 3 seconds and only while the app is running; it never loosens a stop). One click
   sends one Schwab bracket. Entries must be armed each session.
+- **Size by risk or by quantity:** size from your risk and stop (the default), or type the number of
+  shares or contracts yourself. Sizing by quantity also allows **no stop** (a red warning and a
+  confirmation on every click) and either way you can send **no target**. The order then carries only
+  what you picked; add the missing stop or target later from the trade (Set stop / Set target), and
+  once it has both they are paired as one OCO.
 - **Options on the ticket:** switch the ticket to Option, type the underlying, pick the expiry, calls
   or puts and a strike from the chain (bid, ask, mark, delta, spread and open interest), then buy to
   open or sell to open. Stop and targets are option prices; contracts are sized from your risk (one
