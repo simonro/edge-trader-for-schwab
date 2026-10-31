@@ -1195,3 +1195,149 @@ def test_quote_reads_the_option_fields(tmp_path):
     assert t.quote("SPY   261120C00600000")["ticks"] == OPT_PENNY_ALL     # underlying from the OCC root
     assert t.quote("MXR")["ticks"] == EQUITY
     assert t._ticks("MXR", "EQUITY") == EQUITY and t._ticks(OPT, "OPTION") == OPT_PENNY
+
+
+# ---- option entries from the ticket ------------------------------------------------------------
+
+CALL = "AAPL  261120C00232500"
+
+
+def _opt_ticket_quote(trader, monkeypatch, bid=0.77, ask=0.79, **extra):
+    from companion.bracket import ticks_for
+    q = {"bid": bid, "ask": ask, "mark": (bid + ask) / 2, "asset_type": "OPTION", "underlying": "AAPL",
+         "multiplier": 100.0, "is_penny": True, "deliverables": "100 AAPL", "ticks": ticks_for("OPTION", "AAPL", True)}
+    q.update(extra)
+    monkeypatch.setattr(trader, "quote", lambda sym, max_age=1.0: q)
+
+
+def opt_req(**kw):
+    base = {"ticket_id": "opt-ticket-01", "symbol": CALL, "side": "LONG", "stop": "0.50", "risk": 375, "r": 2,
+            "entry": "mid", "expected_limit": "0.78", "expected_qty": 13, "expected_target": "1.34"}
+    return {**base, **kw}
+
+
+def test_option_ticket_sends_a_buy_to_open_bracket(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    r = trader.submit(opt_req())
+    assert r["ok"], r
+    (order,) = trader._client.placed
+    leg = order["orderLegCollection"][0]
+    assert leg == {"instruction": "BUY_TO_OPEN", "quantity": 13, "instrument": {"symbol": CALL, "assetType": "OPTION"}}
+    assert order["price"] == "0.78"
+    t = trader.store.get_ticket("opt-ticket-01")
+    assert t["limit_price"] == "0.78" and t["risk"] == 364.0          # 13 x 0.28 x 100
+
+
+def test_option_ticket_lock_uses_option_ticks(trader, monkeypatch):
+    # 1R = 0.28: the lock is max(0.028, 2 penny ticks) = 0.028. The mid moving up 2c still sends.
+    _opt_ticket_quote(trader, monkeypatch, bid=0.79, ask=0.81)
+    assert trader.submit(opt_req())["ok"]
+    _opt_ticket_quote(trader, monkeypatch, bid=0.81, ask=0.83)       # mid 0.82: 4c against, refused
+    r = trader.submit(opt_req(ticket_id="opt-ticket-02"))
+    assert not r["ok"] and "Price moved: entry is now 0.82" in r["error"]
+
+
+def test_option_ticket_size_message_says_contracts(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    r = trader.submit(opt_req(expected_qty=14))
+    assert not r["ok"] and "13 contracts" in r["error"]
+
+
+def test_option_ticket_refuses_an_adjusted_contract(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch, deliverables="100 AAPL, 50 XYZ")
+    r = trader.submit(opt_req())
+    assert not r["ok"] and "non-standard" in r["error"] and trader._client.placed == []
+    _opt_ticket_quote(trader, monkeypatch, multiplier=10.0)
+    assert "non-standard" in trader.make_plan(opt_req()).errors[0]
+
+
+def test_option_ticket_with_a_trail_asks_the_preview_first(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    trader._client.preview_order = lambda h, o: JsonResp(200, {"orderValidationResult": {"rejects": [
+        {"message": "Trailing stops are not supported for this security."}]}})
+    req = opt_req(stop_type="trail", trail_unit="$", trail_value=0.10, trail_basis="MARK",
+                  expected_trail_offset=0.10, expected_trail_start="0.68")
+    r = trader.submit(req)
+    assert not r["ok"] and "does not accept a trailing stop" in r["error"] and "Nothing was sent" in r["error"]
+    assert trader._client.placed == [] and trader.store.get_ticket("opt-ticket-01") is None
+    trader._client.preview_order = lambda h, o: JsonResp(200, {"orderValidationResult": {"rejects": []}})
+    r = trader.submit(req)
+    assert r["ok"], r
+    stop = trader._client.placed[0]["childOrderStrategies"][0]["childOrderStrategies"][1]
+    assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceOffset"] == 0.1
+
+
+def test_option_autobe_ticket_is_recorded(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    r = trader.submit(opt_req(stop_type="autobe"))
+    assert r["ok"] and r["plan"]["be_trigger"] == "1.06"              # 0.78 + 1R (0.28)
+    assert trader.store.auto_be("opt-ticket-01")["state"] == "PENDING"
+
+
+def test_option_ticket_shows_its_readable_name(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    trader.submit(opt_req())
+    (row,) = trader.brackets([], [], {}, True)
+    assert row["asset_type"] == "OPTION" and row["display"] == "AAPL 20 Nov 26 232.5C"
+
+
+def test_parse_chain_cleans_schwab_values():
+    from companion.trading import parse_chain
+    body = {"underlyingPrice": 229.84, "underlying": {"description": "Apple Inc"}, "callExpDateMap": {"2026-11-20:20": {
+        "235.0": [{"symbol": "AAPL  261120C00235000", "strikePrice": 235.0, "bid": 0.40, "ask": 0.42, "mark": 0.41,
+                   "delta": 0.12, "volatility": 27.1, "openInterest": 6200, "totalVolume": 900, "pennyPilot": True,
+                   "multiplier": 100.0, "nonStandard": False, "inTheMoney": False, "daysToExpiration": 20}],
+        "230.0": [{"symbol": "AAPL  261120C00230000", "strikePrice": 230.0, "bid": 1.38, "ask": 1.41, "mark": 1.40,
+                   "delta": -999.0, "volatility": 7805.0, "openInterest": 12000, "pennyPilot": True,
+                   "multiplier": 100.0, "nonStandard": False, "inTheMoney": True}],
+        "100.0": [{"symbol": "AAPL1 261120C00100000", "strikePrice": 100.0, "bid": 129.0, "ask": 131.0,
+                   "multiplier": 100.0, "nonStandard": True}]}}}
+    out = parse_chain(body, "CALL")
+    assert out["underlying_price"] == 229.84 and out["underlying_name"] == "Apple Inc"
+    assert [r["strike"] for r in out["rows"]] == [100.0, 230.0, 235.0]          # by strike
+    adj, atm, otm = out["rows"]
+    assert adj["standard"] is False and atm["standard"] and otm["penny"]
+    assert atm["delta"] is None and atm["iv"] is None                           # -999 and junk IV hidden
+    assert otm["delta"] == 0.12 and otm["spread_pct"] == 4.9
+    assert parse_chain(body, "PUT")["rows"] == []
+
+
+class ChainClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def option_expiration_chain(self, sym):
+        self.calls.append(("exp", sym))
+        return JsonResp(200, {"expirationList": [
+            {"expirationDate": "2026-11-06", "daysToExpiration": 6, "expirationType": "W", "standard": True},
+            {"expirationDate": "2026-11-02", "daysToExpiration": 2, "expirationType": "W", "standard": True}]})
+
+    def option_chains(self, sym, **kw):
+        self.calls.append(("chain", sym, kw))
+        return JsonResp(200, {"underlyingPrice": 229.84, "callExpDateMap": {}})
+
+
+def test_expirations_and_chain_are_validated_and_cached(trader):
+    trader._client = ChainClient()
+    exps = trader.expirations("aapl")
+    assert [e["date"] for e in exps] == ["2026-11-02", "2026-11-06"]
+    trader.expirations("AAPL")
+    out = trader.chain("AAPL", "2026-11-02", "call")
+    trader.chain("AAPL", "2026-11-02", "CALL")
+    assert out["put_call"] == "CALL" and out["rows"] == []
+    kinds = [c[0] for c in trader._client.calls]
+    assert kinds == ["exp", "chain"]                                            # second calls came from the cache
+    kw = trader._client.calls[1][2]
+    assert kw["contractType"] == "CALL" and kw["fromDate"] == kw["toDate"] == "2026-11-02"
+    for bad in (("AAPL; DROP", "2026-11-02", "CALL"), ("AAPL", "next friday", "CALL"), ("AAPL", "2026-11-02", "BOTH")):
+        with pytest.raises(ValueError):
+            trader.chain(*bad)
+
+
+def test_only_the_order_client_may_read_option_chains():
+    from companion import schwab
+    assert {"option_chains", "option_expiration_chain"} <= schwab._TRADING
+    assert not ({"option_chains", "option_expiration_chain"} & schwab._ALLOWED)
+    assert trading.OCC_RE.match(CALL) and trading.OCC_RE.match("SPY   261120P00600000")
+    assert not trading.OCC_RE.match("AAPL")

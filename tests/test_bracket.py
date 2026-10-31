@@ -213,3 +213,87 @@ def test_trail_offset_on_an_option_grid():
     assert not err and spec["offset"] == Decimal("0.15")
     spec, err = trail_spec("$", "0.02", None, "MARK", OPT_NICKEL)
     assert spec is None and "rounds to 0" in err
+
+
+# ---- option entries ----------------------------------------------------------------------
+
+AAPL_C = "AAPL  261120C00232500"
+AAPL_P = "AAPL  261120P00227500"
+
+
+def _opt(**kw):
+    from companion.bracket import OPT_PENNY
+    base = dict(symbol=AAPL_C, side="LONG", stop="0.50", risk=375, r_multiple=2, bid="0.77", ask="0.79",
+                entry="mid", asset="OPTION", multiplier=100, ticks=OPT_PENNY)
+    base.update(kw)
+    return plan(**base)
+
+
+def test_option_sizing_counts_the_multiplier():
+    p = _opt()
+    assert p.ok, p.errors
+    assert p.limit == Decimal("0.78") and p.per_share == Decimal("0.28")
+    assert p.qty == 13                                    # floor(375 / 28)
+    assert p.planned_risk == Decimal("364.00") and p.notional == Decimal("1014.00")
+    assert p.target == Decimal("1.34")                    # 0.78 + 2 x 0.28
+    d = p.as_dict()
+    assert d["limit"] == "0.78" and d["unit_risk"] == 28.0 and d["asset"] == "OPTION"
+
+
+def test_option_bracket_json():
+    order = bracket_order(_opt())
+    assert order["price"] == "0.78" and order["orderType"] == "LIMIT"
+    entry = order["orderLegCollection"][0]
+    assert entry["instruction"] == "BUY_TO_OPEN" and entry["instrument"] == {"symbol": AAPL_C, "assetType": "OPTION"}
+    target, stop = order["childOrderStrategies"][0]["childOrderStrategies"]
+    assert target["price"] == "1.34" and stop["stopPrice"] == "0.50"
+    assert {target["orderLegCollection"][0]["instruction"], stop["orderLegCollection"][0]["instruction"]} == {"SELL_TO_CLOSE"}
+
+
+def test_sell_to_open_sizes_from_the_stop_above_and_warns():
+    p = _opt(symbol=AAPL_P, side="SHORT", stop="1.60", r_multiple=1, bid="0.84", ask="0.86")
+    assert p.ok, p.errors
+    assert p.limit == Decimal("0.85") and p.qty == 5 and p.target == Decimal("0.10")
+    assert any("Sell to open" in w for w in p.warnings)
+    assert not any("assigned" in w for w in p.warnings)  # a put: no early-assignment note
+    order = bracket_order(p)
+    assert order["orderLegCollection"][0]["instruction"] == "SELL_TO_OPEN"
+    assert order["childOrderStrategies"][0]["childOrderStrategies"][1]["orderLegCollection"][0]["instruction"] == "BUY_TO_CLOSE"
+    call = _opt(side="SHORT", stop="1.20", r_multiple=1)
+    assert any("assigned" in w for w in call.warnings)
+
+
+def test_option_target_below_zero_says_what_to_do():
+    p = _opt(symbol=AAPL_P, side="SHORT", stop="1.60", r_multiple=2, bid="0.84", ask="0.86")
+    assert not p.ok and "pick a smaller R" in p.errors[0]
+
+
+def test_option_prices_must_sit_on_the_contract_grid():
+    from companion.bracket import OPT_NICKEL
+    p = _opt(ticks=OPT_NICKEL, stop="0.52", bid="0.75", ask="0.85")
+    assert not p.ok and "0.05 steps" in p.errors[0]
+    p = _opt(ticks=OPT_NICKEL, stop="0.50", bid="0.75", ask="0.85")
+    assert p.ok and p.limit == Decimal("0.80")            # mid 0.80 on the nickel grid
+    assert p.target == Decimal("1.40")                     # 0.80 + 0.60, on the grid
+    p = _opt(ticks=OPT_NICKEL, stop="2.50", bid="3.20", ask="3.40", risk=2000)
+    assert p.ok and p.limit == Decimal("3.30") and p.target == Decimal("4.90")   # dimes from $3
+
+
+def test_option_market_entry_and_odd_contracts_are_refused():
+    assert "limit" in _opt(entry="market").errors[0]
+    assert "limit" in _opt(entry="cross").errors[0]
+    assert "non-standard" in _opt(multiplier=10).errors[0]
+
+
+def test_option_warnings_and_caps():
+    wide = _opt(bid="0.70", ask="0.86", stop="0.40")
+    assert any("Wide market" in w for w in wide.warnings)
+    assert _opt(risk=100000, stop="0.70").qty == 100      # MAX_CONTRACTS
+    tiny = _opt(risk=20)
+    assert not tiny.ok and "one contract's risk ($28.00)" in tiny.errors[0]
+
+
+def test_stock_plan_is_unchanged_by_the_option_fields():
+    p = plan("avgo", "LONG", stop="336.00", risk=500, r_multiple=2, bid="338.70", ask="338.77")
+    assert p.asset == "EQUITY" and p.multiplier == 1 and p.unit_risk == p.per_share
+    assert bracket_order(p)["orderLegCollection"][0]["instrument"] == {"symbol": "AVGO", "assetType": "EQUITY"}

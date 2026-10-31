@@ -17,13 +17,14 @@ Safety that is engineering, not coaching:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from . import schwab
-from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, tick, ticks_for
+from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
@@ -31,8 +32,12 @@ from .store import Store, now_iso
 log = logging.getLogger("companion.trading")
 
 LOCK_R = Decimal("0.1")       # the click keeps the displayed plan while price moved <= 0.1R against it
-LOCK_MIN_TICKS = 2            # ...and at least 2 ticks (2 cents above $1)
+LOCK_MIN_TICKS = 2            # ...and at least 2 ticks (2 cents above $1; 2 option ticks for an option)
 RISK_CHOICES = (250, 375, 500, 750)      # defaults; the user edits them with the gear on the ticket
+EXPIRATIONS_TTL = 300.0       # the option chain picker's expiry list, seconds
+CHAIN_TTL = 5.0               # one expiry's strikes (bid / ask move; the click re-quotes anyway)
+UNDERLYING_RE = re.compile(r"^\$?[A-Z][A-Z0-9./]{0,9}$")
+OCC_RE = re.compile(r"^[A-Z0-9.]{1,6} {0,5}\d{6}[CP]\d{8}$")
 
 
 def _dec(v) -> Decimal | None:
@@ -163,6 +168,51 @@ def _occ_root(symbol: str) -> str:
     return symbol[:6].strip() if len(symbol) > 15 else symbol
 
 
+def _odd_deliverable(q: dict) -> bool:
+    """An adjusted contract (after a split or merger) delivers something other than 100 shares
+    of one underlying: its prices do not compare with the regular chain, so the ticket refuses it."""
+    d = (q.get("deliverables") or "").strip()
+    if not d:
+        return False
+    # "100 AAPL" is standard; "$100 SPX"-style cash deliverables are left to the multiplier check.
+    return "," in d or (d[0].isdigit() and not d.startswith("100 "))
+
+
+def _greek(v, lo: float, hi: float):
+    """Schwab sends -999 (and the odd absurd value) when it has no greek: show nothing then."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(x, 3) if lo <= x <= hi else None
+
+
+def parse_chain(body: dict, pc: str) -> dict:
+    """One expiry of Schwab's option chain as compact rows for the picker, by strike."""
+    rows = []
+    for _exp, strikes in (body.get("callExpDateMap" if pc == "CALL" else "putExpDateMap") or {}).items():
+        for _k, contracts in (strikes or {}).items():
+            for c in contracts or []:
+                bid, ask = c.get("bid") or 0, c.get("ask") or 0
+                mark = c.get("mark") or ((bid + ask) / 2 if bid and ask else None)
+                mult = c.get("multiplier")
+                rows.append({
+                    "symbol": c.get("symbol"), "description": c.get("description"),
+                    "strike": c.get("strikePrice"), "bid": bid, "ask": ask, "mark": mark, "last": c.get("last"),
+                    "delta": _greek(c.get("delta"), -1.0, 1.0), "iv": _greek(c.get("volatility"), 0.0, 1000.0),
+                    "oi": c.get("openInterest"), "volume": c.get("totalVolume"),
+                    "spread_pct": round((ask - bid) / mark * 100, 1) if mark and ask >= bid > 0 else None,
+                    "itm": bool(c.get("inTheMoney")), "dte": c.get("daysToExpiration"),
+                    "penny": bool(c.get("pennyPilot") or c.get("isPennyPilot")),
+                    "standard": not (c.get("nonStandard") or c.get("mini")) and (mult in (None, 100, 100.0)),
+                })
+    rows = [r for r in rows if r["symbol"] and r["strike"] is not None]
+    rows.sort(key=lambda r: r["strike"])
+    und = body.get("underlying") or {}
+    return {"underlying_price": body.get("underlyingPrice") or und.get("mark") or und.get("last"),
+            "underlying_name": und.get("description"), "rows": rows}
+
+
 class Trader:
     expected_hash: str | None = None   # set by the poller: orders only ever go to the shown account
     on_request = None                  # set by the poller: counts order traffic in its limiter
@@ -231,7 +281,7 @@ class Trader:
             # that a rebuild needs waits at most 5 s, so a stop is never held back for long.
             left = self.cooldown_left()
             if left > 0:
-                if endpoint in ("order_details", "ticket_quote"):
+                if endpoint in ("order_details", "ticket_quote", "option_expirations", "option_chain"):
                     return _Throttled()
                 end = time.monotonic() + left
                 if abs(end - self._waited_for) > 2.0:      # wait once per pause, at most 5 s
@@ -268,6 +318,11 @@ class Trader:
                "name": ref.get("description"), "exchange": ref.get("exchangeName"),
                "asset_type": asset, "underlying": underlying, "multiplier": ref.get("multiplier"),
                "is_penny": penny if isinstance(penny, bool) else None, "realtime": entry.get("realtime"),
+               "deliverables": ref.get("deliverables"), "put_call": put_call(sym) if asset == "OPTION" else None,
+               "expiration": (f"{ref['expirationYear']:04d}-{ref['expirationMonth']:02d}-{ref['expirationDay']:02d}"
+                              if all(isinstance(ref.get(k), int) for k in ("expirationYear", "expirationMonth",
+                                                                         "expirationDay")) else None),
+               "strike": ref.get("strikePrice"),
                "ticks": ticks_for(asset, underlying, penny if isinstance(penny, bool) else None)}
         self._quote_cache[sym] = (time.monotonic(), out)
         return out
@@ -287,13 +342,61 @@ class Trader:
         return ticks_for("OPTION", _occ_root(symbol), None)
 
     def make_plan(self, req: dict, fresh: bool = False, q: dict | None = None, limit_override=None) -> Plan:
+        """Asset, multiplier and price grid always come from Schwab's quote, never from the page."""
         q = q or self.quote(req["symbol"], max_age=0 if fresh else 1.0)
+        asset = "OPTION" if q.get("asset_type") == "OPTION" else "EQUITY"
+        mult = q.get("multiplier") or (100 if asset == "OPTION" else 1)
+        if asset == "OPTION" and _odd_deliverable(q):
+            mult = 0            # plan() refuses it as a non-standard contract
         return plan(req["symbol"], req["side"], req["stop"], req["risk"], req.get("r", 2),
                     q.get("bid"), q.get("ask"), split=req.get("split") or 0, t1_r=req.get("t1_r") or 1,
                     entry=req.get("entry") or "cross", target_price=req.get("target_price"),
                     t1_price=req.get("t1_price"), stop_type=req.get("stop_type") or "fixed",
                     trail_unit=req.get("trail_unit") or "R", trail_value=req.get("trail_value") or 1,
-                    trail_basis=req.get("trail_basis") or "MARK", limit_override=limit_override)
+                    trail_basis=req.get("trail_basis") or "MARK", limit_override=limit_override,
+                    asset=asset, multiplier=mult, ticks=q.get("ticks") or ticks_for(asset))
+
+    # ---- option chain picker (only on a click in the ticket's Option mode) ---------------------
+
+    def expirations(self, underlying: str) -> list[dict]:
+        sym = (underlying or "").upper().strip()
+        if not UNDERLYING_RE.match(sym):
+            raise ValueError("type a stock or ETF symbol")
+        key = ("exp", sym)
+        hit = self._quote_cache.get(key)
+        if hit and time.monotonic() - hit[0] < EXPIRATIONS_TTL:
+            return hit[1]
+        r = self._logged("option_expirations", lambda: self._ensure().option_expiration_chain(sym))
+        r.raise_for_status()
+        rows = [{"date": e.get("expirationDate"), "dte": e.get("daysToExpiration"),
+                 "type": e.get("expirationType"), "standard": e.get("standard", True) is not False}
+                for e in (r.json() or {}).get("expirationList") or [] if e.get("expirationDate")]
+        rows.sort(key=lambda e: e["date"])
+        self._quote_cache[key] = (time.monotonic(), rows)
+        return rows
+
+    def chain(self, underlying: str, expiration: str, put_call_: str, strikes: int = 16) -> dict:
+        sym = (underlying or "").upper().strip()
+        pc = (put_call_ or "").upper().strip()
+        if not UNDERLYING_RE.match(sym):
+            raise ValueError("type a stock or ETF symbol")
+        if pc not in ("CALL", "PUT"):
+            raise ValueError("pick Calls or Puts")
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", expiration or ""):
+            raise ValueError("pick an expiry")
+        strikes = max(4, min(int(strikes or 16), 40))
+        key = ("chain", sym, expiration, pc, strikes)
+        hit = self._quote_cache.get(key)
+        if hit and time.monotonic() - hit[0] < CHAIN_TTL:
+            return hit[1]
+        r = self._logged("option_chain", lambda: self._ensure().option_chains(
+            sym, contractType=pc, strikeCount=strikes, includeUnderlyingQuote=True,
+            fromDate=expiration, toDate=expiration))
+        r.raise_for_status()
+        out = parse_chain(r.json() or {}, pc)
+        out.update({"underlying": sym, "expiration": expiration, "put_call": pc})
+        self._quote_cache[key] = (time.monotonic(), out)
+        return out
 
     # ---- actions -----------------------------------------------------------
 
@@ -385,40 +488,41 @@ class Trader:
         # displayed limit caps the fill, so the risk cannot exceed what the ticket showed, and a
         # move in favour fills at a better price. A Mkt entry has no price cap: the lock only
         # refuses when the quote already sits more than 0.1R worse, and the fill can slip beyond.
-        lock = max(LOCK_R * p.per_share, LOCK_MIN_TICKS * tick(exp_limit))
+        f, unit_w = p.f, ("contracts" if p.option else "shares")
+        lock = max(LOCK_R * p.per_share, LOCK_MIN_TICKS * tick(exp_limit, p.ticks))
         long = p.side == "LONG"
         against = now.limit - exp_limit if long else exp_limit - now.limit
         if against > lock:
-            return {"ok": False, "error": f"Price moved: entry is now {fmt(now.limit)} (ticket showed "
-                    f"{fmt(exp_limit)}, more than {fmt(lock)} away). Review and click again.",
+            return {"ok": False, "error": f"Price moved: entry is now {f(now.limit)} (ticket showed "
+                    f"{f(exp_limit)}, more than {f(lock)} away). Review and click again.",
                     "plan": now.as_dict()}
         # After a move in favour the fill comes nearer the stop: keep the minimum stop distance
         # from where it would fill now, not from the displayed price.
         room = now.limit - p.stop if long else p.stop - now.limit
-        if room < MIN_STOP_TICKS * tick(now.limit):
-            return {"ok": False, "error": f"Price is within {MIN_STOP_TICKS} ticks of the stop {fmt(p.stop)}. "
+        if room < MIN_STOP_TICKS * tick(now.limit, p.ticks):
+            return {"ok": False, "error": f"Price is within {MIN_STOP_TICKS} ticks of the stop {f(p.stop)}. "
                     "Review and click again.", "plan": now.as_dict()}
         if p.qty < exp_qty:
-            return {"ok": False, "error": f"Size changed to {p.qty} shares (ticket showed {exp_qty}). "
+            return {"ok": False, "error": f"Size changed to {p.qty} {unit_w} (ticket showed {exp_qty}). "
                     "Review and click again.", "plan": now.as_dict()}
-        # Never more shares than displayed; recompute the numbers for that size.
+        # Never more shares (contracts) than displayed; recompute the numbers for that size.
         p.qty = exp_qty
-        p.planned_risk = p.per_share * p.qty
-        p.notional = p.limit * p.qty
+        p.planned_risk = p.per_share * p.qty * p.multiplier
+        p.notional = p.limit * p.qty * p.multiplier
         # Same entry price and inputs give the same targets; a difference means the ticket's
         # inputs changed after it was displayed.
         if p.target != exp_target:
-            return {"ok": False, "error": f"Target is now {fmt(p.target)} (ticket showed {fmt(exp_target)}). "
+            return {"ok": False, "error": f"Target is now {f(p.target)} (ticket showed {f(exp_target)}). "
                     "Review and click again.", "plan": now.as_dict()}
         if p.two_targets:
             p.qty1 = int((p.qty * p.split).to_integral_value(rounding=ROUND_FLOOR))
             exp_qty1 = int(req.get("expected_qty1") or 0)
             exp_t1 = Decimal(str(req.get("expected_target1") or 0))
             if p.qty1 != exp_qty1 or p.qty1 < 1 or p.qty - p.qty1 < 1:
-                return {"ok": False, "error": f"Split changed to {p.qty1}/{p.qty - p.qty1} shares. "
+                return {"ok": False, "error": f"Split changed to {p.qty1}/{p.qty - p.qty1} {unit_w}. "
                         "Review and click again.", "plan": now.as_dict()}
             if p.target1 != exp_t1:
-                return {"ok": False, "error": f"Target 1 is now {fmt(p.target1)}. Review and click again.",
+                return {"ok": False, "error": f"Target 1 is now {f(p.target1)}. Review and click again.",
                         "plan": now.as_dict()}
         elif req.get("expected_qty1"):
             return {"ok": False, "error": "Ticket showed two targets but the plan has one. Review.",
@@ -436,14 +540,23 @@ class Trader:
                         "plan": now.as_dict()}
             looser = exp_start - p.trail_start if long else p.trail_start - exp_start
             if looser > lock:
-                return {"ok": False, "error": f"The trail would now start at {fmt(p.trail_start)} (ticket showed "
-                        f"{fmt(exp_start)}). Review and click again.", "plan": now.as_dict()}
+                return {"ok": False, "error": f"The trail would now start at {f(p.trail_start)} (ticket showed "
+                        f"{f(exp_start)}). Review and click again.", "plan": now.as_dict()}
         elif req.get("expected_trail_offset"):
             return {"ok": False, "error": "Ticket showed a trailing stop but the plan has a fixed one. Review.",
                     "plan": p.as_dict()}
         order = bracket_order(p)
+        if p.option and p.trail:
+            # Schwab does not document trailing stops on options: its preview decides first.
+            refused = self._preview_refusal(self._ensure(), order)
+            if refused:
+                rejected, why = refused
+                head = (f"Schwab does not accept a trailing stop on this option: {why}" if rejected else
+                        f"Schwab's preview did not confirm the trailing stop ({why})")
+                return {"ok": False, "error": head.rstrip(".") + ". Nothing was sent: use a fixed stop or Auto B/E.",
+                        "plan": now.as_dict()}
         intent = {"ticket_id": ticket_id, "symbol": p.symbol, "side": p.side, "qty": p.qty,
-                  "limit": fmt(p.limit), "stop": fmt(p.stop), "target": fmt(p.target),
+                  "limit": f(p.limit), "stop": f(p.stop), "target": f(p.target),
                   "risk": float(p.planned_risk), "request": order}
         if p.stop_type == "autobe":
             self.store.add_auto_be(ticket_id, p.symbol)     # Simon's consent for one stop move
@@ -1761,8 +1874,12 @@ class Trader:
         by_id = {o["orderId"]: o for o in orders_today}
         start = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         out, seen = [], set()
+        from .view import pretty_symbol
         for t in self.store.tickets_since(start.isoformat()):   # newest first
             row = dict(t)
+            legs = (t.get("request") or {}).get("orderLegCollection") or [{}]
+            row["asset_type"] = (legs[0].get("instrument") or {}).get("assetType") or "EQUITY"
+            row["display"] = pretty_symbol(t["symbol"], row["asset_type"])
             tree = by_id.get(t["order_id"]) if t["order_id"] else None
             # Only a filled ticket claims the symbol, so a newer rejected or unfilled ticket
             # never hides the protection status of a position an earlier ticket opened.

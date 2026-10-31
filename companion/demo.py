@@ -126,3 +126,100 @@ def demo_state(now: datetime | None = None) -> dict:
                                                  "close": _iso(now + timedelta(hours=1, minutes=12))}},
         "brackets": brackets, "action_log": log,
     }
+
+
+# ---- invented quotes and option chain, so the ticket can be tried in demo (never sent) ----------
+
+_DEMO_LAST = {"AAPL": 229.84, "NVDA": 188.65, "AMD": 161.05, "PLTR": 41.38, "MSFT": 431.50, "SPY": 598.20}
+_DEMO_NAMES = {"AAPL": "Apple Inc", "NVDA": "NVIDIA Corp", "AMD": "Advanced Micro Devices", "PLTR": "Palantir",
+               "MSFT": "Microsoft Corp", "SPY": "SPDR S&P 500 ETF"}
+
+
+def _occ(root: str, exp: str, pc: str, strike: float) -> str:
+    return f"{root:<6}{exp[2:4]}{exp[5:7]}{exp[8:10]}{pc}{int(round(strike * 1000)):08d}"
+
+
+def _premium(spot: float, strike: float, pc: str, dte: int) -> tuple[float, float, float, float]:
+    """(bid, ask, mark, delta) of an invented contract: intrinsic + a time value that fades away
+    from the money. Plausible-looking, not a pricing model."""
+    import math
+    intrinsic = max(0.0, spot - strike) if pc == "C" else max(0.0, strike - spot)
+    width = 2.5 + 0.6 * dte
+    tv = (0.9 + 0.35 * dte) * math.exp(-abs(strike - spot) / width)
+    mark = round(intrinsic + tv, 2)
+    half = max(0.01, round(mark * 0.015, 2))
+    bid, ask = max(0.01, round(mark - half, 2)), round(mark + half, 2)
+    x = (spot - strike) / width
+    d = 1 / (1 + math.exp(-1.7 * x))
+    return bid, ask, round((bid + ask) / 2, 3), round(d if pc == "C" else d - 1, 3)
+
+
+def demo_expirations(underlying: str) -> list[dict]:
+    from datetime import date
+    und = (underlying or "").upper().strip()
+    if und not in _DEMO_LAST:
+        raise ValueError(f"demo: no options for {und or '?'} (try AAPL)")
+    today = date.today()
+    out, d = [], today
+    while len(out) < 7:
+        if d.weekday() in (0, 2, 4):
+            out.append({"date": d.isoformat(), "dte": (d - today).days, "type": "W", "standard": True})
+        d += timedelta(days=1)
+    for months in (1, 2):
+        m = (today.month - 1 + months) % 12 + 1
+        y = today.year + (today.month - 1 + months) // 12
+        first = date(y, m, 1)
+        third_fri = first + timedelta(days=(4 - first.weekday()) % 7 + 14)
+        out.append({"date": third_fri.isoformat(), "dte": (third_fri - today).days, "type": "S", "standard": True})
+    return out
+
+
+def demo_chain(underlying: str, expiration: str, put_call: str, strikes: int = 16) -> dict:
+    from datetime import date
+    und = (underlying or "").upper().strip()
+    spot = _DEMO_LAST.get(und)
+    if spot is None:
+        raise ValueError(f"demo: no options for {und or '?'} (try AAPL)")
+    pc = "C" if (put_call or "").upper() == "CALL" else "P"
+    dte = max(0, (date.fromisoformat(expiration) - date.today()).days)
+    step = 2.5 if spot < 300 else 5.0
+    atm = round(spot / step) * step
+    rows = []
+    for i in range(-(strikes // 2), strikes // 2):
+        k = atm + i * step
+        bid, ask, mark, delta = _premium(spot, k, pc, dte)
+        sym = _occ(und, expiration, pc, k)
+        rows.append({"symbol": sym, "description": f"{und} {expiration} {k:g} {pc}", "strike": k, "bid": bid,
+                     "ask": ask, "mark": mark, "last": mark, "delta": delta, "iv": 28.0,
+                     "oi": int(9000 * (0.3 + abs(delta) * (1 - abs(delta)) * 3)), "volume": int(4000 * abs(delta)),
+                     "spread_pct": round((ask - bid) / mark * 100, 1) if mark else None,
+                     "itm": (spot > k) if pc == "C" else (spot < k), "dte": dte, "penny": True, "standard": True})
+    return {"underlying": und, "expiration": expiration, "put_call": put_call.upper(), "underlying_price": spot,
+            "underlying_name": _DEMO_NAMES.get(und), "rows": rows}
+
+
+def demo_quote(symbol: str, max_age: float = 1.0) -> dict:
+    """A stock or option quote in the shape Trader.quote returns."""
+    from datetime import date
+    from .bracket import ticks_for
+    sym = (symbol or "").upper().strip()
+    if len(sym) > 15:                                   # OCC option symbol
+        root, exp = sym[:6].strip(), f"20{sym[6:8]}-{sym[8:10]}-{sym[10:12]}"
+        pc, strike = sym[12], int(sym[13:]) / 1000
+        spot = _DEMO_LAST.get(root)
+        if spot is None:
+            return {"symbol": sym, "found": False}
+        dte = max(0, (date.fromisoformat(exp) - date.today()).days)
+        bid, ask, mark, _ = _premium(spot, strike, pc, dte)
+        return {"symbol": sym, "found": True, "bid": bid, "ask": ask, "last": mark, "mark": mark, "change_pct": 4.2,
+                "name": f"{root} {exp} {strike:g} {'Call' if pc == 'C' else 'Put'}", "exchange": "OPR",
+                "asset_type": "OPTION", "underlying": root, "multiplier": 100.0, "is_penny": True, "realtime": True,
+                "deliverables": f"100 {root}", "put_call": pc, "expiration": exp, "strike": strike,
+                "ticks": ticks_for("OPTION", root, True)}
+    last = _DEMO_LAST.get(sym)
+    if last is None:
+        return {"symbol": sym, "found": False}
+    return {"symbol": sym, "found": True, "bid": round(last - 0.03, 2), "ask": round(last + 0.03, 2), "last": last,
+            "mark": last, "change_pct": 1.12, "name": _DEMO_NAMES.get(sym), "exchange": "NASDAQ",
+            "asset_type": "EQUITY", "underlying": None, "multiplier": None, "is_penny": None, "realtime": True,
+            "ticks": "EQUITY"}

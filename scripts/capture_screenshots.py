@@ -30,7 +30,7 @@ def main():
         page.click("button[data-trailopen='NVDA']")
         page.wait_for_timeout(1500)
         page.locator("#workspace").screenshot(path=str(OUT / "screenshot-workbench.png"))
-        # A filled-in ticket is not possible in demo (no quotes); the empty ticket shows the controls.
+        # The empty ticket shows the controls (demo has invented quotes if you want a filled one).
         page.locator("#ticket").screenshot(path=str(OUT / "screenshot-ticket.png"))
         # The floating Manage window view
         m = browser.new_page(viewport={"width": 560, "height": 620}, device_scale_factor=2)

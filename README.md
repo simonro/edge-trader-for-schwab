@@ -68,6 +68,11 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
   (it checks every 3 seconds and only while the app is running; it never loosens a stop). One click
   sends one Schwab bracket. Entries must be armed each session.
+- **Options on the ticket:** switch the ticket to Option, type the underlying, pick the expiry, calls
+  or puts and a strike from the chain (bid, ask, mark, delta, spread and open interest), then buy to
+  open or sell to open. Stop and targets are option prices; contracts are sized from your risk (one
+  contract = 100 shares of premium). The same one-click bracket goes to Schwab, with limit entries
+  only (mid, ask or bid) and a warning on wide markets and on every sell to open.
 - **Workbench for the selected trade:** an R ruler (original stop, current stop, entry, 1R, targets,
   price), stop to break-even, move stop, Schwab-held trailing stop (R, dollars or percent), replace
   target, partials at the mid, market, ask or bid (the stop and target are rebuilt on the rest), cancel
@@ -169,10 +174,13 @@ folder across, run `setup.bat` once, then `launch.bat`.
 
 - **Futures:** Schwab's API reports futures fills but not futures positions or orders, so Edge Trader
   shows futures realized P&L only and cannot trade futures.
-- **Options:** shown and manageable: close, cancel, stops, partials, targets by price, and trailing
-  stops. Prices follow each contract's own steps (pennies, nickels or dimes). Schwab does not document
-  trailing stops on options, so each one is first checked with Schwab's order preview; if Schwab would
-  refuse it, nothing is sent and your stop and target stay as they were. The New trade ticket is for stocks.
+- **Options:** single calls and puts, bought or sold to open from the ticket and managed like stocks
+  (close, cancel, stops, Auto B/E, partials, targets, trailing stops). Prices follow each contract's own
+  steps (pennies, nickels or dimes). Schwab does not document trailing stops on options, so each one is
+  first checked with Schwab's order preview; if Schwab would refuse it, nothing is sent. Spreads and
+  other multi-leg orders are shown but not traded here (Schwab's API does not take stops on them), and
+  adjusted contracts (after a split or merger) are refused. Selling to open needs the matching option
+  approval level on your Schwab account.
 - **One stream per Schwab user:** Edge Trader polls (REST) and never opens Schwab's streamer, so it
   works alongside thinkorswim and other tools. It keeps its own requests well under Schwab's limits.
 - **Schwab cancels a symbol's working orders when a new order for it is entered.** Edge Trader is built
@@ -182,7 +190,8 @@ folder across, run `setup.bat` once, then `launch.bat`.
 - **Recording mode:** `.venv\Scripts\python.exe -m companion --private` hides positions carried from
   earlier sessions, their orders, the carried P&L and the account value, so you can record or share your
   screen while showing only today's trades. It only changes what is displayed; orders work as usual.
-  `--demo` runs on invented data with no Schwab connection, and refuses every order.
+  `--demo` runs on invented data with no Schwab connection, and refuses every order (the ticket plans on
+  invented quotes and an invented AAPL option chain, so you can try it).
 
 ## Contributing
 
