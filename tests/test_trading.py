@@ -1024,3 +1024,174 @@ def test_partial_at_bid_and_ask_uses_the_literal_price(trader, monkeypatch):
     trader._client = Broker([_mu_oco()], fill_limits=True)
     trader.take_partial("MXR", 0.5, None, [], set(), mode="ask")
     assert trader._client.placed[0]["price"] == "906.30"             # cover at the ask: takes
+
+
+# ---- options: price grids, contracts wording, and trailing stops behind Schwab's preview -------
+
+OPT = "AAPL  261120C00230000"
+
+
+class OptBroker(Broker):
+    """The Broker fake holding a long option position, with Schwab's order preview."""
+
+    def __init__(self, orders, qty=4.0, preview=None, preview_exc=None, **kw):
+        super().__init__(orders, position=(OPT, qty, "OPTION"), **kw)
+        self.previewed, self.preview_resp, self.preview_exc = [], preview, preview_exc
+
+    def preview_order(self, _h, order):
+        self.previewed.append(order)
+        if self.preview_exc:
+            raise self.preview_exc
+        return self.preview_resp or JsonResp(200, {"orderValidationResult": {"rejects": []}})
+
+
+def _opt_leaf(oid, otype, qty, **px):
+    return {"orderId": oid, "orderStrategyType": "SINGLE", "status": "WORKING", "orderType": otype,
+            "quantity": qty, "filledQuantity": 0, **px,
+            "orderLegCollection": [{"instruction": "SELL_TO_CLOSE", "positionEffect": "CLOSING",
+                                    "quantity": qty, "instrument": {"symbol": OPT, "assetType": "OPTION"}}]}
+
+
+def _opt_oco(stop=0.30, target=0.95, qty=4):
+    return {"orderId": 50, "orderStrategyType": "OCO", "status": "WORKING", "childOrderStrategies": [
+        _opt_leaf(51, "STOP", qty, stopPrice=stop), _opt_leaf(52, "LIMIT", qty, price=target)]}
+
+
+def _opt_quote(trader, monkeypatch, bid=0.55, ask=0.60, penny=False, underlying="AAPL"):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    q = {"bid": bid, "ask": ask, "mark": round((bid + ask) / 2, 4), "asset_type": "OPTION",
+         "underlying": underlying, "is_penny": penny}
+    monkeypatch.setattr(trader, "quote", lambda s, max_age=0: q)
+
+
+def test_option_move_stop_lands_on_the_nickel_grid(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.move_stop(OPT, "0.37", [], set())
+    assert r["ok"] and r["stop"] == "0.35", r
+    (oid, body), = trader._client.replaced
+    assert oid == 51 and body["stopPrice"] == "0.35"
+    assert body["orderLegCollection"][0]["instrument"]["assetType"] == "OPTION"
+    assert "4 contracts" in r["message"] and "shares" not in r["message"]
+
+
+def test_option_move_stop_on_a_penny_class_keeps_pennies(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, penny=True)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.move_stop(OPT, "0.37", [], set())
+    assert r["ok"] and trader._client.replaced[0][1]["stopPrice"] == "0.37"
+
+
+def test_option_set_target_rounds_to_the_grid(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.set_target(OPT, "0.93", None, [], set(), None)
+    assert r["ok"] and r["target"] == "0.95", r
+    (order,) = trader._client.placed
+    target, stop = order["childOrderStrategies"]
+    assert target["price"] == "0.95" and stop["stopPrice"] == "0.30"
+    assert target["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE"
+    assert trader._client.previewed == []                     # a fixed stop needs no preview
+
+
+def test_option_target_in_r_uses_the_frozen_premium_basis(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.set_target(OPT, None, 2, [], set(), {"side": "LONG", "entry": 0.52, "rps": 0.22})
+    assert r["ok"] and r["target"] == "0.95", r               # 0.52 + 0.44 = 0.96, floored to 0.95
+
+
+def test_option_partial_at_the_mid_uses_option_ticks(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, bid=0.55, ask=0.70)
+    trader._client = OptBroker([_opt_oco()], fill_limits=True)
+    r = trader.take_partial(OPT, 0.5, None, [], set(), mode="mid")
+    assert r["ok"], r
+    partial, rebuild = trader._client.placed
+    assert partial["price"] == "0.60"                         # mid 0.625, sell rounds down on 0.05s
+    assert partial["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE"
+    assert rebuild["childOrderStrategies"][1]["stopPrice"] == "0.30"
+    assert "contracts" in r["message"] or "Took 2 of 4" in r["message"]
+    assert "share" not in trader.take_partial(OPT, 0.1, None, [], set())["error"]
+
+
+def test_option_trail_is_sent_when_schwab_preview_accepts_it(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, bid=0.70, ask=0.75)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.set_trail(OPT, "$", "0.13", "MARK", [], set(), None)
+    assert r["ok"], r
+    (previewed,) = trader._client.previewed
+    (order,) = trader._client.placed
+    assert previewed == order
+    target, stop = order["childOrderStrategies"]
+    assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceOffset"] == 0.15   # 0.13 -> nickel
+    assert stop["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE" and target["price"] == "0.95"
+
+
+def test_option_trail_refused_by_the_preview_sends_nothing(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, bid=0.70, ask=0.75)
+    no = JsonResp(200, {"orderValidationResult": {"rejects": [
+        {"validationRuleName": "TrailingStop", "message": "Trailing stop orders are not allowed for options."}]}})
+    trader._client = OptBroker([_opt_oco()], preview=no)
+    r = trader.set_trail(OPT, "$", "0.15", "MARK", [], set(), None)
+    assert not r["ok"] and "does not accept" in r["error"] and "not allowed for options" in r["error"]
+    assert "still working" in r["error"] and trader._client.placed == []
+    assert trader._client.orders[50]["childOrderStrategies"][0]["status"] == "WORKING"   # stop untouched
+
+
+@pytest.mark.parametrize("kw", [{"preview": Resp(500, text="boom")}, {"preview_exc": TimeoutError("read timed out")},
+                                {"preview": Resp(429)}])
+def test_option_trail_without_a_clear_preview_is_refused(trader, monkeypatch, kw):
+    _opt_quote(trader, monkeypatch, bid=0.70, ask=0.75)
+    trader._client = OptBroker([_opt_oco()], **kw)
+    r = trader.set_trail(OPT, "$", "0.15", "MARK", [], set(), None)
+    assert not r["ok"] and "Nothing was sent" in r["error"] and trader._client.placed == []
+    assert "did not confirm" in r["error"]                    # unclear, not "Schwab does not accept"
+
+
+def test_stock_trail_is_not_previewed(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_oco()])
+    trader._client.preview_order = lambda *a: pytest.fail("a stock trail must not need a preview")
+    assert trader.set_trail("MXR", "$", 2.5, "MARK", [], set(), None)["ok"]
+
+
+def test_option_auto_breakeven_rounds_up_to_the_nickel(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, bid=0.75, ask=0.80)
+    tree = {"orderId": 40, "orderStrategyType": "TRIGGER", "status": "FILLED", "filledQuantity": 4,
+            "orderLegCollection": [{"instruction": "BUY_TO_OPEN", "positionEffect": "OPENING", "quantity": 4,
+                                    "instrument": {"symbol": OPT, "assetType": "OPTION"}}],
+            "childOrderStrategies": [_opt_oco()]}
+    trader._client = OptBroker([tree])
+    trader.store.insert_ticket({"ticket_id": "t-opt", "symbol": OPT, "side": "LONG", "qty": 4, "limit": "0.52",
+                                "stop": "0.30", "target": "0.95", "risk": 88.0, "request": {}})
+    trader.store.update_ticket("t-opt", "ACCEPTED", order_id=40)
+    trader.store.add_auto_be("t-opt", OPT)
+    assert trader.store.set_auto_be("t-opt", "SENDING", only_from="PENDING")
+    r = trader.auto_breakeven("t-opt", OPT, "LONG", 0.52, [], set())
+    assert r["ok"] and r["state"] == "DONE", r
+    (oid, body), = trader._client.replaced
+    assert oid == 51 and body["stopPrice"] == "0.55"          # 0.52 is off the grid: up, never below entry
+
+
+def test_quote_reads_the_option_fields(tmp_path):
+    from companion.bracket import EQUITY, OPT_NICKEL, OPT_PENNY, OPT_PENNY_ALL
+    t = Trader(Store(tmp_path / "q.db"))
+
+    class Q(FakeClient):
+        def quotes(self, syms):
+            return JsonResp(200, {
+                OPT: {"assetMainType": "OPTION", "realtime": True,
+                      "quote": {"bidPrice": 0.55, "askPrice": 0.6, "lastPrice": 0.57, "mark": 0.575},
+                      "reference": {"underlying": "AAPL", "isPennyPilot": True, "multiplier": 100.0}},
+                "XYZ   261120P00050000": {"assetMainType": "OPTION", "quote": {"bidPrice": 3.1, "askPrice": 3.3},
+                                         "reference": {"underlying": "XYZ", "isPennyPilot": False}},
+                "SPY   261120C00600000": {"assetMainType": "OPTION", "quote": {"bidPrice": 4.0, "askPrice": 4.02},
+                                         "reference": {"isPennyPilot": True}},
+                "MXR": {"assetMainType": "EQUITY", "quote": {"bidPrice": 906.0, "askPrice": 906.2}}})
+    t._client, t._hash = Q(), "H" * 64
+    q = t.quote(OPT)
+    assert q["mark"] == 0.575 and q["multiplier"] == 100.0 and q["underlying"] == "AAPL" and q["ticks"] == OPT_PENNY
+    assert t.quote("XYZ   261120P00050000")["ticks"] == OPT_NICKEL
+    assert t.quote("SPY   261120C00600000")["ticks"] == OPT_PENNY_ALL     # underlying from the OCC root
+    assert t.quote("MXR")["ticks"] == EQUITY
+    assert t._ticks("MXR", "EQUITY") == EQUITY and t._ticks(OPT, "OPTION") == OPT_PENNY

@@ -33,11 +33,12 @@ def _pos(sym, side, qty, avg, last, stop, target, opened, held="INTRADAY", r=Non
 
 
 def _order(oid, sym, role, instr, otype, qty, price=None, stop=None, last=None, group=None, gtype="OCO",
-           duration="DAY", cancellable=False, status="WORKING", effect="CLOSING"):
+           duration="DAY", cancellable=False, status="WORKING", effect="CLOSING", asset="EQUITY", display=None,
+           underlying=None):
     ref = stop if stop is not None else price
     return {
         "order_id": oid, "leg_id": 1, "legs": 1, "group_id": group or oid, "group_type": gtype, "status": status,
-        "live": True, "symbol": sym, "display": sym, "underlying": sym, "asset_type": "EQUITY",
+        "live": True, "symbol": sym, "display": display or sym, "underlying": underlying or sym, "asset_type": asset,
         "instruction": instr, "effect": effect, "order_type": otype, "role": role, "qty": float(qty), "filled": 0.0,
         "price": price, "stop": stop, "duration": duration, "entered": "", "tag": None, "last": last,
         "distance": round(ref - last, 2) if (ref and last) else None,
@@ -47,6 +48,7 @@ def _order(oid, sym, role, instr, otype, qty, price=None, stop=None, last=None, 
 
 
 _STARTED = datetime.now(timezone.utc)      # fixed open times: positions do not "reopen" every poll
+OPT, OPT_DISPLAY = "AAPL  261120C00230000", "AAPL 20 Nov 26 230C"
 
 
 def demo_state(now: datetime | None = None) -> dict:
@@ -60,6 +62,9 @@ def demo_state(now: datetime | None = None) -> dict:
              r={"side": "LONG", "entry": 187.42, "stop": 185.20, "rps": 2.22, "live_r": 0.55}),
         _pos("AMD", "SHORT", 90, 162.30, 161.05, 164.10, 158.70, t - timedelta(minutes=21),
              r={"side": "SHORT", "entry": 162.30, "stop": 164.10, "rps": 1.80, "live_r": 0.69}),
+        _pos(OPT, "LONG", 4, 0.52, 0.73, 0.30, 0.95, t - timedelta(minutes=6), bid=0.72, ask=0.74,
+             r={"side": "LONG", "entry": 0.52, "stop": 0.30, "rps": 0.22, "live_r": 0.95},
+             name_display=OPT_DISPLAY, asset="OPTION", underlying="AAPL", mult=100.0),
         _pos("PLTR", "LONG", 400, 41.60, 41.38, 41.10, None, t - timedelta(minutes=9),
              protection="PARTIAL", stop_qty=200),
         _pos("MSFT", "LONG", 50, 402.10, 431.50, None, 445.00, None, held="CARRIED", protection="NONE"),
@@ -69,6 +74,10 @@ def demo_state(now: datetime | None = None) -> dict:
         _order(9002, "NVDA", "TARGET", "SELL", "LIMIT", 180, price=191.86, last=188.65, group=9000),
         _order(9011, "AMD", "STOP", "BUY_TO_COVER", "STOP", 90, stop=164.10, last=161.05, group=9010),
         _order(9012, "AMD", "TARGET", "BUY_TO_COVER", "LIMIT", 90, price=158.70, last=161.05, group=9010),
+        _order(9051, OPT, "STOP", "SELL_TO_CLOSE", "STOP", 4, stop=0.30, last=0.73, group=9050,
+               asset="OPTION", display=OPT_DISPLAY, underlying="AAPL"),
+        _order(9052, OPT, "TARGET", "SELL_TO_CLOSE", "LIMIT", 4, price=0.95, last=0.73, group=9050,
+               asset="OPTION", display=OPT_DISPLAY, underlying="AAPL"),
         _order(9021, "PLTR", "STOP", "SELL", "STOP", 200, stop=41.10, last=41.38, gtype="SINGLE"),
         _order(9031, "AAPL", "ENTRY", "BUY", "LIMIT", 120, price=229.40, last=229.55, gtype="TRIGGER",
                cancellable=True, effect="OPENING"),

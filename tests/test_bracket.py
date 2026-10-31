@@ -177,3 +177,39 @@ def test_trail_wider_than_the_stop_warns_and_percent_works():
     assert q.ok and q.trail["link"] == "PERCENT" and q.trail_start > q.limit
     assert not plan("TSX", "LONG", stop="414.73", risk=375, r_multiple=2, bid="417.80", ask="417.86",
                     stop_type="trail", trail_unit="$", trail_value=0).ok
+
+
+# ---- option price grids ------------------------------------------------------------------
+
+def test_ticks_for_picks_the_grid():
+    from companion.bracket import EQUITY, OPT_NICKEL, OPT_PENNY, OPT_PENNY_ALL, ticks_for
+    assert ticks_for("EQUITY") == EQUITY and ticks_for(None) == EQUITY
+    assert ticks_for("OPTION", "AAPL", True) == OPT_PENNY
+    assert ticks_for("OPTION", "XYZ", False) == OPT_NICKEL
+    assert ticks_for("OPTION", "XYZ", None) == OPT_NICKEL        # unknown flag: the grid valid everywhere
+    assert ticks_for("OPTION", "SPY", False) == OPT_PENNY_ALL     # SPY / QQQ / IWM: pennies at every price
+
+
+def test_option_ticks_and_rounding():
+    from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+    from companion.bracket import OPT_NICKEL, OPT_PENNY, OPT_PENNY_ALL, _to_tick, fmt, tick
+    D = Decimal
+    assert tick(D("2.99"), OPT_PENNY) == D("0.01") and tick(D("3.00"), OPT_PENNY) == D("0.05")
+    assert tick(D("2.99"), OPT_NICKEL) == D("0.05") and tick(D("3.00"), OPT_NICKEL) == D("0.10")
+    assert tick(D("12.34"), OPT_PENNY_ALL) == D("0.01")
+    assert _to_tick(D("0.37"), ROUND_HALF_UP, OPT_NICKEL) == D("0.35")
+    assert _to_tick(D("0.37"), ROUND_CEILING, OPT_NICKEL) == D("0.40")
+    assert _to_tick(D("3.07"), ROUND_FLOOR, OPT_NICKEL) == D("3.00")
+    assert _to_tick(D("2.98"), ROUND_CEILING, OPT_NICKEL) == D("3.00")
+    assert _to_tick(D("3.02"), ROUND_CEILING, OPT_PENNY) == D("3.05")
+    assert _to_tick(D("2.996"), ROUND_CEILING, OPT_PENNY) == D("3.00")
+    assert fmt(D("0.35"), OPT_NICKEL) == "0.35"                   # cents, never 4 decimals
+    assert fmt(D("0.35")) == "0.3500"                             # stocks under $1 unchanged
+
+
+def test_trail_offset_on_an_option_grid():
+    from companion.bracket import OPT_NICKEL, trail_spec
+    spec, err = trail_spec("$", "0.13", None, "MARK", OPT_NICKEL)
+    assert not err and spec["offset"] == Decimal("0.15")
+    spec, err = trail_spec("$", "0.02", None, "MARK", OPT_NICKEL)
+    assert spec is None and "rounds to 0" in err

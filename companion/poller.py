@@ -387,7 +387,7 @@ class Poller:
         otherwise the best mark seen since we first saw the order, minus the offset. Seen from
         polls only, so the estimate never runs ahead of the real stop (it can lag behind it)."""
         from decimal import Decimal
-        from .bracket import trail_level
+        from .bracket import ticks_for, trail_level
         live_ids = set()
         for p in st.get("positions") or []:
             t = p.get("trail")
@@ -415,7 +415,9 @@ class Poller:
                 t.update({"level": t["schwab_stop"], "estimated": False, "best": best})
             elif best and t.get("offset") and t.get("whole"):
                 spec = {"offset": Decimal(str(t["offset"])), "link": t.get("link") or "VALUE"}
-                lvl = float(trail_level(Decimal(str(best)), spec, p["side"]))
+                pen = ((self.quotes.get(p["symbol"]) or {}).get("reference") or {}).get("isPennyPilot")
+                tk = ticks_for(p.get("asset_type"), p.get("underlying"), pen if isinstance(pen, bool) else None)
+                lvl = float(trail_level(Decimal(str(best)), spec, p["side"], tk))
                 t.update({"level": lvl, "estimated": True, "best": best})
                 p["stop_price"] = lvl          # ruler and P&L at stop use the estimate, flagged
                 if p.get("avg_price"):

@@ -169,8 +169,10 @@ folder across, run `setup.bat` once, then `launch.bat`.
 
 - **Futures:** Schwab's API reports futures fills but not futures positions or orders, so Edge Trader
   shows futures realized P&L only and cannot trade futures.
-- **Options:** shown and manageable (close, cancel, stops, partials, targets by price); the New trade
-  ticket and trailing stops are for stocks.
+- **Options:** shown and manageable: close, cancel, stops, partials, targets by price, and trailing
+  stops. Prices follow each contract's own steps (pennies, nickels or dimes). Schwab does not document
+  trailing stops on options, so each one is first checked with Schwab's order preview; if Schwab would
+  refuse it, nothing is sent and your stop and target stay as they were. The New trade ticket is for stocks.
 - **One stream per Schwab user:** Edge Trader polls (REST) and never opens Schwab's streamer, so it
   works alongside thinkorswim and other tools. It keeps its own requests well under Schwab's limits.
 - **Schwab cancels a symbol's working orders when a new order for it is entered.** Edge Trader is built

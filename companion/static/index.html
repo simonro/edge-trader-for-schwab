@@ -691,8 +691,9 @@ function stopRow(p, sym, noR) {
     ${noR ? `<div class="warnline mut" style="color:var(--muted)">Trail in R needs a companion entry; use Trail ▾ with $ or %.</div>` : ""}
     ${TRAIL_OPEN[sym] ? trailPanel(p, sym, noR) : ""}</div>`;
 }
+const unitSh = p => p && p.asset_type === "OPTION" ? "ct" : "sh";      // contracts or shares
 function trailPanel(p, sym, noR) {
-  const d = trailDraft(sym);
+  const d = trailDraft(sym), us = unitSh(p);
   if (noR && d.unit === "R") d.unit = "$";
   const info = trailStartInfo(p, d);
   const seg = (name, vals, cur) => `<div class="seg">${vals.map(([v, t]) =>
@@ -701,12 +702,12 @@ function trailPanel(p, sym, noR) {
   return `<div class="trailpanel">
     <div class="r"><span class="k">Distance</span>${seg("unit", [["R", "R"], ["$", "$"], ["%", "%"]].filter(([u]) => !(noR && u === "R")), d.unit)}
       ${d.unit === "R" ? seg("value", [[0.5, "0.5R"], [1, "1R"], [1.5, "1.5R"], [2, "2R"]], d.value)
-        : `<input class="in trail-val" data-symbol="${esc(sym)}" inputmode="decimal" value="${esc(d.value)}" placeholder="${d.unit === "%" ? "0.5" : "1.20"}"> ${d.unit}`}</div>
+        : `<input class="in trail-val" data-symbol="${esc(sym)}" inputmode="decimal" value="${esc(d.value)}" placeholder="${d.unit === "%" ? "0.5" : p.asset_type === "OPTION" ? "0.10" : "1.20"}"> ${d.unit}`}</div>
     <div class="r"><span class="k">Follows</span>${seg("basis", [["MARK", "Mark"], ["LAST", "Last"], ["BID", "Bid"], ["ASK", "Ask"]], d.basis)}</div>
     <div class="r"><span class="k">Start</span><span class="mut">Now</span><label class="mut" style="opacity:.6" title="Schwab accepted it in a preview but has not been verified live"><input type="checkbox" disabled> At price (not verified yet)</label></div>
-    <div class="eff">${info ? `Starts about <b class="num">${px(info.start)}</b> (${unitTxt(d)} = ${px(info.off)}/sh from ${esc(d.basis.toLowerCase())})` : "Needs a price to estimate the start."}
-      ${info?.looser ? `<span class="amb"> · looser than your ${p.trail ? "trail's ~" + px(p.trail.level) : "stop " + px(p.stop_price)} by ${px(info.by)}/sh</span>` : ""}</div>
-    <div class="foot"><span class="mut" style="font-size:12px">One OCO for ${qty(p.qty)} sh: trailing stop + ${tgtTxt}. It keeps trailing after B/E.</span><span class="sp"></span>
+    <div class="eff">${info ? `Starts about <b class="num">${px(info.start)}</b> (${unitTxt(d)} = ${px(info.off)}/${us} from ${esc(d.basis.toLowerCase())})` : "Needs a price to estimate the start."}
+      ${info?.looser ? `<span class="amb"> · looser than your ${p.trail ? "trail's ~" + px(p.trail.level) : "stop " + px(p.stop_price)} by ${px(info.by)}/${us}</span>` : ""}</div>
+    <div class="foot"><span class="mut" style="font-size:12px">One OCO for ${qty(p.qty)} ${us}: trailing stop + ${tgtTxt}. It keeps trailing after B/E.</span><span class="sp"></span>
       <button type="button" class="btn" data-trailopen="${esc(sym)}">Close</button>
       ${actionBtn(`trlx:${sym}`, `${p.trail ? "Change to" : "Replace with"} trail ${unitTxt(d)}`, "trail",
                   {symbol: sym, unit: d.unit, value: d.value, basis: d.basis}, "", !(Number(d.value) > 0), "primary")}</div>
@@ -772,7 +773,7 @@ function renderWorkspace(p, st) {
         <div class="ctl"><div class="seg">${[["mid", "Mid"], ["market", "Mkt"], ["ask", "Ask"], ["bid", "Bid"]].map(([v, t]) =>
             `<button type="button" data-pmode="${v}" class="${PART_MODE === v ? "on" : ""}">${t}</button>`).join("")}</div>
           ${[25, 50, 75].map(v => actionBtn(`pt${v}:${sym}`, `${v}%`, "partial", {symbol: sym, pct: v / 100}, "", false, "act", kbd(`pt${v}`))).join("")}<span class="gap"></span>
-          <input class="in ms-input pt-input" data-symbol="${esc(sym)}" inputmode="numeric" placeholder="shares" value="${esc(PT_INPUT[sym] || "")}" style="width:84px">
+          <input class="in ms-input pt-input" data-symbol="${esc(sym)}" inputmode="numeric" placeholder="${p.asset_type === "OPTION" ? "contracts" : "shares"}" value="${esc(PT_INPUT[sym] || "")}" style="width:${p.asset_type === "OPTION" ? 104 : 84}px">
           ${actionBtn(`ptc:${sym}`, "Send", "partial", {symbol: sym, custom: 1}, "", false, "act", kbd("@shares"))}</div></div>
     </div>
     <div class="result ${m ? m.cls : ""}">${m ? `<b>Last result:</b> ${esc(m.text)}` : "No action on this position yet."}
@@ -946,10 +947,10 @@ document.addEventListener("click", async e => {
       CONFIRM.busy.delete(key); if (lastState) render(lastState); return;
     }
     if (act === "partial" && b.dataset.custom && !(parseInt(PT_INPUT[sym]) > 0)) {
-      POS_MSG[sym] = {cls: "bad", text: "Type how many shares to send first."};
+      POS_MSG[sym] = {cls: "bad", text: "Type how many to send first."};
       CONFIRM.busy.delete(key); if (lastState) render(lastState); return;
     }
-    const ptLabel = b.dataset.custom ? `${PT_INPUT[sym]} shares` : `${Math.round(parseFloat(b.dataset.pct) * 100)}%`;
+    const ptLabel = b.dataset.custom ? `${PT_INPUT[sym]}` : `${Math.round(parseFloat(b.dataset.pct) * 100)}%`;
     POS_MSG[sym] = {cls: "warn", text: {close: "Closing at market...", symcancel: "Cancelling orders...",
                     be: "Moving stop to break-even...", move: `Moving stop to ${MS_INPUT[sym]}...`,
                     partial: `Sending partial ${ptLabel} (${PART_MODE})...`,

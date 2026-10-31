@@ -26,16 +26,51 @@ MAX_NOTIONAL = Decimal("250000")
 MIN_STOP_TICKS = 2
 
 
-def tick(price: Decimal) -> Decimal:
+# Price grids ("ticks" profiles). Stocks: pennies from $1, 1/100 cent below. Options (exchange
+# minimum increments): Penny Interval Program classes trade in $0.01 under $3 and $0.05 from $3,
+# SPY / QQQ / IWM in $0.01 at every price, every other class in $0.05 under $3 and $0.10 from $3.
+# When the penny flag is unknown an option gets the nickel grid: its prices are valid on every grid.
+EQUITY = "EQUITY"
+OPT_PENNY = "OPT_PENNY"
+OPT_PENNY_ALL = "OPT_PENNY_ALL"
+OPT_NICKEL = "OPT_NICKEL"
+PENNY_ALL_ROOTS = frozenset({"SPY", "QQQ", "IWM"})
+_C1, _C5, _C10 = Decimal("0.01"), Decimal("0.05"), Decimal("0.10")
+
+
+def ticks_for(asset_type: str | None, underlying: str | None = None, is_penny: bool | None = None) -> str:
+    """The price grid of an instrument (stocks and anything that is not an option: EQUITY)."""
+    if (asset_type or "").upper() != "OPTION":
+        return EQUITY
+    if (underlying or "").upper().strip() in PENNY_ALL_ROOTS:
+        return OPT_PENNY_ALL
+    return OPT_PENNY if is_penny is True else OPT_NICKEL
+
+
+def tick(price: Decimal, ticks: str = EQUITY) -> Decimal:
+    if ticks == OPT_PENNY_ALL:
+        return _C1
+    if ticks == OPT_PENNY:
+        return _C1 if price < 3 else _C5
+    if ticks == OPT_NICKEL:
+        return _C5 if price < 3 else _C10
     return Decimal("0.01") if price >= 1 else Decimal("0.0001")
 
 
-def _to_tick(price: Decimal, rounding: str) -> Decimal:
-    t = tick(price)
-    return (price / t).to_integral_value(rounding=rounding) * t
+def _to_tick(price: Decimal, rounding: str, ticks: str = EQUITY) -> Decimal:
+    t = tick(price, ticks)
+    out = (price / t).to_integral_value(rounding=rounding) * t
+    # Rounding up across the $3 break can land between the two grids (2.98 -> 3.00 is fine, but a
+    # coarser grid above $3 needs the result checked again on its own tick).
+    t2 = tick(out, ticks)
+    if t2 != t:
+        out = (out / t2).to_integral_value(rounding=rounding) * t2
+    return out
 
 
-def fmt(price: Decimal) -> str:
+def fmt(price: Decimal, ticks: str = EQUITY) -> str:
+    if ticks != EQUITY:
+        return f"{price:.2f}"           # option prices are quoted in cents
     return f"{price:.2f}" if price >= 1 else f"{price:.4f}"
 
 
@@ -119,7 +154,8 @@ def _price(v) -> Decimal | None:
 TRAIL_BASES = ("MARK", "LAST", "BID", "ASK")
 
 
-def trail_spec(unit: str, value, per_share: Decimal | None, basis: str = "MARK") -> tuple[dict | None, str | None]:
+def trail_spec(unit: str, value, per_share: Decimal | None, basis: str = "MARK",
+               ticks: str = EQUITY) -> tuple[dict | None, str | None]:
     """Schwab trailing-stop fields from a distance in R (needs the risk per share), $ or %.
     Returns (spec, error)."""
     unit = {"$": "USD", "%": "PCT", "PERCENT": "PCT", "DOLLAR": "USD"}.get((unit or "").upper().strip(), (unit or "").upper().strip())
@@ -135,9 +171,15 @@ def trail_spec(unit: str, value, per_share: Decimal | None, basis: str = "MARK")
     if unit == "R":
         if not per_share:
             return None, "a trail in R needs the frozen 1R of a companion entry: use $ or %"
-        return {"offset": _to_tick(per_share * v, ROUND_HALF_UP), "link": "VALUE", "basis": basis}, None
-    if unit == "USD":
-        return {"offset": _to_tick(v, ROUND_HALF_UP), "link": "VALUE", "basis": basis}, None
+        off = _to_tick(per_share * v, ROUND_HALF_UP, ticks)
+    elif unit == "USD":
+        off = _to_tick(v, ROUND_HALF_UP, ticks)
+    else:
+        off = None
+    if off is not None:
+        if off <= 0:
+            return None, f"trail distance rounds to 0 (prices move in {fmt(tick(v, ticks), ticks)} steps)"
+        return {"offset": off, "link": "VALUE", "basis": basis}, None
     if unit == "PCT":
         if v >= 50:
             return None, "trail percent must be below 50"
@@ -145,14 +187,14 @@ def trail_spec(unit: str, value, per_share: Decimal | None, basis: str = "MARK")
     return None, "trail unit must be R, $ or %"
 
 
-def trail_level(from_price: Decimal, spec: dict, side: str) -> Decimal:
+def trail_level(from_price: Decimal, spec: dict, side: str, ticks: str = EQUITY) -> Decimal:
     """Where a trailing stop sits when the best price so far is from_price."""
     off = (from_price * spec["offset"] / 100) if spec["link"] == "PERCENT" else spec["offset"]
     raw = from_price - off if side == "LONG" else from_price + off
-    return _to_tick(raw, ROUND_HALF_UP)
+    return _to_tick(raw, ROUND_HALF_UP, ticks)
 
 
-def stop_leg(spec, legs: list[dict], duration: str = "DAY") -> dict:
+def stop_leg(spec, legs: list[dict], duration: str = "DAY", ticks: str = EQUITY) -> dict:
     """The stop child of an exit: a STOP at a price (Decimal) or a Schwab TRAILING_STOP (dict)."""
     if isinstance(spec, dict):
         off = spec["offset"]
@@ -160,7 +202,7 @@ def stop_leg(spec, legs: list[dict], duration: str = "DAY") -> dict:
                 "duration": duration, "stopPriceLinkBasis": spec["basis"], "stopPriceLinkType": spec["link"],
                 "stopPriceOffset": float(off), "orderLegCollection": legs}
     return {"orderStrategyType": "SINGLE", "orderType": "STOP", "session": "NORMAL", "duration": duration,
-            "stopPrice": fmt(spec), "orderLegCollection": legs}
+            "stopPrice": fmt(spec, ticks), "orderLegCollection": legs}
 
 
 def plan(symbol: str, side: str, stop, risk, r_multiple, bid, ask, split=0, t1_r=1, entry="cross",
