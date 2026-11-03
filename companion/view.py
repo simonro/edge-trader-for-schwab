@@ -162,16 +162,21 @@ def _position_rows(account: dict, pend: list[PendingOrder], quotes: dict, book: 
             "ledger": "MATCH" if abs(ledger_qty - qty) < 1e-9 else "MISMATCH",
             # When the current flat-to-flat position started (first fill), for R ownership.
             "opened": open_trade.opened.isoformat() if open_trade and open_trade.opened else None,
+            # Partial exits of the current round trip so far: net $ (None when a basis is unknown).
+            "realized_qty": open_trade.exit_qty if open_trade else 0.0,
+            "realized": open_trade.net if open_trade and open_trade.exit_qty else None,
         })
     # Stable order: intraday, mixed, carried, then by symbol (rows must not jump as P&L moves).
     order = {"INTRADAY": 0, "MIXED": 1, "CARRIED": 2}
     return sorted(rows, key=lambda r: (order[r["held"]], r["underlying"], r["symbol"]))
 
 
-def _trade_row(t) -> dict:
+def _trade_row(t, fills_by_id: dict[str, Fill]) -> dict:
+    # A fill that flips the position belongs to both round trips and is listed in each at full size.
+    execs = [fills_by_id[i] for i in t.fills if i in fills_by_id]
     return {
         "symbol": t.symbol, "display": pretty_symbol(t.symbol, t.asset_type),
-        "asset_type": t.asset_type, "side": t.side, "status": t.status,
+        "asset_type": t.asset_type, "underlying": t.underlying, "side": t.side, "status": t.status,
         "opened": t.opened.isoformat() if t.opened else None,
         "closed": t.closed.isoformat() if t.closed else None,
         "max_qty": t.max_qty, "exit_qty": t.exit_qty, "avg_entry": t.avg_entry,
@@ -180,7 +185,49 @@ def _trade_row(t) -> dict:
         "fees": t.fees, "net": t.net,
         "unresolved_qty": t.unresolved_qty, "multiplier": t.multiplier,
         "hold_seconds": (t.closed - t.opened).total_seconds() if t.closed and t.opened else None,
+        "executions": [{"time": f.time.isoformat(), "qty": f.qty, "price": f.price, "fees": f.fees,
+                        "effect": f.effect, "order_id": f.order_id} for f in execs],
     }
+
+
+_SLACK = 120.0   # seconds between an order's execution time and its /transactions time
+
+
+def _t(iso: str | None) -> datetime | None:
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00").replace("+0000", "+00:00"))
+    except ValueError:
+        return None
+
+
+def ticket_pnl(brackets: list[dict], positions: list[dict], closed: list[dict]) -> None:
+    """Attach the P&L of the round trip each filled ticket opened (or added to), in place.
+
+    pnl = {"state": OPEN | PARTIAL | CLOSED, "open": live $, "realized": net $ or None}. The
+    round trip is the one on the ticket's symbol that was open at the ticket's first fill. A
+    ticket with no fill, or one no round trip matches yet (fills still on their way), gets none.
+    """
+    for b in brackets:
+        fill = _t(b.get("first_fill"))
+        if not fill or not (b.get("filled") or 0) > 0:
+            continue
+
+        def covers(opened, closed_at) -> bool:
+            o, c = _t(opened), _t(closed_at)
+            return (o is None or (o - fill).total_seconds() <= _SLACK) and \
+                (c is None or (fill - c).total_seconds() <= _SLACK)
+
+        p = next((p for p in positions if p["symbol"] == b["symbol"] and covers(p.get("opened"), None)), None)
+        if p and p.get("opened"):
+            b["pnl"] = {"state": "PARTIAL" if p.get("realized_qty") else "OPEN",
+                        "open": p.get("open_pnl"), "realized": p.get("realized")}
+            continue
+        trips = [t for t in closed if t["symbol"] == b["symbol"] and covers(t.get("opened"), t.get("closed"))]
+        if trips:
+            t = max(trips, key=lambda t: t.get("opened") or "")
+            b["pnl"] = {"state": "CLOSED", "open": None, "realized": t.get("net")}
 
 
 def _filled_in_orders(orders: list[dict], day) -> float:
@@ -251,6 +298,7 @@ def build_state(*, account: dict | None, orders: list[dict], txns: list[dict], q
             fut_net[f.symbol] = fut_net.get(f.symbol, 0.0) + f.qty
 
     known = [t for t in closed_today if t.net is not None]
+    fills_by_id = {f.id: f for f in fills}
     open_by = {h: sum(p["open_pnl"] for p in positions if p["held"] == h)
                for h in ("INTRADAY", "MIXED", "CARRIED")}
     cb = acct.get("currentBalances") or {}
@@ -280,7 +328,7 @@ def build_state(*, account: dict | None, orders: list[dict], txns: list[dict], q
         },
         "positions": positions,
         "orders": [_order_row(p, quotes) for p in pend],
-        "closed": [_trade_row(t) for t in closed_today],
+        "closed": [_trade_row(t, fills_by_id) for t in closed_today],
         "futures": {
             "observed_net_today": {k: v for k, v in fut_net.items() if abs(v) > 1e-9},
             "note": "Schwab's API does not return futures positions or futures orders. "

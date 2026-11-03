@@ -105,7 +105,7 @@
   .stat .s { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .stat.quiet .v { color: #aab3bd; font-size: 17px; }
 
-  main { display: grid; grid-template-columns: 300px minmax(0, 1fr) 400px; gap: 10px; padding: 10px 14px 0; align-items: stretch; }
+  main { display: grid; grid-template-columns: 340px minmax(0, 1fr) 400px; gap: 10px; padding: 10px 14px 0; align-items: stretch; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-width: 0; display: flex; flex-direction: column; }
   .ph { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-weight: 700; font-size: 13px; min-height: 38px; }
   .ph small { margin-left: auto; font-weight: 400; color: var(--muted); font-size: 11.5px; }
@@ -119,8 +119,10 @@
   .li { padding: 9px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
   .li:hover { background: #151b23; }
   .li.sel { background: rgba(76,141,255,.10); box-shadow: inset 4px 0 var(--blue); }
-  .li .r1 { display: flex; align-items: center; gap: 6px; } .li .sym { font-size: 16px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .li .pl { margin-left: auto; font: 700 15px var(--mono); }
+  .li.carried .sym { color: #aab3bd; }
+  .li .held { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+  .li .r1 { display: flex; align-items: center; gap: 6px; } .li .sym { flex: none; font-size: 16px; font-weight: 800; white-space: nowrap; }
+  .li .pl { flex: none; margin-left: auto; font: 700 15px var(--mono); }
   .li .r2 { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--muted); margin-top: 3px; }
   .li .r3 { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12px; margin-top: 4px; }
 
@@ -206,6 +208,24 @@
   .riskedit .btn { height: 32px; }
   .chips .btn.riskb { padding: 0 4px; font-size: 12.5px; }
   .tk-name { font-size: 12px; color: var(--muted); min-height: 17px; margin-top: -4px; }
+  /* Option mode: expiry chips and the strike list */
+  .optbox { display: grid; gap: 8px; }
+  .expchips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .expchips .btn { height: 28px; padding: 0 9px; font-size: 12px; flex: none; }
+  .expchips .btn small { color: var(--muted); font-weight: 500; margin-left: 3px; }
+  .chain { max-height: 236px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel2); }
+  .chain table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .chain th { position: sticky; top: 0; background: var(--panel2); color: var(--muted); font: 600 10px var(--sans);
+    text-transform: uppercase; letter-spacing: .4px; text-align: right; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+  .chain td { font-family: var(--mono); text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .chain th:first-child, .chain td:first-child { text-align: left; }
+  .chain tr.row { cursor: pointer; } .chain tr.row:hover td { background: #161d26; }
+  .chain tr.itm td { background: rgba(76,141,255,.05); }
+  .chain tr.sel td { background: var(--blue-bg); color: #fff; }
+  .chain tr.atm td { border-top: 1px solid var(--blue); }
+  .chain .wide { color: var(--amber); }
+  .chain.stale table { opacity: .45; }
+  .chain .empty { padding: 10px; color: var(--muted); font-size: 12px; }
   .tk-name b { color: var(--text); font-weight: 600; }
   .tgt { display: grid; gap: 6px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel2); }
   .tgt .th { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
@@ -237,6 +257,11 @@
   tr.grp td { height: 24px; background: var(--panel2); color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .4px; }
   tr.carried-row { cursor: pointer; } tr.carried-row:hover td { background: #151b23; } tr.carried-row.sel td { background: rgba(76,141,255,.10); }
   tr.carried-row td { color: #aab3bd; }
+  td.xc { width: 26px; padding: 0 0 0 8px; }
+  .xbtn { width: 20px; height: 20px; padding: 0; border-radius: 4px; border: 1px solid var(--line-hi); background: var(--panel2);
+    color: var(--muted); font: 700 13px/18px var(--mono); cursor: pointer; }
+  .xbtn:hover { color: var(--text); border-color: var(--blue); }
+  tr.exec td { height: 24px; font-size: 11.5px; background: var(--panel2); }
 
   .fut { display: flex; gap: 22px; padding: 7px 12px; border-bottom: 1px solid var(--line); font-size: 12px; align-items: baseline; flex-wrap: wrap; }
   .fut .v { font: 700 14px var(--mono); }
@@ -276,8 +301,8 @@
   .strip .chip.sel { border-color: var(--blue); background: var(--blue-bg); }
   .strip .chip.carried { color: #aab3bd; }
   .strip .lockbtn { margin-left: auto; }
-  @media (max-width: 1599px) { main { grid-template-columns: 250px minmax(0, 1fr) 350px; } .metrics .v.xl { font-size: 21px; } }
-  @media (max-width: 1299px) { main { grid-template-columns: 250px minmax(0, 1fr); } main > #ticket { grid-column: 1 / -1; } main > #ticket .tk { max-width: 760px; } }
+  @media (max-width: 1599px) { main { grid-template-columns: 300px minmax(0, 1fr) 350px; } .metrics .v.xl { font-size: 21px; } }
+  @media (max-width: 1299px) { main { grid-template-columns: 300px minmax(0, 1fr); } main > #ticket { grid-column: 1 / -1; } main > #ticket .tk { max-width: 760px; } }
   @media (max-width: 1150px) { main { grid-template-columns: 1fr; } .bottom { grid-template-columns: 1fr; } #daylist { flex: none; max-height: 300px; } .stats { grid-template-columns: 1fr 1fr; }
     header { flex-wrap: wrap; height: auto; padding: 6px 12px; row-gap: 6px; } .metrics { grid-template-columns: 1fr 1fr; } }
 </style>
@@ -292,7 +317,7 @@
   <span class="clock" id="clock"></span>
   <span class="pill" id="mkt-state"></span>
   <span class="pill" id="auth">auth</span>
-  <button type="button" class="btn sm ghost voice" id="voice" title="Spoken alert 10 minutes before the close if day trades are still open. Click to switch on/off; Shift+click to test."></button>
+  <button type="button" class="btn sm ghost voice" id="voice" title="Spoken fills (open, add, partial, closed with P&amp;L) and an alert 10 minutes before the close if day trades are still open. Click to switch on/off; Shift+click to test."></button>
   <button type="button" class="armchip" id="arm-chip" title="Entries need arming; position actions do not">Entries disarmed</button>
   <span class="only-main"><button type="button" class="btn sm ghost" data-open="entry" title="Small always-on-top window with the New trade ticket">Entry ⧉</button>
     <button type="button" class="btn sm ghost" data-open="manage" title="Small always-on-top window to manage the selected position">Manage ⧉</button></span>
@@ -313,7 +338,7 @@
 
 <main>
   <section class="panel">
-    <div class="ph">Day trades <span class="mut" id="day-n"></span><small id="age-account"></small></div>
+    <div class="ph">Open trades <span class="mut" id="day-n"></span><small id="age-account"></small></div>
     <div class="scroll" id="daylist"></div>
   </section>
 
@@ -323,32 +348,42 @@
     <div class="ph">New trade <button type="button" class="armchip" id="t-arm" style="margin-left:auto">Entries disarmed</button>
       <button type="button" class="btn sm ghost popbtn only-main" data-open="entry" title="Pop out: New trade in a small always-on-top window">⧉</button></div>
     <div class="tk">
+      <div class="seg full" id="t-asset"><button type="button" data-v="EQUITY" class="on">Stock</button><button type="button" data-v="OPTION">Option</button></div>
       <div class="row2">
-        <div class="fld"><span class="lbl">Symbol</span><input class="in" id="t-sym" autocomplete="off" spellcheck="false" placeholder="Symbol"></div>
-        <div class="fld"><span class="lbl">Side</span><div class="seg full" id="t-side"><button type="button" data-v="LONG" class="on long">Long</button><button type="button" data-v="SHORT">Short</button></div></div>
+        <div class="fld"><span class="lbl" id="t-symlbl">Symbol</span><input class="in" id="t-sym" autocomplete="off" spellcheck="false" placeholder="Symbol"></div>
+        <div class="fld"><span class="lbl" id="t-sidelbl">Side</span><div class="seg full" id="t-side"><button type="button" data-v="LONG" class="on long">Long</button><button type="button" data-v="SHORT">Short</button></div></div>
       </div>
       <div class="tk-name" id="t-name"></div>
-      <div class="row2">
-        <div class="fld"><span class="lbl">Stop price</span><input class="in" id="t-stop" inputmode="decimal" autocomplete="off" placeholder="$$$"></div>
-        <div class="fld"><span class="lbl">Entry price</span><div class="seg full" id="t-entry">
-          <button type="button" data-v="mid" class="on">Mid</button><button type="button" data-v="market">Mkt</button><button type="button" data-v="ask">Ask</button><button type="button" data-v="bid">Bid</button></div></div>
+      <div class="optbox" id="t-optbox" style="display:none">
+        <div class="fld"><span class="lbl">Expiry</span><div class="expchips" id="t-exp"><span class="mut" style="font-size:12px">Type the underlying.</span></div></div>
+        <div class="seg full" id="t-pc"><button type="button" data-v="CALL" class="on">Calls</button><button type="button" data-v="PUT">Puts</button></div>
+        <div class="chain" id="t-chain"><div class="empty">Pick an expiry.</div></div>
+        <div class="tk-name" id="t-optsel" style="margin-top:0"></div>
       </div>
+      <div class="row2">
+        <div class="fld"><span class="lbl" id="t-stoplbl">Stop price</span><input class="in" id="t-stop" inputmode="decimal" autocomplete="off" placeholder="$$$"></div>
+        <div class="fld"><span class="lbl">Entry price</span><div class="seg full" id="t-entry">
+          <button type="button" data-v="mid" class="on">Mid</button><button type="button" data-v="market">Mkt</button><button type="button" data-v="ask">Ask</button><button type="button" data-v="bid">Bid</button><button type="button" data-v="limit" title="Your own limit price">Lmt</button></div></div>
+      </div>
+      <div class="fld" id="t-lmtfld" style="display:none"><span class="lbl">Limit price (entry)</span><input class="in" id="t-lmt" inputmode="decimal" autocomplete="off" placeholder="limit price"></div>
       <div class="fld"><span class="lbl">Stop type</span><div class="seg full" id="t-stoptype">
-        <button type="button" data-v="fixed" class="on">Fixed</button><button type="button" data-v="autobe">Auto B/E 1R</button><button type="button" data-v="trail">Trail</button></div></div>
+        <button type="button" data-v="fixed" class="on">Fixed</button><button type="button" data-v="autobe">Auto B/E 1R</button><button type="button" data-v="trail">Trail</button><button type="button" data-v="none" title="Only when sizing by quantity">None</button></div></div>
       <div class="chips" id="t-trailbox" style="display:none"><span class="chips" id="t-trailunit"></span><input class="in" id="t-trailval" inputmode="decimal" value="1"><span class="chips" id="t-trailbasis"></span></div>
-      <div class="fld"><span class="lbl" style="display:flex;align-items:center;gap:6px">Risk $
+      <div class="fld"><span class="lbl">Size by</span><div class="seg full" id="t-size"><button type="button" data-v="risk" class="on">Risk $</button><button type="button" data-v="qty">Quantity</button></div></div>
+      <div class="fld" id="t-qtyfld" style="display:none"><span class="lbl" id="t-qtylbl">Shares</span><input class="in" id="t-qty" inputmode="numeric" autocomplete="off" placeholder="how many"></div>
+      <div class="fld" id="t-riskfld"><span class="lbl" style="display:flex;align-items:center;gap:6px">Risk $
         <button type="button" class="gear" id="t-risk-gear" title="Change the risk buttons">⚙</button></span>
         <div class="riskedit" id="t-risk-edit" style="display:none">
           <input class="in" inputmode="decimal"><input class="in" inputmode="decimal"><input class="in" inputmode="decimal"><input class="in" inputmode="decimal">
           <button type="button" class="btn primary" id="t-risk-save">Save</button><button type="button" class="btn" id="t-risk-cancel">Cancel</button>
           <span class="tk-msg" id="t-risk-msg"></span></div>
         <div class="chips" id="t-risk-row"><span id="t-risk" class="chips" style="flex:1"></span><input class="in" id="t-risk-custom" inputmode="decimal" placeholder="other $"></div></div>
-      <div class="fld"><span class="lbl">Targets</span><div class="seg full" id="t-targets"><button type="button" data-v="1" class="on">One target</button><button type="button" data-v="2">Two targets</button></div></div>
+      <div class="fld"><span class="lbl">Targets</span><div class="seg full" id="t-targets"><button type="button" data-v="0">None</button><button type="button" data-v="1" class="on">One target</button><button type="button" data-v="2">Two targets</button></div></div>
       <div class="tgt" id="t-t1box" style="display:none">
         <div class="th"><span class="t">Target 1</span>size<div class="chips sz" id="t-split"><button type="button" class="btn" data-v="0.25">25%</button><button type="button" class="btn on" data-v="0.5">50%</button><button type="button" class="btn" data-v="0.75">75%</button></div></div>
         <div class="chips"><span class="chips" id="t-t1r" style="flex:1"></span><input class="in" id="t-t1p" inputmode="decimal" placeholder="or price"></div>
       </div>
-      <div class="tgt">
+      <div class="tgt" id="t-t2box">
         <div class="th"><span class="t" id="t-t2title">Target</span><span id="t-t2sub"></span><span class="ovr" id="t-t2ovr"></span></div>
         <div class="chips"><span class="chips" id="t-r" style="flex:1"></span><input class="in" id="t-tp" inputmode="decimal" placeholder="or price"></div>
       </div>
@@ -361,12 +396,12 @@
 </main>
 
 <div class="bottom">
+  <section class="panel"><div class="ph">Closed today <span class="mut" id="closed-n"></span><small id="age-tx"></small></div>
+    <div id="futures"></div><div class="scroll box" id="closed"></div></section>
   <section class="panel"><div class="ph">Pending orders <span class="mut" id="orders-n"></span><small><span id="age-orders"></span> <span id="cancel-all-slot"></span></small></div>
     <div class="scroll box" id="orders"></div></section>
   <section class="panel"><div class="ph">Today's tickets <span class="mut" id="tickets-n"></span><small>entries sent from New trade</small></div>
     <div class="scroll box" id="t-brackets"></div></section>
-  <section class="panel"><div class="ph">Closed today <span class="mut" id="closed-n"></span><small id="age-tx"></small></div>
-    <div id="futures"></div><div class="scroll box" id="closed"></div></section>
   <section class="panel"><div class="ph">Carried positions <span class="mut" id="carried-n"></span><small>since entry · click to manage</small></div>
     <div class="scroll box" id="carried"></div></section>
 </div>
@@ -568,18 +603,21 @@ document.addEventListener("click", async e => {
   if (row && !e.target.closest("button")) select(row.dataset.sel);
 });
 
+// Every open position: today's first, then carried ones (same order as the workbench strip).
 function renderDayList(st) {
-  const rows = (st.positions || []).filter(isDay);
+  const rows = ordered(st);
   $("day-n").textContent = rows.length;
-  if (!rows.length) return `<div class="empty">No day trades open.</div>`;
+  if (!rows.length) return `<div class="empty">No open trades.</div>`;
   return rows.map(p => {
     const r = p.r;
-    return `<div class="li${p.symbol === SEL ? " sel" : ""}" data-sel="${esc(p.symbol)}">
+    return `<div class="li${p.symbol === SEL ? " sel" : ""}${isDay(p) ? "" : " carried"}" data-sel="${esc(p.symbol)}">
       <div class="r1"><span class="sym" title="${esc(p.display)}">${esc(p.asset_type === "OPTION" ? p.underlying : p.display)}</span>
-        <span class="tag ${p.side.toLowerCase()}">${p.side} ${qty(p.qty)}</span>${p.held === "MIXED" ? `<span class="tag est" title="Carried and traded today">MIXED</span>` : ""}
+        <span class="tag ${p.side.toLowerCase()}">${p.side} ${qty(p.qty)}</span>
         <span class="pl ${cls(p.open_pnl)}">${money(p.open_pnl)}</span></div>
       <div class="r2"><span>${p.asset_type === "OPTION" ? esc(p.display.replace(p.underlying + " ", "")) + " · " : ""}${px(p.avg_price)} / ${px(p.last)}</span>
-        ${r ? `<span class="num ${cls(r.live_r)}">${fmtR(r.live_r)}</span>` : `<span>R not set</span>`}</div>
+        <span class="held">${p.held === "MIXED" ? `<span class="tag est" title="Carried and traded today">MIXED</span>`
+          : p.held === "CARRIED" ? `<span class="tag" title="Held from before today">CARRIED</span>` : ""}
+        ${r ? `<span class="num ${cls(r.live_r)}">${fmtR(r.live_r)}</span>` : p.held === "CARRIED" ? "" : `<span>R not set</span>`}</span></div>
       <div class="r3"><span class="num">Stop ${p.trail ? `trail ${p.trail.level != null ? "~" + px(p.trail.level) : ""}` : p.stop_price != null ? px(p.stop_price) : "none"} · Tgt ${targetsTxt(p)}</span>${protTag(p)}</div></div>`;
   }).join("");
 }
@@ -686,13 +724,14 @@ function stopRow(p, sym, noR) {
       <button type="button" class="btn act${TRAIL_OPEN[sym] ? " on" : ""}" data-trailopen="${esc(sym)}">Trail ${TRAIL_OPEN[sym] ? "▴" : "▾"}</button>
       <span class="gap"></span>
       <input class="in ms-input" data-symbol="${esc(sym)}" inputmode="decimal" placeholder="price" value="${esc(MS_INPUT[sym] || "")}">
-      ${actionBtn(`ms:${sym}`, "Move stop", "move", {symbol: sym}, "", false, "act", kbd("@stop"))}</div>
+      ${actionBtn(`ms:${sym}`, p.stop_price == null ? "Set stop" : "Move stop", "move", {symbol: sym}, "", false, "act", kbd("@stop"))}</div>
     ${loose.length && !TRAIL_OPEN[sym] ? `<div class="warnline">Trail ${loose.join(" and ")} would start looser than your stop ${px(p.stop_price)} (${loose.map(u => `${u} at ${px((u === "1R" ? one : half).start)}`).join(", ")}).</div>` : ""}
     ${noR ? `<div class="warnline mut" style="color:var(--muted)">Trail in R needs a companion entry; use Trail ▾ with $ or %.</div>` : ""}
     ${TRAIL_OPEN[sym] ? trailPanel(p, sym, noR) : ""}</div>`;
 }
+const unitSh = p => p && p.asset_type === "OPTION" ? "ct" : "sh";      // contracts or shares
 function trailPanel(p, sym, noR) {
-  const d = trailDraft(sym);
+  const d = trailDraft(sym), us = unitSh(p);
   if (noR && d.unit === "R") d.unit = "$";
   const info = trailStartInfo(p, d);
   const seg = (name, vals, cur) => `<div class="seg">${vals.map(([v, t]) =>
@@ -701,12 +740,12 @@ function trailPanel(p, sym, noR) {
   return `<div class="trailpanel">
     <div class="r"><span class="k">Distance</span>${seg("unit", [["R", "R"], ["$", "$"], ["%", "%"]].filter(([u]) => !(noR && u === "R")), d.unit)}
       ${d.unit === "R" ? seg("value", [[0.5, "0.5R"], [1, "1R"], [1.5, "1.5R"], [2, "2R"]], d.value)
-        : `<input class="in trail-val" data-symbol="${esc(sym)}" inputmode="decimal" value="${esc(d.value)}" placeholder="${d.unit === "%" ? "0.5" : "1.20"}"> ${d.unit}`}</div>
+        : `<input class="in trail-val" data-symbol="${esc(sym)}" inputmode="decimal" value="${esc(d.value)}" placeholder="${d.unit === "%" ? "0.5" : p.asset_type === "OPTION" ? "0.10" : "1.20"}"> ${d.unit}`}</div>
     <div class="r"><span class="k">Follows</span>${seg("basis", [["MARK", "Mark"], ["LAST", "Last"], ["BID", "Bid"], ["ASK", "Ask"]], d.basis)}</div>
     <div class="r"><span class="k">Start</span><span class="mut">Now</span><label class="mut" style="opacity:.6" title="Schwab accepted it in a preview but has not been verified live"><input type="checkbox" disabled> At price (not verified yet)</label></div>
-    <div class="eff">${info ? `Starts about <b class="num">${px(info.start)}</b> (${unitTxt(d)} = ${px(info.off)}/sh from ${esc(d.basis.toLowerCase())})` : "Needs a price to estimate the start."}
-      ${info?.looser ? `<span class="amb"> · looser than your ${p.trail ? "trail's ~" + px(p.trail.level) : "stop " + px(p.stop_price)} by ${px(info.by)}/sh</span>` : ""}</div>
-    <div class="foot"><span class="mut" style="font-size:12px">One OCO for ${qty(p.qty)} sh: trailing stop + ${tgtTxt}. It keeps trailing after B/E.</span><span class="sp"></span>
+    <div class="eff">${info ? `Starts about <b class="num">${px(info.start)}</b> (${unitTxt(d)} = ${px(info.off)}/${us} from ${esc(d.basis.toLowerCase())})` : "Needs a price to estimate the start."}
+      ${info?.looser ? `<span class="amb"> · looser than your ${p.trail ? "trail's ~" + px(p.trail.level) : "stop " + px(p.stop_price)} by ${px(info.by)}/${us}</span>` : ""}</div>
+    <div class="foot"><span class="mut" style="font-size:12px">One OCO for ${qty(p.qty)} ${us}: trailing stop + ${tgtTxt}. It keeps trailing after B/E.</span><span class="sp"></span>
       <button type="button" class="btn" data-trailopen="${esc(sym)}">Close</button>
       ${actionBtn(`trlx:${sym}`, `${p.trail ? "Change to" : "Replace with"} trail ${unitTxt(d)}`, "trail",
                   {symbol: sym, unit: d.unit, value: d.value, basis: d.basis}, "", !(Number(d.value) > 0), "primary")}</div>
@@ -766,13 +805,14 @@ function renderWorkspace(p, st) {
       <div class="arow"><div class="al">Target<small>${tgtNote}</small></div>
         <div class="ctl">${[1, 1.5, 2, 3].map(v => actionBtn(`tr${v}:${sym}`, `${v}R`, "target", {symbol: sym, r: v}, "", noR, "act", kbd(`tr${v}`))).join("")}<span class="gap"></span>
           <input class="in ms-input tg-input" data-symbol="${esc(sym)}" inputmode="decimal" placeholder="price" value="${esc(TG_INPUT[sym] || "")}">
-          ${actionBtn(`tg:${sym}`, "Replace target", "target", {symbol: sym, custom: 1}, "", false, "act", kbd("@target"))}
-          ${noR ? `<span class="why">R needs a companion entry: type a price</span>` : ""}</div></div>
+          ${actionBtn(`tg:${sym}`, nT ? "Replace target" : "Set target", "target", {symbol: sym, custom: 1}, "", false, "act", kbd("@target"))}
+          ${noR ? `<span class="why">R needs a companion entry: type a price</span>` : ""}</div>
+        ${(p.stop_price == null && !p.trail) !== !nT ? `<div class="warnline mut" style="color:var(--muted)">${!nT ? "No target yet: Set target pairs it with the stop as one OCO." : "No stop yet: Set stop pairs it with the target as one OCO."}</div>` : ""}</div>
       <div class="arow"><div class="al">Partial<small>${PART_MODE === "market" ? "at market" : `limit at ${PART_MODE}, then market after 3 s`}</small></div>
         <div class="ctl"><div class="seg">${[["mid", "Mid"], ["market", "Mkt"], ["ask", "Ask"], ["bid", "Bid"]].map(([v, t]) =>
             `<button type="button" data-pmode="${v}" class="${PART_MODE === v ? "on" : ""}">${t}</button>`).join("")}</div>
           ${[25, 50, 75].map(v => actionBtn(`pt${v}:${sym}`, `${v}%`, "partial", {symbol: sym, pct: v / 100}, "", false, "act", kbd(`pt${v}`))).join("")}<span class="gap"></span>
-          <input class="in ms-input pt-input" data-symbol="${esc(sym)}" inputmode="numeric" placeholder="shares" value="${esc(PT_INPUT[sym] || "")}" style="width:84px">
+          <input class="in ms-input pt-input" data-symbol="${esc(sym)}" inputmode="numeric" placeholder="${p.asset_type === "OPTION" ? "contracts" : "shares"}" value="${esc(PT_INPUT[sym] || "")}" style="width:${p.asset_type === "OPTION" ? 104 : 84}px">
           ${actionBtn(`ptc:${sym}`, "Send", "partial", {symbol: sym, custom: 1}, "", false, "act", kbd("@shares"))}</div></div>
     </div>
     <div class="result ${m ? m.cls : ""}">${m ? `<b>Last result:</b> ${esc(m.text)}` : "No action on this position yet."}
@@ -946,10 +986,10 @@ document.addEventListener("click", async e => {
       CONFIRM.busy.delete(key); if (lastState) render(lastState); return;
     }
     if (act === "partial" && b.dataset.custom && !(parseInt(PT_INPUT[sym]) > 0)) {
-      POS_MSG[sym] = {cls: "bad", text: "Type how many shares to send first."};
+      POS_MSG[sym] = {cls: "bad", text: "Type how many to send first."};
       CONFIRM.busy.delete(key); if (lastState) render(lastState); return;
     }
-    const ptLabel = b.dataset.custom ? `${PT_INPUT[sym]} shares` : `${Math.round(parseFloat(b.dataset.pct) * 100)}%`;
+    const ptLabel = b.dataset.custom ? `${PT_INPUT[sym]}` : `${Math.round(parseFloat(b.dataset.pct) * 100)}%`;
     POS_MSG[sym] = {cls: "warn", text: {close: "Closing at market...", symcancel: "Cancelling orders...",
                     be: "Moving stop to break-even...", move: `Moving stop to ${MS_INPUT[sym]}...`,
                     partial: `Sending partial ${ptLabel} (${PART_MODE})...`,
@@ -967,7 +1007,10 @@ document.addEventListener("click", async e => {
                                               : {symbol: sym, pct: parseFloat(b.dataset.pct), mode: PART_MODE})
       : {symbol: sym};
     try {
-      const r = await post(url, payload);
+      let r = await post(url, payload);
+      // The server refuses a close/partial that may split a spread or uncover a short until confirmed.
+      if (r.needs_confirm && confirm(`${r.error}\n\nSend the ${act} for ${sym} anyway?`))
+        r = await post(url, {...payload, confirm_leg: true});
       if (act === "move" && r.ok) MS_INPUT[sym] = "";
       if (act === "partial" && r.ok) PT_INPUT[sym] = "";
       if (act === "target" && r.ok) TG_INPUT[sym] = "";
@@ -1012,20 +1055,38 @@ function renderFutures(st) {
       <span class="mut">gross ${money(f.gross)} · fees ${money(f.fees)} · net contracts today ${netTxt}</span></div>
     <div class="note">${esc(st.futures.note)} The net contract count is today's fills only, not a confirmed position.</div>`;
 }
+// Closed trades expand ("+") to their executions; the open set survives the 1 s re-render.
+const CLOSED_OPEN = new Set();
+const tETs = iso => iso ? new Date(iso).toLocaleTimeString("en-US", {timeZone: "America/New_York", hour: "numeric", minute: "2-digit", second: "2-digit"}) : "-";
 function renderClosed(rows) {
   $("closed-n").textContent = rows.length || "";
   if (!rows.length) return `<div class="empty">No closed trades yet today.</div>`;
-  let h = `<table><tr><th>Closed</th><th>Symbol</th><th class="n">Size</th><th class="n">In / out</th><th class="n">Held</th><th class="n">Net</th><th></th></tr>`;
+  let h = `<table><tr><th></th><th>Closed</th><th>Symbol</th><th class="n">Size</th><th class="n">In / out</th><th class="n">Held</th><th class="n">Net</th><th></th></tr>`;
   for (const t of rows) {
     const flag = t.status === "ESTIMATED" ? `<span class="tag est" title="Entry is older than the fill history; Schwab's average price was used">EST</span>`
       : t.status === "UNRESOLVED" ? `<span class="tag unres" title="No entry found: P&L unknown">${qty(t.unresolved_qty)} UNRESOLVED</span>` : "";
-    h += `<tr><td class="mut num">${tET(t.closed)}</td><td><b>${esc(t.display)}</b> <span class="tag ${t.side.toLowerCase()}">${t.side}</span></td>
+    const key = `${t.symbol}|${t.opened}|${t.closed}`, ex = t.executions || [], open = CLOSED_OPEN.has(key);
+    const tog = ex.length ? `<button type="button" class="xbtn" data-xkey="${esc(key)}" title="${open ? "Hide" : "Show"} the ${ex.length} execution${ex.length === 1 ? "" : "s"}">${open ? "−" : "+"}</button>` : "";
+    h += `<tr><td class="xc">${tog}</td><td class="mut num">${tET(t.closed)}</td><td><b>${esc(t.display)}</b> <span class="tag ${t.side.toLowerCase()}">${t.side}</span></td>
       <td class="n">${qty(t.max_qty || t.exit_qty)}</td><td class="n mut">${px(t.avg_entry)} / ${px(t.avg_exit)}</td>
       <td class="n mut">${dur(t.hold_seconds)}</td>
       <td class="n ${cls(t.net)}"><b>${t.net == null ? "unknown" : money(t.net)}</b></td><td>${flag}</td></tr>`;
+    if (open) for (const e of ex) {
+      const buy = e.qty > 0, eff = e.effect === "OPENING" ? "open" : e.effect === "CLOSING" ? "close" : "";
+      h += `<tr class="exec"><td></td><td class="mut num">${tETs(e.time)}</td>
+        <td><span class="${buy ? "pos" : "neg"}">${buy ? "BUY" : "SELL"}</span> <span class="mut">${eff}</span></td>
+        <td class="n">${qty(Math.abs(e.qty))}</td><td class="n">@ ${px(e.price)}</td><td></td>
+        <td class="n mut">${e.fees ? money(e.fees) : ""}</td><td></td></tr>`;
+    }
   }
   return h + `</table>`;
 }
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-xkey]"); if (!b) return;
+  const k = b.dataset.xkey;
+  CLOSED_OPEN.has(k) ? CLOSED_OPEN.delete(k) : CLOSED_OPEN.add(k);
+  if (lastState) render(lastState);
+});
 
 let UPDATE_HIDDEN = null;
 try { UPDATE_HIDDEN = localStorage.getItem("updateHidden"); } catch (e) {}
@@ -1110,8 +1171,33 @@ function render(st) {
 // lost responses, so clicking again on the same intent can never send a second order: the server
 // answers with the recorded outcome. A new id only comes from changing the ticket.
 const T = {stopType: "fixed", trailUnit: "R", trailBasis: "MARK", side: "LONG", entry: "mid", risk: null, targets: 1, r: 2, t1r: 1, split: 0.5,
-           plan: null, ticketId: null, intentKey: null, sentKey: null, seq: 0, busy: false, timer: null, armed: false};
-const ENTRY_TXT = {mid: "limit at mid", bid: "limit at bid", ask: "limit at ask", market: "market"};
+           plan: null, ticketId: null, intentKey: null, sentKey: null, seq: 0, busy: false, timer: null, armed: false,
+           // Option mode: the underlying typed in the symbol box, its expiries, the chain shown and the contract picked.
+           asset: "EQUITY", und: "", exps: [], exp: null, pc: "CALL", chain: null, opt: null, chainSeq: 0,
+           sizeMode: "risk"};      // risk: size from the stop; qty: the number typed in the box
+const MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
+function optName(sym) {          // "AAPL  261120C00230000" -> "AAPL 20 Nov 26 230C" (same as the dashboard)
+  const m = /^([A-Z0-9.]+)\s*(\d\d)(\d\d)(\d\d)([CP])(\d{8})$/.exec(sym || "");
+  return m ? `${m[1]} ${+m[4]} ${MONTHS[+m[3] - 1]} ${m[2]} ${+m[6] / 1000}${m[5]}` : sym;
+}
+const isOpt = () => T.asset === "OPTION";
+// Price grids, the same as bracket.tick(): stocks in cents from $1; options by class.
+function gridStep(price, ticks) {
+  if (ticks === "OPT_PENNY_ALL") return 0.01;
+  if (ticks === "OPT_PENNY") return price < 3 ? 0.01 : 0.05;
+  if (ticks === "OPT_NICKEL") return price < 3 ? 0.05 : 0.10;
+  return price >= 1 ? 0.01 : 0.0001;
+}
+function onGrid(price, ticks, up) {      // up: round toward a buy's fill; down for a sell
+  const r = (v, s) => (up ? Math.ceil(v / s - 1e-9) : Math.floor(v / s + 1e-9)) * s;
+  const s = gridStep(price, ticks);
+  let v = r(price, s);
+  const s2 = gridStep(v, ticks);           // across the $3 break the coarser grid applies
+  if (s2 !== s) v = r(v, s2);
+  return v.toFixed(ticks && ticks !== "EQUITY" ? 2 : v < 1 ? 4 : 2);
+}
+const optTicks = o => !o ? "OPT_NICKEL" : /^(SPY|QQQ|IWM)\s/.test(o.symbol || "") ? "OPT_PENNY_ALL" : o.penny ? "OPT_PENNY" : "OPT_NICKEL";
+const ENTRY_TXT = {mid: "limit at mid", bid: "limit at bid", ask: "limit at ask", market: "market", limit: "limit"};
 // Every POST gives up after 25 s, so a button never hangs on "Working..." if the server is gone.
 const post = (url, body, ms = 25000) => {
   const ctl = new AbortController();
@@ -1127,22 +1213,29 @@ function riskValue() {
 const priceBox = id => $(id).value.trim() || null;   // blank = use R; anything typed is sent and validated
 function ticketReq() {
   const two = T.targets === 2;
-  return {symbol: $("t-sym").value.trim().toUpperCase(), side: T.side, stop: $("t-stop").value.trim(),
-          risk: riskValue(), r: T.r, entry: T.entry, target_price: priceBox("t-tp"),
+  const noTgt = T.targets === 0;
+  return {symbol: isOpt() ? (T.opt ? T.opt.symbol : "") : $("t-sym").value.trim().toUpperCase(), side: T.side,
+          stop: T.stopType === "none" ? "" : $("t-stop").value.trim(),
+          risk: T.sizeMode === "risk" ? riskValue() : 0, r: noTgt ? 0 : T.r, entry: T.entry, target_price: noTgt ? null : priceBox("t-tp"),
           split: two ? T.split : 0, t1_r: two ? T.t1r : 0, t1_price: two ? priceBox("t-t1p") : null,
           stop_type: T.stopType, trail_unit: T.trailUnit, trail_value: parseFloat($("t-trailval").value) || 0,
-          trail_basis: T.trailBasis};
+          trail_basis: T.trailBasis, size_mode: T.sizeMode, qty: T.sizeMode === "qty" ? ($("t-qty").value.trim() || null) : null,
+          targets: T.targets, limit_price: T.entry === "limit" ? ($("t-lmt").value.trim() || null) : null};
 }
 function ticketReady() {
   const q = ticketReq();
-  return q.symbol && q.stop && q.risk > 0;
+  if (!q.symbol || (q.entry === "limit" && !q.limit_price)) return false;
+  if (q.size_mode === "risk") return q.stop && q.risk > 0;
+  const stopOk = q.stop || q.stop_type === "none" || (q.stop_type === "trail" && q.trail_unit !== "R");
+  return parseInt(q.qty) > 0 && stopOk;
 }
 const keyOf = q => [q.symbol, q.side, q.stop, q.risk, q.r, q.entry, q.target_price, q.split, q.t1_r, q.t1_price,
-                    q.stop_type, q.trail_unit, q.trail_value, q.trail_basis].join("|");
+                    q.stop_type, q.trail_unit, q.trail_value, q.trail_basis, q.size_mode, q.qty, q.targets, q.limit_price].join("|");
 let lookupSeq = 0, lookupTimer = null, LAST_Q = null;
 function showName(q) {
   const el = $("t-name");
   LAST_Q = q;
+  if (isOpt()) { showOptName(); return; }
   if (!q) { el.innerHTML = ""; return; }
   if (!q.found && !q.name) { el.innerHTML = `<span class="neg">${esc(q.symbol)}: symbol not found</span>`; return; }
   const p = T.plan && T.plan.ok ? T.plan : null;
@@ -1150,8 +1243,152 @@ function showName(q) {
     + (q.change_pct != null ? ` <span class="num ${cls(q.change_pct)}">${pct(q.change_pct)}</span>` : "")
     + (p ? ` · bid <span class="num">${px(p.bid)}</span> · ask <span class="num">${px(p.ask)}</span>` : "");
 }
+// ---- Option mode: underlying -> expiry -> calls / puts -> strike ----
+function showOptName() {
+  const c = T.chain, el = $("t-name"), sel = $("t-optsel"), p = T.plan && T.plan.ok ? T.plan : null;
+  el.innerHTML = c && c.underlying === T.und ? `<b>${esc(c.underlying_name || c.underlying)}</b> · <span class="num" style="color:var(--text)">${px(c.underlying_price)}</span>` : "";
+  sel.innerHTML = (T.chainStale ? `<span class="amb">Strike prices not updated for ${T.chainStale} s.</span> ` : "")
+    + (T.opt ? `Selected <b>${esc(optName(T.opt.symbol))}</b>${T.opt.penny ? " · penny steps" : " · nickel steps"}`
+    + (p ? ` · bid <span class="num">${px(p.bid)}</span> · ask <span class="num">${px(p.ask)}</span>` : "") : "");
+}
+const fmtK = k => Number.isInteger(k) ? `${k}` : `${k}`.replace(/0+$/, "");
+function renderChain() {
+  const box = $("t-chain"), c = T.chain;
+  if (!T.exp) { box.innerHTML = `<div class="empty">${T.exps.length ? "Pick an expiry." : "Type the underlying."}</div>`; return; }
+  if (!c) { box.innerHTML = `<div class="empty">Loading strikes...</div>`; return; }
+  if (c.error) { box.innerHTML = `<div class="empty neg">${esc(c.error)}</div>`; return; }
+  const rows = (c.rows || []).filter(r => r.standard !== false);
+  if (!rows.length) { box.innerHTML = `<div class="empty">No strikes for this expiry.</div>`; return; }
+  const und = c.underlying_price, cp = T.pc === "CALL" ? "C" : "P";
+  let atm = -1, best = Infinity;
+  rows.forEach((r, i) => { const d = Math.abs(r.strike - und); if (und && d < best) { best = d; atm = i; } });
+  const n = v => v == null ? "-" : v;
+  box.innerHTML = `<table><thead><tr><th>Strike</th><th>Bid</th><th>Ask</th><th>Mark</th><th>Δ</th><th>Sprd</th><th>OI</th></tr></thead><tbody>
+    ${rows.map((r, i) => `<tr class="row${r.itm ? " itm" : ""}${T.opt && T.opt.symbol === r.symbol ? " sel" : ""}${i === atm ? " atm" : ""}" data-sym="${esc(r.symbol)}">
+      <td>${fmtK(r.strike)}${cp}${i === atm ? ` <span class="mut" style="font-size:10px">ATM</span>` : ""}</td><td>${px(r.bid)}</td><td>${px(r.ask)}</td><td>${px(r.mark)}</td>
+      <td>${r.delta == null ? "-" : r.delta.toFixed(2).replace(/^(-?)0\./, "$1.")}</td>
+      <td class="${r.spread_pct > 10 ? "wide" : ""}">${r.spread_pct == null ? "-" : r.spread_pct.toFixed(r.spread_pct < 10 ? 1 : 0) + "%"}</td>
+      <td>${r.oi == null ? "-" : r.oi >= 1000 ? (r.oi / 1000).toFixed(1) + "k" : n(r.oi)}</td></tr>`).join("")}</tbody></table>`;
+  const sel = box.querySelector("tr.sel") || box.querySelector("tr.atm");
+  if (sel && !box.dataset.scrolled) { box.scrollTop = Math.max(0, sel.offsetTop - box.clientHeight / 2); box.dataset.scrolled = "1"; }
+}
+function renderExps() {
+  const el = $("t-exp");
+  if (!T.und) { el.innerHTML = `<span class="mut" style="font-size:12px">Type the underlying.</span>`; return; }
+  if (T.exps.error) { el.innerHTML = `<span class="neg" style="font-size:12px">${esc(T.exps.error)}</span>`; return; }
+  if (!T.exps.length) { el.innerHTML = `<span class="mut" style="font-size:12px">Loading expiries...</span>`; return; }
+  const shown = T.exps.slice(0, T.showAllExps ? 40 : 6);
+  const lab = e => { const d = new Date(e.date + "T12:00:00");
+    return e.dte === 0 ? "0DTE" : `${d.toLocaleDateString("en-US", {weekday: "short"})} ${d.getDate()} ${MONTHS[d.getMonth()]}`; };
+  el.innerHTML = shown.map(e => `<button type="button" class="btn${e.date === T.exp ? " on" : ""}" data-exp="${e.date}" title="${e.date}">${lab(e)}<small>${e.dte}d</small></button>`).join("")
+    + (T.exps.length > 6 ? `<button type="button" class="btn ghost" data-more="1">${T.showAllExps ? "less" : "more"}</button>` : "");
+}
+async function loadExpirations() {
+  const und = $("t-sym").value.trim().toUpperCase();
+  if (und === T.und && T.exps.length) return;
+  T.und = und; T.exps = []; T.exp = null; T.chain = null; T.opt = null; delete $("t-chain").dataset.scrolled;
+  renderExps(); renderChain(); showOptName(); onTicketEdit();
+  if (!und) return;
+  const seq = ++T.chainSeq;
+  try {
+    const r = await post("/api/ticket/expirations", {underlying: und});
+    if (seq !== T.chainSeq) return;
+    if (!r.ok) { T.exps = []; T.exps.error = r.error || "no expiries"; renderExps(); return; }
+    T.exps = r.expirations.filter(e => e.standard !== false);
+    T.exp = T.exps.length ? T.exps[0].date : null;
+    renderExps(); loadChain();
+  } catch (e) { T.exps = []; T.exps.error = "companion not reachable"; renderExps(); }
+}
+async function loadChain() {
+  if (!T.und || !T.exp) { renderChain(); return; }
+  T.chain = null; renderChain();
+  const seq = ++T.chainSeq;
+  try {
+    const r = await post("/api/ticket/chain", {underlying: T.und, expiration: T.exp, put_call: T.pc, strikes: 16});
+    if (seq !== T.chainSeq) return;
+    T.chain = r.ok ? r : {error: r.error || "no strikes"};
+    if (r.ok) { T.chainAt = Date.now(); T.chainStale = 0; $("t-chain").classList.remove("stale"); }
+  } catch (e) { if (seq === T.chainSeq) T.chain = {error: "companion not reachable"}; }
+  delete $("t-chain").dataset.scrolled;
+  renderChain(); showOptName();
+}
+// The strike list refreshes every 5 s while it is on screen (one chain request each, about 12 a
+// minute, only while the Option ticket shows a chain and the window is visible). In place: no
+// "Loading", same scroll position, the picked contract stays picked.
+const CHAIN_REFRESH_MS = 5000;
+let CHAIN_BUSY = false, CHAIN_PRESSED = false;   // never redraw the rows under a click in progress
+$("t-chain").addEventListener("mousedown", () => { CHAIN_PRESSED = true; });
+document.addEventListener("mouseup", () => { setTimeout(() => { CHAIN_PRESSED = false; }, 0); });
+async function refreshChain() {
+  const c = T.chain;
+  if (CHAIN_BUSY || CHAIN_PRESSED || document.hidden || !isOpt() || !T.und || !T.exp || !c || c.error) return;
+  if ($("t-optbox").offsetParent === null) return;                      // ticket not shown (e.g. Manage window)
+  const seq = T.chainSeq, key = `${T.und}|${T.exp}|${T.pc}`;
+  CHAIN_BUSY = true;
+  try {
+    const r = await post("/api/ticket/chain", {underlying: T.und, expiration: T.exp, put_call: T.pc, strikes: 16});
+    if (!r.ok || CHAIN_PRESSED || seq !== T.chainSeq || key !== `${T.und}|${T.exp}|${T.pc}`) return;   // the pick changed meanwhile
+    T.chain = r; T.chainAt = Date.now();
+    if (T.opt) T.opt = (r.rows || []).find(x => x.symbol === T.opt.symbol) || T.opt;
+    const box = $("t-chain"), top = box.scrollTop;
+    renderChain(); box.scrollTop = top; showOptName();
+  } catch (e) { /* keep the last strikes; the next refresh tries again */ }
+  finally { CHAIN_BUSY = false; markChainAge(); }
+}
+// Strikes that stopped refreshing must not look current: dimmed, with their age, after 15 s.
+function markChainAge() {
+  const age = T.chain && !T.chain.error && T.chainAt ? (Date.now() - T.chainAt) / 1000 : 0;
+  const stale = age > 15, was = T.chainStale || 0;
+  T.chainStale = stale ? Math.round(age) : 0;
+  if (T.chainStale === was) return;
+  $("t-chain").classList.toggle("stale", stale);
+  $("t-chain").title = stale ? `Prices not updated for ${T.chainStale} s` : "";
+  showOptName();
+}
+setInterval(markChainAge, 1000);   // also while a refresh request hangs, not only when it ends
+setInterval(refreshChain, CHAIN_REFRESH_MS);
+function setAsset(a) {
+  T.asset = a;
+  [...$("t-asset").children].forEach(x => x.classList.toggle("on", x.dataset.v === a));
+  const o = a === "OPTION";
+  $("t-optbox").style.display = o ? "" : "none";
+  $("t-symlbl").textContent = o ? "Underlying" : "Symbol";
+  $("t-sidelbl").textContent = o ? "Action" : "Side";
+  $("t-stoplbl").textContent = o ? "Stop (option price)" : "Stop price";
+  $("t-qtylbl").textContent = o ? "Contracts" : "Shares";
+  const [lb, sb] = $("t-side").children;
+  lb.textContent = o ? "Buy to open" : "Long"; sb.textContent = o ? "Sell to open" : "Short";
+  const mkt = $("t-entry").querySelector('[data-v="market"]');
+  mkt.style.display = o ? "none" : "";
+  if (o && T.entry === "market") { T.entry = "mid"; [...$("t-entry").children].forEach(x => x.classList.toggle("on", x.dataset.v === "mid")); }
+  $("t-stop").value = ""; $("t-tp").value = ""; $("t-t1p").value = ""; $("t-lmt").value = "";   // a stock price is never an option price
+  $("t-qty").value = "";                                                                       // nor 50 shares 50 contracts
+  if (o) { T.und = ""; loadExpirations(); } else { T.opt = null; showName(null); lookupSymbol(); }
+  $("t-optsel").innerHTML = "";
+  onTicketEdit();
+}
+$("t-asset").addEventListener("click", e => { const b = e.target.closest("button"); if (b && b.dataset.v !== T.asset) setAsset(b.dataset.v); });
+$("t-exp").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.more) { T.showAllExps = !T.showAllExps; renderExps(); return; }
+  if (b.dataset.exp === T.exp) { loadChain(); return; }            // same expiry again: refresh the strikes
+  T.exp = b.dataset.exp; T.opt = null; renderExps(); loadChain(); onTicketEdit();
+});
+$("t-pc").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b || b.dataset.v === T.pc) return;
+  T.pc = b.dataset.v; T.opt = null;
+  [...$("t-pc").children].forEach(x => x.classList.toggle("on", x === b));
+  loadChain(); onTicketEdit();
+});
+$("t-chain").addEventListener("click", e => {
+  const tr = e.target.closest("tr.row"); if (!tr) return;
+  const row = (T.chain?.rows || []).find(r => r.symbol === tr.dataset.sym); if (!row) return;
+  if (!T.opt || T.opt.symbol !== row.symbol) { $("t-stop").value = ""; $("t-tp").value = ""; $("t-t1p").value = ""; $("t-lmt").value = ""; }
+  T.opt = row; renderChain(); showOptName(); onTicketEdit();
+});
 function lookupSymbol() {
   clearTimeout(lookupTimer);
+  if (isOpt()) { lookupTimer = setTimeout(loadExpirations, 400); return; }
   const sym = $("t-sym").value.trim().toUpperCase();
   if (!sym) { showName(null); return; }
   lookupTimer = setTimeout(async () => {
@@ -1191,38 +1428,57 @@ async function refreshPlan() {
   scheduleRefresh(document.hasFocus() ? 5000 : 30000);   // fresh price while you work the ticket
 }
 // Target chips: clicking an R clears that target's price box; typing a price overrides the R.
-function chipRow(id, values, current, priced) {
-  $(id).innerHTML = values.map(v => `<button type="button" class="btn${!priced && v === current ? " on" : ""}" data-v="${v}">${v}R</button>`).join("");
+function chipRow(id, values, current, priced, off = false) {
+  $(id).innerHTML = values.map(v => `<button type="button" class="btn${!priced && !off && v === current ? " on" : ""}" data-v="${v}"${off ? ' disabled title="R needs a stop price: type the target price"' : ""}>${v}R</button>`).join("");
 }
+// No stop price (Quantity mode with None, or a trail in $ / %): there is no R to price targets from.
+const noStopPrice = () => T.stopType === "none" || (T.sizeMode === "qty" && !$("t-stop").value.trim());
 function renderTargets() {
-  const two = T.targets === 2;
+  const two = T.targets === 2, none = T.targets === 0, noR = noStopPrice();
+  [...$("t-targets").children].forEach(b => {
+    b.classList.toggle("on", Number(b.dataset.v) === T.targets);
+    b.disabled = b.dataset.v === "2" && T.stopType === "none";
+    b.title = b.disabled ? "Two targets need a stop" : "";
+  });
+  $("t-t2box").style.display = none ? "none" : "";
   $("t-t1box").style.display = two ? "" : "none";
   $("t-t2title").textContent = two ? "Target 2" : "Target";
-  $("t-t2sub").textContent = two ? "rest of the shares" : "all shares";
+  const u = isOpt() ? "contracts" : "shares";
+  $("t-t2sub").textContent = two ? `rest of the ${u}` : `all ${u}`;
   const tp = !!priceBox("t-tp"), t1p = !!priceBox("t-t1p");
   $("t-t2ovr").textContent = tp ? "price set, R ignored" : "";
   $("t-tp").classList.toggle("set", tp); $("t-t1p").classList.toggle("set", t1p);
-  chipRow("t-r", two ? [1.5, 2, 3, 4] : [1, 1.5, 2, 3], T.r, tp);
-  chipRow("t-t1r", [1, 1.5, 2, 3], T.t1r, t1p);
+  chipRow("t-r", two ? [1.5, 2, 3, 4] : [1, 1.5, 2, 3], T.r, tp, noR);
+  chipRow("t-t1r", [1, 1.5, 2, 3], T.t1r, t1p, noR);
+  if (noR && !tp) $("t-t2ovr").textContent = "no stop: type the target price";
   [...$("t-split").children].forEach(b => b.classList.toggle("on", parseFloat(b.dataset.v) === T.split));
 }
 function renderTicket() {
   const p = T.plan, calc = $("t-calc"), go = $("t-go");
-  if (!p) { calc.innerHTML = `<span class="mut">Enter symbol, stop and risk.</span>`; }
+  const opt = isOpt();
+  const sizeTxt = T.sizeMode === "qty" ? (opt ? "contracts" : "shares") : "risk";
+  const stopTxt = T.stopType === "none" ? "" : T.sizeMode === "qty" ? "stop (or None), " : "stop, ";
+  if (!p) { calc.innerHTML = `<span class="mut">${opt && !T.opt ? `Pick a contract, then the ${stopTxt}${sizeTxt}.` : `Enter ${opt ? "the " : "symbol, "}${stopTxt}${sizeTxt}.`}</span>`; }
   else if (!p.ok) { calc.innerHTML = `<div class="err">${esc((p.errors || []).join("; ") || "invalid")}</div>`; }
   else {
-    const verb = p.side === "LONG" ? "Buy" : "Sell short";
+    const o = p.asset === "OPTION";
+    const verb = o ? (p.side === "LONG" ? "Buy to open" : "Sell to open") : p.side === "LONG" ? "Buy" : "Sell short";
+    const name = o ? optName(p.symbol) : p.symbol;
     const tR = (v, r) => r != null ? `${r.toFixed(2)}R` : "";
+    const exitTxt = o ? (p.side === "LONG" ? "SELL_TO_CLOSE" : "BUY_TO_CLOSE") : "";
     calc.innerHTML = `
-      <div class="pr"><span class="mut">${verb} ${qty(p.qty)} ${esc(p.symbol)}, ${ENTRY_TXT[p.entry] || "limit"}</span><span class="num">${p.market ? "~" : ""}${esc(p.limit)}</span></div>
-      ${p.trail ? `<div class="pr"><span class="mut">Stop: trailing ${p.trail.link === "PERCENT" ? p.trail.offset + "%" : "$" + p.trail.offset.toFixed(2)} from ${p.trail.basis.toLowerCase()} · ${qty(p.qty)}</span><span class="num neg">starts ${esc(p.trail_start)}</span></div>`
-      : `<div class="pr"><span class="mut">Stop (market) ${qty(p.qty)}</span><span class="num neg">${esc(p.stop)}</span></div>`}
+      <div class="pr"><span class="mut">${verb} ${qty(p.qty)} ${esc(name)}, ${ENTRY_TXT[p.entry] || "limit"}</span><span class="num">${p.market ? "~" : ""}${esc(p.limit)}</span></div>
+      ${!p.has_stop ? `<div class="pr"><span class="mut">No stop: add one later in Manage</span><span class="num neg">none</span></div>`
+      : p.trail ? `<div class="pr"><span class="mut">Stop: trailing ${p.trail.link === "PERCENT" ? p.trail.offset + "%" : "$" + p.trail.offset.toFixed(2)} from ${p.trail.basis.toLowerCase()} · ${qty(p.qty)}</span><span class="num neg">starts ${esc(p.trail_start)}</span></div>`
+      : `<div class="pr"><span class="mut">Stop (market) ${qty(p.qty)}${o ? ` · ${exitTxt}, held at Schwab` : ""}</span><span class="num neg">${esc(p.stop)}</span></div>`}
       ${p.be_trigger ? `<div class="pr"><span class="mut">Moves to B/E once, when the app sees the mark at +1R of your fill (checks every 3 s, app must be running)</span><span class="num">~${esc(p.be_trigger)}</span></div>` : ""}
       ${p.qty1 ? `<div class="pr"><span class="mut">Target 1 · ${tR(p.target1, p.target1_r)} · ${qty(p.qty1)}</span><span class="num pos">${esc(p.target1)}</span></div>
         <div class="pr"><span class="mut">Target 2 · ${tR(p.target, p.target_r)} · ${qty(p.qty2)}</span><span class="num pos">${esc(p.target)}</span></div>`
-      : `<div class="pr"><span class="mut">Target · ${tR(p.target, p.target_r)} · ${qty(p.qty)}</span><span class="num pos">${esc(p.target)}</span></div>`}
-      <div class="pr tot"><span>Risk${p.market ? " (estimate)" : ""} · ${px(p.per_share)}/sh · notional ${money(p.notional, false)}</span><span class="num">${money(p.planned_risk, false)}</span></div>
-      ${(p.warnings || []).map(w => `<div class="pr amb" style="font-size:12px">${esc(w)}</div>`).join("")}`;
+      : !p.has_target ? `<div class="pr"><span class="mut">No target: add one later in Manage</span><span class="num">none</span></div>`
+      : `<div class="pr"><span class="mut">Target${p.target_r != null ? " · " + tR(p.target, p.target_r) : ""} · ${qty(p.qty)}</span><span class="num pos">${esc(p.target)}</span></div>`}
+      ${p.per_share ? `<div class="pr tot"><span>Risk${p.market ? " (estimate)" : ""} · ${o ? `${px(p.per_share)}/ct × ${p.multiplier} · ${p.side === "LONG" ? "cost" : "credit"}` : `${px(p.per_share)}/sh · notional`} ${money(p.notional, false)}</span><span class="num">${money(p.planned_risk, false)}</span></div>`
+      : `<div class="pr tot"><span>Risk · ${p.has_stop ? "set by the trail (no stop price)" : "undefined (no stop)"} · ${o ? (p.side === "LONG" ? "cost" : "credit") : "notional"} ${money(p.notional, false)}</span><span class="num ${p.has_stop ? "" : "neg"}">${p.has_stop ? "trail" : "—"}</span></div>`}
+      ${(p.warnings || []).map(w => `<div class="pr ${w.startsWith("NO STOP") || w.startsWith("A short option with no stop") ? "neg" : "amb"}" style="font-size:12px${w.startsWith("NO STOP") ? ";font-weight:700" : ""}">${esc(w)}</div>`).join("")}`;
     if (LAST_Q) showName(LAST_Q);
   }
   const current = p && p.ok && p.key === keyOf(ticketReq());
@@ -1231,26 +1487,34 @@ function renderTicket() {
   const blocked = lastState?.trading?.blocked;
   go.className = "btn " + (T.side === "SHORT" ? "sell" : "buy");
   go.textContent = sent ? "Sent. Change the ticket for a new trade"
-    : current ? `Place trade · ${p.side === "LONG" ? "Buy" : "Short"} ${qty(p.qty)} ${p.symbol}` : "Place trade";
+    : current ? (p.asset === "OPTION" ? `${p.side === "LONG" ? "Buy to open" : "Sell to open"} ${qty(p.qty)} ${optName(p.symbol).replace(/ \d+ \w{3} \d\d /, " ")}`
+                : `Place trade · ${p.side === "LONG" ? "Buy" : "Short"} ${qty(p.qty)} ${p.symbol}`) : "Place trade";
   const live = HEALTH === "live";
   go.disabled = !(current && !sent && T.armed && open && !blocked && !T.busy && live);
   go.title = !live ? "Waiting for live data" : !T.armed ? "Arm entries first" : !open ? "Regular hours only" : blocked ? "Resolve the unconfirmed order first" : "";
   $("t-hint").textContent = !T.armed ? "Entries are disarmed: click Entries disarmed to arm until the close."
+    : T.entry === "limit" ? (p && p.ok && (p.side === "LONG" ? +p.limit >= p.ask : +p.limit <= p.bid) ? ""
+        : "Your limit rests until the price reaches it, and may not fill. An unfilled entry shows in Pending orders with Cancel entry.")
     : T.entry === "mid" || (T.entry === "bid" && T.side === "LONG") || (T.entry === "ask" && T.side === "SHORT")
       ? "This entry rests and may not fill. An unfilled entry shows in Pending orders with Cancel entry."
-      : T.entry === "market" ? "Market entry: fills at once; shares are sized from the quote, so the risk is an estimate." : "";
+      : T.entry === "market" ? (T.sizeMode === "qty" ? "Market entry: fills at once at the market price." : "Market entry: fills at once; shares are sized from the quote, so the risk is an estimate.") : "";
 }
 async function submitTicket() {
   const p = T.plan;
   if (T.busy || !p?.ok || p.key !== keyOf(ticketReq()) || HEALTH !== "live") return;
+  // A ticket without a stop is confirmed every time: nothing protects the position until a stop is added.
+  if (!p.has_stop && !confirm("Send without a stop?\nNothing protects this position at Schwab until you add a stop in Manage.")) return;
   T.busy = true; clearTimeout(T.timer); renderTicket();
   const msg = $("t-msg");
   msg.className = "tk-msg warn"; msg.textContent = "Sending to Schwab...";
   // Send the displayed plan itself, not whatever the inputs say now.
   const req = ticketReq();
-  const body = {ticket_id: T.ticketId, symbol: p.symbol, side: p.side, stop: p.stop, risk: p.risk,
+  const body = {ticket_id: T.ticketId, symbol: p.symbol, side: p.side, stop: p.stop || "", risk: p.risk,
                 r: p.r_multiple, entry: p.entry, target_price: req.target_price, t1_price: req.t1_price,
-                expected_limit: p.limit, expected_qty: p.qty, expected_target: p.target,
+                size_mode: p.size_mode, qty: p.size_mode === "qty" ? p.qty : null, targets: req.targets,
+                limit_price: p.entry === "limit" ? p.limit : null,
+                confirm_no_stop: !p.has_stop,
+                expected_limit: p.limit, expected_qty: p.qty, expected_target: p.has_target ? p.target : null,
                 split: p.split, t1_r: p.t1_r, expected_qty1: p.qty1 || 0, expected_target1: p.target1,
                 stop_type: req.stop_type, trail_unit: req.trail_unit, trail_value: req.trail_value,
                 trail_basis: req.trail_basis, expected_trail_offset: p.trail ? p.trail.offset : null,
@@ -1261,7 +1525,7 @@ async function submitTicket() {
       T.sentKey = T.intentKey;
       msg.className = "tk-msg ok";
       msg.textContent = r.duplicate ? `Already sent: order ${r.order_id ?? "(id pending)"}.`
-        : `Sent: order ${r.order_id ?? "(id pending)"}, ${r.plan.side} ${r.plan.qty} ${r.plan.symbol} ${r.plan.market ? "at market" : "@ " + r.plan.limit}, stop ${r.plan.stop}, target ${r.plan.target}.`;
+        : `Sent: order ${r.order_id ?? "(id pending)"}, ${r.plan.asset === "OPTION" ? (r.plan.side === "LONG" ? "buy to open" : "sell to open") : r.plan.side} ${r.plan.qty} ${r.plan.asset === "OPTION" ? optName(r.plan.symbol) : r.plan.symbol} ${r.plan.market ? "at market" : "@ " + r.plan.limit}, stop ${r.plan.has_stop ? (r.plan.stop || "trailing") : "none"}, target ${r.plan.has_target ? r.plan.target : "none"}.`;
     } else {
       if (r.status === "RATE_LIMITED") T.ticketId = crypto.randomUUID();   // nothing placed: retry allowed
       else if (r.status || r.duplicate) T.sentKey = T.intentKey;   // reached Schwab: this intent is spent
@@ -1300,8 +1564,15 @@ function renderTrading(st) {
       : b.protection === "WAITING_FILL" ? `<span class="tag waiting">WAITING FOR FILL</span> ${cancelBtn(`o:${b.order_id}`, "Cancel", {order: b.order_id})}`
       : b.protection === "UNKNOWN" ? `<span class="tag unknown">PROTECTION UNKNOWN</span>`
       : `<span class="tag">${esc((b.protection || b.status).replaceAll("_", " "))}</span>`;
+    // The round trip this ticket opened: closed with realized P&L, open with live P&L, or both.
+    const pl = b.pnl, $v = v => v == null ? `<span class="amb">unknown</span>` : `<b class="num ${cls(v)}">${money(v)}</b>`;
+    const res = !pl ? (b.entry_reason ? `<span class="neg">${esc(b.entry_status)}: ${esc(b.entry_reason)}</span>`
+                                      : `<span class="mut">${esc(b.entry_status || b.status)}</span>`)
+      : pl.state === "CLOSED" ? `<span class="mut">closed</span> ${$v(pl.realized)}`
+      : pl.state === "PARTIAL" ? `<span class="mut">partial · realized</span> ${$v(pl.realized)} <span class="mut">· open</span> ${$v(pl.open)}`
+      : `<span class="mut">open</span> ${$v(pl.open)}`;
     h += `<div class="tkt"><span class="mut num">${tET(b.created)}</span> <span class="tag ${b.side.toLowerCase()}">${b.side}</span>
-      <b>${esc(b.symbol)}</b> ${qty(b.qty)} <span class="mut">@ ${esc(b.limit_price)} · ${esc(b.entry_status || b.status)}</span>
+      <b>${esc(b.display || b.symbol)}</b> ${qty(b.qty)}${b.asset_type === "OPTION" ? " ct" : ""} <span class="mut">@ ${esc(b.limit_price)} ·</span> ${res}
       <span class="tkt-p">${prot}</span></div>`;
   }
   $("t-brackets").innerHTML = h;
@@ -1317,7 +1588,17 @@ $("t-entry").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
   T.entry = b.dataset.v;
   [...$("t-entry").children].forEach(x => x.classList.toggle("on", x === b));
+  const lmt = T.entry === "limit";
+  $("t-lmtfld").style.display = lmt ? "" : "none";
+  if (lmt && !$("t-lmt").value.trim()) {
+    // Start from the mid of what the ticket last saw; you then type your own price.
+    // On the contract's own price grid (a plain cent mid is off the nickel grid), rounded toward a fill.
+    const q = T.plan && T.plan.bid ? T.plan : isOpt() ? T.opt : null;
+    const tk = q && q === T.plan ? T.plan.ticks : optTicks(T.opt);
+    if (q && q.bid > 0 && q.ask > 0) $("t-lmt").value = onGrid((q.bid + q.ask) / 2, tk, T.side === "LONG");
+  }
   onTicketEdit();
+  if (lmt) $("t-lmt").focus();
 });
 $("t-risk").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
@@ -1326,30 +1607,64 @@ $("t-risk").addEventListener("click", e => {
   onTicketEdit();
 });
 $("t-targets").addEventListener("click", e => {
-  const b = e.target.closest("button"); if (!b) return;
+  const b = e.target.closest("button"); if (!b || b.disabled) return;
   T.targets = Number(b.dataset.v);
   if (T.targets === 2 && T.r <= T.t1r) T.r = 2;
-  [...$("t-targets").children].forEach(x => x.classList.toggle("on", x === b));
   onTicketEdit();
 });
+function renderSize() {
+  const q = T.sizeMode === "qty";
+  [...$("t-size").children].forEach(b => b.classList.toggle("on", b.dataset.v === T.sizeMode));
+  $("t-qtyfld").style.display = q ? "" : "none";
+  $("t-riskfld").style.display = q ? "none" : "";
+}
+$("t-size").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b || b.dataset.v === T.sizeMode) return;
+  T.sizeMode = b.dataset.v;
+  if (T.sizeMode === "risk" && T.stopType === "none") T.stopType = "fixed";    // risk sizing needs a stop
+  renderSize(); renderStopType(); onTicketEdit();
+  if (T.sizeMode === "qty") $("t-qty").focus();
+});
 function renderStopType() {
-  [...$("t-stoptype").children].forEach(b => b.classList.toggle("on", b.dataset.v === T.stopType));
+  [...$("t-stoptype").children].forEach(b => {
+    b.classList.toggle("on", b.dataset.v === T.stopType);
+    if (b.dataset.v === "none") { b.disabled = T.sizeMode !== "qty"; b.style.opacity = b.disabled ? ".45" : ""; }
+  });
+  const none = T.stopType === "none";
+  $("t-stop").disabled = none;
+  if (none) $("t-stop").value = "";
+  $("t-stop").placeholder = none ? "no stop" : T.sizeMode === "qty" && T.stopType === "trail" ? "optional" : "$$$";
   $("t-trailbox").style.display = T.stopType === "trail" ? "" : "none";
   $("t-trailunit").innerHTML = ["R", "$", "%"].map(u => `<button type="button" class="btn${T.trailUnit === u ? " on" : ""}" data-v="${u}">${u}</button>`).join("");
   $("t-trailbasis").innerHTML = [["MARK", "Mark"], ["LAST", "Last"], ["BID", "Bid"], ["ASK", "Ask"]].map(([v, t]) =>
     `<button type="button" class="btn${T.trailBasis === v ? " on" : ""}" data-v="${v}">${t}</button>`).join("");
 }
-$("t-stoptype").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.stopType = b.dataset.v; renderStopType(); onTicketEdit(); });
+$("t-stoptype").addEventListener("click", e => { const b = e.target.closest("button"); if (!b || b.disabled) return; T.stopType = b.dataset.v;
+  if (T.stopType === "none" && T.targets === 2) T.targets = 1;               // two targets need a stop
+  renderStopType(); onTicketEdit(); });
 $("t-trailunit").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.trailUnit = b.dataset.v;
-  $("t-trailval").value = T.trailUnit === "%" ? "0.5" : T.trailUnit === "$" ? "1.00" : "1"; renderStopType(); onTicketEdit(); });
+  $("t-trailval").value = T.trailUnit === "%" ? "0.5" : T.trailUnit === "$" ? (isOpt() ? "0.10" : "1.00") : "1"; renderStopType(); onTicketEdit(); });
 $("t-trailbasis").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.trailBasis = b.dataset.v; renderStopType(); onTicketEdit(); });
 $("t-trailval").addEventListener("input", () => onTicketEdit());
 $("t-split").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.split = parseFloat(b.dataset.v); onTicketEdit(); });
 $("t-r").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.r = parseFloat(b.dataset.v); $("t-tp").value = ""; onTicketEdit(); });
 $("t-t1r").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; T.t1r = parseFloat(b.dataset.v); $("t-t1p").value = ""; onTicketEdit(); });
-["t-sym", "t-stop", "t-risk-custom", "t-tp", "t-t1p"].forEach(id => $(id).addEventListener("input", () => {
+["t-sym", "t-stop", "t-risk-custom", "t-tp", "t-t1p", "t-qty", "t-lmt"].forEach(id => $(id).addEventListener("input", () => {
   if (id === "t-risk-custom") { T.risk = null; [...$("t-risk").children].forEach(x => x.classList.remove("on")); }
-  if (id === "t-sym") lookupSymbol();
+  if (id === "t-sym") {
+    // A new symbol never inherits the last one's prices: the Lmt, stop and targets are cleared.
+    const sym = $("t-sym").value.trim().toUpperCase();
+    if (sym !== T.lastSym) { ["t-lmt", "t-stop", "t-tp", "t-t1p"].forEach(x => { $(x).value = ""; }); }
+    if (isOpt() && sym !== T.und) {
+      // A new underlying drops the old contract at once, not when its expiries load: no plan or
+      // in-flight chain answer can bring the previous contract back.
+      T.und = ""; T.exps = []; T.exp = null; T.chain = null; T.opt = null; T.chainSeq++;
+      delete $("t-chain").dataset.scrolled;
+      renderExps(); renderChain(); showOptName();
+    }
+    T.lastSym = sym;
+    lookupSymbol();
+  }
   onTicketEdit();
 }));
 $("t-go").addEventListener("click", submitTicket);
@@ -1384,6 +1699,7 @@ async function tick() {
     lastOk = Date.now();
     updateHealth();          // health first, so the render below draws buttons with the right state
     render(lastState);
+    try { announceTrades(lastState); } catch (e) { console.error("trade voice", e); }
   } catch (e) { /* updateHealth turns the page red */ }
   TICKING = false;
   updateHealth();
@@ -1463,14 +1779,14 @@ function session(now) {
 function dayTrades() {
   return (lastState?.positions || []).filter(isDay);
 }
-function speak(text) {
+function speak(text, queue = false) {
   if (!("speechSynthesis" in window)) return false;
   const u = new SpeechSynthesisUtterance(text);
   const v = speechSynthesis.getVoices().find(v => /en-US/i.test(v.lang) && /natural|aria|jenny|guy|zira|david/i.test(v.name))
          || speechSynthesis.getVoices().find(v => /^en/i.test(v.lang));
   if (v) u.voice = v;
   u.rate = 1.0;
-  speechSynthesis.cancel();
+  if (!queue) speechSynthesis.cancel();
   speechSynthesis.speak(u);
   return true;
 }
@@ -1482,8 +1798,72 @@ function closeAlertText(rows) {
 }
 function updateVoiceBtn() {
   const b = $("voice");
-  b.textContent = VOICE_ON ? "Voice alert on" : "Voice alert off";
+  b.textContent = VOICE_ON ? "Voice on" : "Voice off";
   b.classList.toggle("off", !VOICE_ON);
+}
+
+// ---- trade announcements ---------------------------------------------------------------------
+// Spoken on the main page when a position opens, grows or shrinks, and when a round trip closes
+// (with its net P&L). Built from the dashboard state, so it hears thinkorswim fills too. Nothing
+// is spoken for what was already there at page load, or while data is stale.
+const TV = {pos: null, closed: null, acctAt: null, flat: {}, said: {}};
+function sayName(p) {
+  if (p.asset_type === "OPTION") {
+    const m = /([\d.]+)([CP])$/.exec(p.display || "");
+    return spell(p.underlying || "") + (m ? ` ${m[1]} ${m[2] === "C" ? "call" : "put"}` : " option");
+  }
+  return spell(p.display || p.symbol);
+}
+const sayQty = (n, p) => `${qty(n)}${p.asset_type === "OPTION" ? (n === 1 ? " contract" : " contracts") : ""}`;
+const sayMoney = v => `${v >= 0 ? "plus" : "minus"} ${Math.round(Math.abs(v)).toLocaleString("en-US")} dollars`;
+function announceTrades(st) {
+  if (VIEW || !st.summary) return;
+  const acct = (st.freshness || {}).account || {};
+  const now = Date.now(), msgs = [];
+  const closedKeys = new Set((st.closed || []).map(t => `${t.symbol}|${t.opened}|${t.closed}`));
+  // Closed trades: only once the fill history is complete, or the first full load would read out
+  // every trade of the day.
+  if (TV.closed === null || !st.history_complete) TV.closed = closedKeys;
+  else {
+    for (const t of st.closed || []) {
+      const k = `${t.symbol}|${t.opened}|${t.closed}`;
+      if (TV.closed.has(k)) continue;
+      delete TV.flat[t.symbol];
+      TV.said[t.symbol] = now;
+      msgs.push(`${sayName(t)} closed, ${t.net == null ? "P and L unknown" : sayMoney(t.net)}.`);
+    }
+    TV.closed = closedKeys;
+  }
+  // Positions: compare only on a fresh account read.
+  if (acct.error || !acct.ok_at || HEALTH !== "live") return flushTrades(msgs);
+  const pos = Object.fromEntries((st.positions || []).map(p => [p.symbol, p]));
+  if (TV.pos === null) { TV.pos = pos; TV.acctAt = acct.ok_at; return flushTrades(msgs); }
+  if (acct.ok_at === TV.acctAt) return flushTrades(msgs);
+  TV.acctAt = acct.ok_at;
+  for (const [sym, p] of Object.entries(pos)) {
+    const was = TV.pos[sym];
+    delete TV.flat[sym];
+    if (!was || was.side !== p.side) {
+      msgs.push(`${p.asset_type === "OPTION" ? (p.side === "LONG" ? "Bought" : "Sold") : p.side === "LONG" ? "Long" : "Short"} `
+              + `${sayQty(p.qty, p)} ${sayName(p)} at ${px(p.avg_price)}.`);
+    } else if (p.qty > was.qty + 1e-9) {
+      msgs.push(`Added ${sayQty(p.qty - was.qty, p)} ${sayName(p)}, now ${qty(p.qty)}.`);
+    } else if (p.qty < was.qty - 1e-9) {
+      msgs.push(`${sayName(p)} partial, ${sayQty(was.qty - p.qty, p)} out, ${qty(p.qty)} left.`);
+    }
+  }
+  // Gone from positions: the closed trade (with its P&L) usually follows within seconds; if
+  // the fills are late, say it went flat.
+  for (const sym of Object.keys(TV.pos))
+    if (!pos[sym] && !(now - (TV.said[sym] || 0) < 60000)) TV.flat[sym] = {p: TV.pos[sym], at: now};
+  TV.pos = pos;
+  for (const [sym, f] of Object.entries(TV.flat)) {
+    if (now - f.at > 20000) { msgs.push(`${sayName(f.p)} is flat.`); delete TV.flat[sym]; }
+  }
+  flushTrades(msgs);
+}
+function flushTrades(msgs) {
+  if (msgs.length && VOICE_ON) speak(msgs.join(" "), true);
 }
 $("voice").addEventListener("click", e => {
   if (e.shiftKey) {
@@ -1494,7 +1874,7 @@ $("voice").addEventListener("click", e => {
   VOICE_ON = !VOICE_ON;
   try { localStorage.setItem("voiceAlert", VOICE_ON ? "on" : "off"); } catch (err) {}
   updateVoiceBtn();
-  if (VOICE_ON) speak("Voice alert on.");
+  if (VOICE_ON) speak("Voice on.");
 });
 function updateClock() {
   const now = new Date();

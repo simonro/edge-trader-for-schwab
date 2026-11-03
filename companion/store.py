@@ -48,6 +48,10 @@ create table if not exists actions (
     created text, kind text, symbol text, order_id integer, status text, detail text);
 create table if not exists auto_be (
     ticket_id text primary key, symbol text, state text, created text, updated text, detail text);
+create table if not exists auto_be_orders (
+    ticket_id text, order_id integer, created text, primary key (ticket_id, order_id));
+create table if not exists companion_stops (symbol text, stop text, order_id integer, created text);
+create table if not exists ticket_r_stop (ticket_id text primary key, stop text, created text);
 create index if not exists ix_tx_time on transactions(time);
 create index if not exists ix_quotes on quotes(symbol, seen_at);
 """
@@ -232,6 +236,52 @@ class Store:
                 + (" and state=?" if only_from else ""),
                 (state, (detail or "")[:1000] or None, now_iso(), ticket_id) + ((only_from,) if only_from else ()))
         return cur.rowcount == 1
+
+    def link_auto_be(self, symbol: str, order_id: int, since: str) -> list[str]:
+        """An exit order the companion itself rebuilt (new target, partial, set stop) carries on
+        the stop of every Auto B/E ticket on the symbol since `since` that has not moved yet
+        (PENDING, or SENDING: claimed and waiting for the rebuild to release the order lock).
+        auto_breakeven refuses a ticket whose position was added to or re-entered by another
+        order, so an older ticket never acts on a later position."""
+        with self._lock, self._con:
+            ids = [r[0] for r in self._con.execute(
+                "select ticket_id from auto_be where symbol=? and state in ('PENDING', 'SENDING') and created>=?",
+                (symbol, since))]
+            ts = now_iso()
+            self._con.executemany("insert or ignore into auto_be_orders values (?,?,?)",
+                                  [(t, order_id, ts) for t in ids])
+        return ids
+
+    def record_stop(self, symbol: str, stop, order_id: int) -> None:
+        """A fixed stop Schwab accepted from the companion (order_id: the stop, or the OCO it went
+        in). The first one after a stopless ticket's fill that worked gives that ticket its frozen
+        R (Trader.r_basis)."""
+        with self._lock, self._con:
+            self._con.execute("insert into companion_stops values (?,?,?,?)",
+                              (symbol, str(stop), order_id, now_iso()))
+
+    def stops_since(self, symbol: str, since: str) -> list[tuple[str, int]]:
+        """(stop, order_id) of the companion's stops on `symbol` recorded after `since`, oldest first."""
+        with self._lock:
+            rows = self._con.execute("select stop, order_id from companion_stops where symbol=? and created>? "
+                                     "order by created", (symbol, since)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def frozen_stop(self, ticket_id: str) -> str | None:
+        with self._lock:
+            row = self._con.execute("select stop from ticket_r_stop where ticket_id=?", (ticket_id,)).fetchone()
+        return row[0] if row else None
+
+    def freeze_stop(self, ticket_id: str, stop: str) -> str:
+        """The stop that defines a stopless ticket's R, kept once. Returns the frozen value."""
+        with self._lock, self._con:
+            self._con.execute("insert or ignore into ticket_r_stop values (?,?,?)", (ticket_id, str(stop), now_iso()))
+            return self._con.execute("select stop from ticket_r_stop where ticket_id=?", (ticket_id,)).fetchone()[0]
+
+    def auto_be_orders(self, ticket_id: str) -> list[int]:
+        with self._lock:
+            rows = self._con.execute("select order_id from auto_be_orders where ticket_id=?", (ticket_id,)).fetchall()
+        return [r[0] for r in rows]
 
     def claimed_order_ids(self) -> set[int]:
         with self._lock:

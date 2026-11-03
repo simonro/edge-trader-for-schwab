@@ -33,11 +33,12 @@ def _pos(sym, side, qty, avg, last, stop, target, opened, held="INTRADAY", r=Non
 
 
 def _order(oid, sym, role, instr, otype, qty, price=None, stop=None, last=None, group=None, gtype="OCO",
-           duration="DAY", cancellable=False, status="WORKING", effect="CLOSING"):
+           duration="DAY", cancellable=False, status="WORKING", effect="CLOSING", asset="EQUITY", display=None,
+           underlying=None):
     ref = stop if stop is not None else price
     return {
         "order_id": oid, "leg_id": 1, "legs": 1, "group_id": group or oid, "group_type": gtype, "status": status,
-        "live": True, "symbol": sym, "display": sym, "underlying": sym, "asset_type": "EQUITY",
+        "live": True, "symbol": sym, "display": display or sym, "underlying": underlying or sym, "asset_type": asset,
         "instruction": instr, "effect": effect, "order_type": otype, "role": role, "qty": float(qty), "filled": 0.0,
         "price": price, "stop": stop, "duration": duration, "entered": "", "tag": None, "last": last,
         "distance": round(ref - last, 2) if (ref and last) else None,
@@ -47,6 +48,7 @@ def _order(oid, sym, role, instr, otype, qty, price=None, stop=None, last=None, 
 
 
 _STARTED = datetime.now(timezone.utc)      # fixed open times: positions do not "reopen" every poll
+OPT, OPT_DISPLAY = "AAPL  261120C00230000", "AAPL 20 Nov 26 230C"
 
 
 def demo_state(now: datetime | None = None) -> dict:
@@ -60,6 +62,9 @@ def demo_state(now: datetime | None = None) -> dict:
              r={"side": "LONG", "entry": 187.42, "stop": 185.20, "rps": 2.22, "live_r": 0.55}),
         _pos("AMD", "SHORT", 90, 162.30, 161.05, 164.10, 158.70, t - timedelta(minutes=21),
              r={"side": "SHORT", "entry": 162.30, "stop": 164.10, "rps": 1.80, "live_r": 0.69}),
+        _pos(OPT, "LONG", 4, 0.52, 0.73, 0.30, 0.95, t - timedelta(minutes=6), bid=0.72, ask=0.74,
+             r={"side": "LONG", "entry": 0.52, "stop": 0.30, "rps": 0.22, "live_r": 0.95},
+             name_display=OPT_DISPLAY, asset="OPTION", underlying="AAPL", mult=100.0),
         _pos("PLTR", "LONG", 400, 41.60, 41.38, 41.10, None, t - timedelta(minutes=9),
              protection="PARTIAL", stop_qty=200),
         _pos("MSFT", "LONG", 50, 402.10, 431.50, None, 445.00, None, held="CARRIED", protection="NONE"),
@@ -69,6 +74,10 @@ def demo_state(now: datetime | None = None) -> dict:
         _order(9002, "NVDA", "TARGET", "SELL", "LIMIT", 180, price=191.86, last=188.65, group=9000),
         _order(9011, "AMD", "STOP", "BUY_TO_COVER", "STOP", 90, stop=164.10, last=161.05, group=9010),
         _order(9012, "AMD", "TARGET", "BUY_TO_COVER", "LIMIT", 90, price=158.70, last=161.05, group=9010),
+        _order(9051, OPT, "STOP", "SELL_TO_CLOSE", "STOP", 4, stop=0.30, last=0.73, group=9050,
+               asset="OPTION", display=OPT_DISPLAY, underlying="AAPL"),
+        _order(9052, OPT, "TARGET", "SELL_TO_CLOSE", "LIMIT", 4, price=0.95, last=0.73, group=9050,
+               asset="OPTION", display=OPT_DISPLAY, underlying="AAPL"),
         _order(9021, "PLTR", "STOP", "SELL", "STOP", 200, stop=41.10, last=41.38, gtype="SINGLE"),
         _order(9031, "AAPL", "ENTRY", "BUY", "LIMIT", 120, price=229.40, last=229.55, gtype="TRIGGER",
                cancellable=True, effect="OPENING"),
@@ -80,7 +89,11 @@ def demo_state(now: datetime | None = None) -> dict:
          "opened": _iso(t0 + timedelta(minutes=m)), "closed": _iso(t0 + timedelta(minutes=m + h)),
          "max_qty": float(q), "exit_qty": float(q), "avg_entry": a, "avg_exit": b,
          "gross": g, "fees": -0.6, "net": round(g - 0.6, 2), "unresolved_qty": 0.0, "multiplier": 1.0,
-         "hold_seconds": h * 60}
+         "hold_seconds": h * 60,
+         "executions": [{"time": _iso(t0 + timedelta(minutes=m)), "qty": q if side == "LONG" else -q, "price": a,
+                         "fees": -0.3, "effect": "OPENING", "order_id": None},
+                        {"time": _iso(t0 + timedelta(minutes=m + h)), "qty": -q if side == "LONG" else q, "price": b,
+                         "fees": -0.3, "effect": "CLOSING", "order_id": None}]}
         for s, side, q, a, b, g, m, h in (
             ("TSLA", "LONG", 60, 251.20, 254.85, 219.0, 5, 22), ("META", "SHORT", 40, 588.40, 590.10, -68.0, 40, 11),
             ("AAPL", "LONG", 150, 228.10, 229.30, 180.0, 70, 35), ("AMZN", "LONG", 100, 201.50, 200.95, -55.0, 120, 8))]
@@ -100,7 +113,16 @@ def demo_state(now: datetime | None = None) -> dict:
         {"created": _iso(t - timedelta(minutes=2)), "side": "LONG", "symbol": "AAPL", "limit_price": "229.40", "qty": 120,
          "entry_status": "WORKING", "status": "ACCEPTED", "stop": "227.60", "target": "233.00", "protection": "WAITING_FILL",
          "stop_qty": 0, "exposure": 0, "target_qty": None, "ticket_id": "demo-3", "order_id": 9031, "detail": None},
+        {"created": closed[0]["opened"], "side": "LONG", "symbol": "TSLA", "limit_price": "251.20", "qty": 60,
+         "entry_status": "FILLED", "status": "ACCEPTED", "stop": "249.40", "target": "254.85", "protection": "CLOSED",
+         "ticket_id": "demo-4", "order_id": 8990, "detail": None},
     ]
+    positions[1].update(realized_qty=30.0, realized=44.4)          # AMD: a partial is out
+    for b in brackets:
+        if b["entry_status"] == "FILLED":
+            b.update(filled=float(b["qty"]), first_fill=b["created"])
+    from .view import ticket_pnl
+    ticket_pnl(brackets, positions, closed)
     log = {"NVDA": [{"t": _iso(t - timedelta(minutes=48)), "text": "Ticket LONG 180 @ 187.42, stop 185.20, target 191.86: ACCEPTED", "kind": "ticket"},
                     {"t": _iso(t - timedelta(minutes=48)), "text": "Fill bought 180 @ 187.42", "kind": "fill"},
                     {"t": _iso(t - timedelta(minutes=12)), "text": "move stop: DONE Stop moved to 187.42 on 180 of 180 shares, OCO kept", "kind": "action"}]}
@@ -117,3 +139,100 @@ def demo_state(now: datetime | None = None) -> dict:
                                                  "close": _iso(now + timedelta(hours=1, minutes=12))}},
         "brackets": brackets, "action_log": log,
     }
+
+
+# ---- invented quotes and option chain, so the ticket can be tried in demo (never sent) ----------
+
+_DEMO_LAST = {"AAPL": 229.84, "NVDA": 188.65, "AMD": 161.05, "PLTR": 41.38, "MSFT": 431.50, "SPY": 598.20}
+_DEMO_NAMES = {"AAPL": "Apple Inc", "NVDA": "NVIDIA Corp", "AMD": "Advanced Micro Devices", "PLTR": "Palantir",
+               "MSFT": "Microsoft Corp", "SPY": "SPDR S&P 500 ETF"}
+
+
+def _occ(root: str, exp: str, pc: str, strike: float) -> str:
+    return f"{root:<6}{exp[2:4]}{exp[5:7]}{exp[8:10]}{pc}{int(round(strike * 1000)):08d}"
+
+
+def _premium(spot: float, strike: float, pc: str, dte: int) -> tuple[float, float, float, float]:
+    """(bid, ask, mark, delta) of an invented contract: intrinsic + a time value that fades away
+    from the money. Plausible-looking, not a pricing model."""
+    import math
+    intrinsic = max(0.0, spot - strike) if pc == "C" else max(0.0, strike - spot)
+    width = 2.5 + 0.6 * dte
+    tv = (0.9 + 0.35 * dte) * math.exp(-abs(strike - spot) / width)
+    mark = round(intrinsic + tv, 2)
+    half = max(0.01, round(mark * 0.015, 2))
+    bid, ask = max(0.01, round(mark - half, 2)), round(mark + half, 2)
+    x = (spot - strike) / width
+    d = 1 / (1 + math.exp(-1.7 * x))
+    return bid, ask, round((bid + ask) / 2, 3), round(d if pc == "C" else d - 1, 3)
+
+
+def demo_expirations(underlying: str) -> list[dict]:
+    from datetime import date
+    und = (underlying or "").upper().strip()
+    if und not in _DEMO_LAST:
+        raise ValueError(f"demo: no options for {und or '?'} (try AAPL)")
+    today = date.today()
+    out, d = [], today
+    while len(out) < 7:
+        if d.weekday() in (0, 2, 4):
+            out.append({"date": d.isoformat(), "dte": (d - today).days, "type": "W", "standard": True})
+        d += timedelta(days=1)
+    for months in (1, 2):
+        m = (today.month - 1 + months) % 12 + 1
+        y = today.year + (today.month - 1 + months) // 12
+        first = date(y, m, 1)
+        third_fri = first + timedelta(days=(4 - first.weekday()) % 7 + 14)
+        out.append({"date": third_fri.isoformat(), "dte": (third_fri - today).days, "type": "S", "standard": True})
+    return out
+
+
+def demo_chain(underlying: str, expiration: str, put_call: str, strikes: int = 16) -> dict:
+    from datetime import date
+    und = (underlying or "").upper().strip()
+    spot = _DEMO_LAST.get(und)
+    if spot is None:
+        raise ValueError(f"demo: no options for {und or '?'} (try AAPL)")
+    pc = "C" if (put_call or "").upper() == "CALL" else "P"
+    dte = max(0, (date.fromisoformat(expiration) - date.today()).days)
+    step = 2.5 if spot < 300 else 5.0
+    atm = round(spot / step) * step
+    rows = []
+    for i in range(-(strikes // 2), strikes // 2):
+        k = atm + i * step
+        bid, ask, mark, delta = _premium(spot, k, pc, dte)
+        sym = _occ(und, expiration, pc, k)
+        rows.append({"symbol": sym, "description": f"{und} {expiration} {k:g} {pc}", "strike": k, "bid": bid,
+                     "ask": ask, "mark": mark, "last": mark, "delta": delta, "iv": 28.0,
+                     "oi": int(9000 * (0.3 + abs(delta) * (1 - abs(delta)) * 3)), "volume": int(4000 * abs(delta)),
+                     "spread_pct": round((ask - bid) / mark * 100, 1) if mark else None,
+                     "itm": (spot > k) if pc == "C" else (spot < k), "dte": dte, "penny": True, "standard": True})
+    return {"underlying": und, "expiration": expiration, "put_call": put_call.upper(), "underlying_price": spot,
+            "underlying_name": _DEMO_NAMES.get(und), "rows": rows}
+
+
+def demo_quote(symbol: str, max_age: float = 1.0) -> dict:
+    """A stock or option quote in the shape Trader.quote returns."""
+    from datetime import date
+    from .bracket import ticks_for
+    sym = (symbol or "").upper().strip()
+    if len(sym) > 15:                                   # OCC option symbol
+        root, exp = sym[:6].strip(), f"20{sym[6:8]}-{sym[8:10]}-{sym[10:12]}"
+        pc, strike = sym[12], int(sym[13:]) / 1000
+        spot = _DEMO_LAST.get(root)
+        if spot is None:
+            return {"symbol": sym, "found": False}
+        dte = max(0, (date.fromisoformat(exp) - date.today()).days)
+        bid, ask, mark, _ = _premium(spot, strike, pc, dte)
+        return {"symbol": sym, "found": True, "bid": bid, "ask": ask, "last": mark, "mark": mark, "change_pct": 4.2,
+                "name": f"{root} {exp} {strike:g} {'Call' if pc == 'C' else 'Put'}", "exchange": "OPR",
+                "asset_type": "OPTION", "underlying": root, "multiplier": 100.0, "is_penny": True, "realtime": True,
+                "deliverables": f"100 {root}", "put_call": pc, "expiration": exp, "strike": strike,
+                "ticks": ticks_for("OPTION", root, True)}
+    last = _DEMO_LAST.get(sym)
+    if last is None:
+        return {"symbol": sym, "found": False}
+    return {"symbol": sym, "found": True, "bid": round(last - 0.03, 2), "ask": round(last + 0.03, 2), "last": last,
+            "mark": last, "change_pct": 1.12, "name": _DEMO_NAMES.get(sym), "exchange": "NASDAQ",
+            "asset_type": "EQUITY", "underlying": None, "multiplier": None, "is_penny": None, "realtime": True,
+            "ticks": "EQUITY"}

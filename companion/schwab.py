@@ -46,11 +46,12 @@ _ALLOWED = frozenset({
     "transactions", "transaction_details",
     "quote", "quotes", "price_history", "market_hours", "market_hour",
 })
-# The order client: preview and place orders, cancel and replace (stop moves). Every call it
-# makes comes from a click in the dashboard.
+# The order client: preview and place orders, cancel and replace (stop moves), and the option
+# chain picker of the ticket. Every call it makes comes from a click in the dashboard.
 _TRADING = frozenset({"linked_accounts", "account_details", "account_orders", "quote", "quotes",
                       "order_details", "preview_order", "place_order", "cancel_order",
-                      "replace_order"})   # replace: only Trader.move_stop (stop price of a live stop)
+                      "replace_order",    # replace: only Trader.move_stop (stop price of a live stop)
+                      "option_expiration_chain", "option_chains"})
 
 
 class AuthExpired(RuntimeError):

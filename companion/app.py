@@ -22,7 +22,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .poller import Poller
-from .trading import Trader
+from .trading import OCC_RE, Trader
 from .view import private_view
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -59,6 +59,9 @@ trader = Trader(poller.store)
 poller.trader = trader
 trader.on_request = poller.note_external_request
 trader.cooldown_left = poller.cooldown_left
+if DEMO:      # the ticket plans on invented quotes and an invented option chain; nothing reaches Schwab
+    from . import demo as _demo
+    trader.quote, trader.expirations, trader.chain = _demo.demo_quote, _demo.demo_expirations, _demo.demo_chain
 
 
 @asynccontextmanager
@@ -86,8 +89,7 @@ async def only_local_host(request: Request, call_next):
     if DEMO and request.method == "POST" and (request.url.path.startswith("/api/position/")
                                               or request.url.path in ("/api/ticket/submit", "/api/ticket/cancel",
                                                                       "/api/ticket/cancel_entries", "/api/ticket/arm",
-                                                                      "/api/ticket/preview", "/api/ticket/plan",
-                                                                      "/api/ticket/lookup")):
+                                                                      "/api/ticket/preview")):
         return JSONResponse({"ok": False, "error": "Demo mode: no orders and no Schwab calls."})
     return await call_next(request)
 
@@ -204,12 +206,38 @@ async def ticket_lookup(request: Request):
     """Company name and last price, so you can confirm the symbol before anything else."""
     _guard(request)
     sym = str((await request.json()).get("symbol") or "").strip().upper()
-    if not sym or len(sym) > 10:
+    if not sym or (len(sym) > 10 and not OCC_RE.match(sym)):      # a stock, or an OCC option symbol
         return {"found": False, "symbol": sym}
     try:
         return await run_in_threadpool(trader.quote, sym, 2.0)
     except Exception as e:
         return {"found": False, "symbol": sym, "error": f"{e}"[:200]}
+
+
+@app.post("/api/ticket/expirations")
+async def ticket_expirations(request: Request):
+    """Option mode: the expiry dates of an underlying (cached 5 minutes)."""
+    _guard(request)
+    und = str((await request.json()).get("underlying") or "")
+    try:
+        return {"ok": True, "underlying": und.strip().upper(),
+                "expirations": await run_in_threadpool(trader.expirations, und)}
+    except Exception as e:
+        return {"ok": False, "error": f"{e}"[:200]}
+
+
+@app.post("/api/ticket/chain")
+async def ticket_chain(request: Request):
+    """Option mode: the strikes of one expiry around the money, calls or puts."""
+    _guard(request)
+    body = await request.json()
+    try:
+        out = await run_in_threadpool(trader.chain, str(body.get("underlying") or ""),
+                                      str(body.get("expiration") or ""), str(body.get("put_call") or ""),
+                                      int(body.get("strikes") or 16))
+        return {"ok": True, **out}
+    except Exception as e:
+        return {"ok": False, "error": f"{e}"[:200]}
 
 
 @app.post("/api/ticket/preview")
@@ -254,9 +282,10 @@ async def position_cancel_orders(request: Request):
 async def position_close(request: Request):
     """One market order for the whole position; Schwab cancels its stop/target as it enters."""
     _guard(request)
-    sym = str((await request.json()).get("symbol") or "")
+    body = await request.json()
+    sym = str(body.get("symbol") or "")
     return await run_in_threadpool(trader.close_position, sym, poller._merged_orders(),
-                                   set(poller.terminal))
+                                   set(poller.terminal), body.get("confirm_leg") is True)
 
 
 @app.post("/api/position/move_stop")
@@ -288,7 +317,8 @@ async def position_partial(request: Request):
     pos = next((p for p in (poller.snapshot().get("positions") or []) if p["symbol"] == sym), None)
     prior = ((pos or {}).get("trail") or {}).get("level")
     return await run_in_threadpool(trader.take_partial, sym, body.get("pct"), body.get("shares"),
-                                   poller._merged_orders(), set(poller.terminal), body.get("mode") or "mid", prior)
+                                   poller._merged_orders(), set(poller.terminal), body.get("mode") or "mid", prior,
+                                   body.get("confirm_leg") is True)
 
 
 @app.post("/api/position/set_target")

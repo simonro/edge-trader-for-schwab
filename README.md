@@ -13,7 +13,7 @@ target, take partials, cancel or close. It runs on your own computer, next to th
 
 - **Your data stays on your computer.** No account with us, no cloud, no telemetry. The app talks only to Schwab.
 - **Every order is your click.** No signals, no auto-trading. The one exception is opt-in per trade: pick "Auto B/E 1R" on the ticket and the app moves that trade's stop to break-even once, when price reaches +1R.
-- **Protection first.** Entries go in as one Schwab bracket, so the stop and target live at Schwab even if the app or your PC is off.
+- **Protection first.** Entries go in as one Schwab bracket, so the stop and target live at Schwab even if the app or your PC is off. Leaving out the stop is possible only when you size by quantity, and the ticket asks you to confirm it every time.
 - **Honest numbers.** P&L comes from your own fills, and anything incomplete is labeled as such, never shown as complete.
 - **Free and MIT licensed.** No paid tier.
 
@@ -64,10 +64,20 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
   STALE, DISCONNECTED) that disables every order button when data is not current.
 - **New trade:** symbol, side, stop, risk in dollars (four buttons you set yourself), entry at the mid,
-  market, ask or bid, one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
+  market, ask, bid or your own limit price (Lmt), one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
   (it checks every 3 seconds and only while the app is running; it never loosens a stop). One click
   sends one Schwab bracket. Entries must be armed each session.
+- **Size by risk or by quantity:** size from your risk and stop (the default), or type the number of
+  shares or contracts yourself. Sizing by quantity also allows **no stop** (a red warning and a
+  confirmation on every click) and either way you can send **no target**. The order then carries only
+  what you picked; add the missing stop or target later from the trade (Set stop / Set target), and
+  once it has both they are paired as one OCO.
+- **Options on the ticket:** switch the ticket to Option, type the underlying, pick the expiry, calls
+  or puts and a strike from the chain (bid, ask, mark, delta, spread and open interest), then buy to
+  open or sell to open. Stop and targets are option prices; contracts are sized from your risk (one
+  contract = 100 shares of premium). The same one-click bracket goes to Schwab, with limit entries
+  only (mid, ask or bid) and a warning on wide markets and on every sell to open.
 - **Workbench for the selected trade:** an R ruler (original stop, current stop, entry, 1R, targets,
   price), stop to break-even, move stop, Schwab-held trailing stop (R, dollars or percent), replace
   target, partials at the mid, market, ask or bid (the stop and target are rebuilt on the rest), cancel
@@ -169,8 +179,20 @@ folder across, run `setup.bat` once, then `launch.bat`.
 
 - **Futures:** Schwab's API reports futures fills but not futures positions or orders, so Edge Trader
   shows futures realized P&L only and cannot trade futures.
-- **Options:** shown and manageable (close, cancel, stops, partials, targets by price); the New trade
-  ticket and trailing stops are for stocks.
+- **Options:** single calls and puts, bought or sold to open from the ticket and managed like stocks
+  (close, cancel, stops, Auto B/E, partials, targets, trailing stops). Prices follow each contract's own
+  steps (pennies, nickels or dimes). Schwab does not document trailing stops on options, so each one is
+  first checked with Schwab's order preview; if Schwab would refuse it, nothing is sent. Spreads and
+  other multi-leg orders are shown but not traded here (Schwab's API does not take stops on them), and
+  adjusted contracts (after a split or merger) are refused. Selling to open needs the matching option
+  approval level on your Schwab account.
+- **Leg guard:** Close and partials ask before they send when the contract looks like one leg of a
+  bigger position: an opposite-side option of the same type on the same underlying, short calls
+  against long shares (short puts against short shares), or a working multi-leg order on it. Closing
+  one leg alone can leave the other uncovered; the warning says which, and nothing is sent unless you
+  confirm.
+- **No stop at entry:** a trade sent without a stop gets its R from the first stop you set from the
+  app once Schwab shows it working (a stop set in thinkorswim does not count).
 - **One stream per Schwab user:** Edge Trader polls (REST) and never opens Schwab's streamer, so it
   works alongside thinkorswim and other tools. It keeps its own requests well under Schwab's limits.
 - **Schwab cancels a symbol's working orders when a new order for it is entered.** Edge Trader is built
@@ -180,7 +202,8 @@ folder across, run `setup.bat` once, then `launch.bat`.
 - **Recording mode:** `.venv\Scripts\python.exe -m companion --private` hides positions carried from
   earlier sessions, their orders, the carried P&L and the account value, so you can record or share your
   screen while showing only today's trades. It only changes what is displayed; orders work as usual.
-  `--demo` runs on invented data with no Schwab connection, and refuses every order.
+  `--demo` runs on invented data with no Schwab connection, and refuses every order (the ticket plans on
+  invented quotes and an invented AAPL option chain, so you can try it).
 
 ## Contributing
 

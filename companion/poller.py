@@ -31,7 +31,7 @@ from . import schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, fills_from_transactions, session_day
 from .store import Store, now_iso
-from .view import build_state
+from .view import build_state, ticket_pnl
 
 log = logging.getLogger("companion.poller")
 
@@ -376,6 +376,7 @@ class Poller:
             st["brackets"] = self.trader.brackets(
                 today, pending_orders(self._merged_orders(), self.terminal), positions,
                 self._orders_fresh() and self._fresh("account"))
+            ticket_pnl(st["brackets"], st.get("positions") or [], st.get("closed") or [])
             self._add_r_and_log(st, today, txns)
             self._auto_be(st)
         self._trail_estimates(st)
@@ -387,7 +388,7 @@ class Poller:
         otherwise the best mark seen since we first saw the order, minus the offset. Seen from
         polls only, so the estimate never runs ahead of the real stop (it can lag behind it)."""
         from decimal import Decimal
-        from .bracket import trail_level
+        from .bracket import ticks_for, trail_level
         live_ids = set()
         for p in st.get("positions") or []:
             t = p.get("trail")
@@ -415,7 +416,9 @@ class Poller:
                 t.update({"level": t["schwab_stop"], "estimated": False, "best": best})
             elif best and t.get("offset") and t.get("whole"):
                 spec = {"offset": Decimal(str(t["offset"])), "link": t.get("link") or "VALUE"}
-                lvl = float(trail_level(Decimal(str(best)), spec, p["side"]))
+                pen = ((self.quotes.get(p["symbol"]) or {}).get("reference") or {}).get("isPennyPilot")
+                tk = ticks_for(p.get("asset_type"), p.get("underlying"), pen if isinstance(pen, bool) else None)
+                lvl = float(trail_level(Decimal(str(best)), spec, p["side"], tk))
                 t.update({"level": lvl, "estimated": True, "best": best})
                 p["stop_price"] = lvl          # ruler and P&L at stop use the estimate, flagged
                 if p.get("avg_price"):
@@ -483,9 +486,12 @@ class Poller:
             return abs((a - o).total_seconds()) <= 5
 
         for p in st.get("positions") or []:
-            b = basis.get(p["symbol"])
-            if b and b["side"] == p["side"] and p.get("last") and owns(b, p):
+            top = basis.get(p["symbol"])
+            b = next((c for c in ([top, *top["alts"]] if top else [])
+                      if c["side"] == p["side"] and owns(c, p)), None)
+            if b and p.get("last"):
                 direction = 1 if p["side"] == "LONG" else -1
+                b = {k: v for k, v in b.items() if k != "alts"}
                 p["r"] = {**b, "live_r": (float(p["last"]) - b["entry"]) * direction / b["rps"]}
             else:
                 p["r"] = None

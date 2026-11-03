@@ -74,3 +74,17 @@ def test_ignores_a_quote_from_before_the_fill_and_stale_data(tmp_path, monkeypat
     st, p.quotes = _state(57.00)
     p._auto_be(st)
     assert p.trader.calls == [] and p.trader.store.auto_be("t1")["state"] == "PENDING"
+
+
+def test_live_r_comes_from_the_ticket_that_opened_the_position(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch)
+    opener = {"ticket_id": "a", "side": "LONG", "entry": 100.0, "stop": 98.0, "rps": 2.0,
+              "first_fill": "2099-01-01T14:00:00+0000"}
+    add_on = {"ticket_id": "b", "side": "LONG", "entry": 101.0, "stop": 99.0, "rps": 2.0,
+              "first_fill": "2099-01-01T14:10:00+0000"}
+    p.trader.r_basis = lambda orders: {"XYZ": {**add_on, "alts": [opener]}}
+    st = {"positions": [{"symbol": "XYZ", "side": "LONG", "qty": 200, "last": 103.0,
+                         "opened": "2099-01-01T14:00:00+00:00"}]}
+    p._add_r_and_log(st, [], [])
+    r = st["positions"][0]["r"]
+    assert r["ticket_id"] == "a" and r["live_r"] == 1.5 and "alts" not in r

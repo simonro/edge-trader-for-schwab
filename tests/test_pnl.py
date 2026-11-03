@@ -157,3 +157,40 @@ def test_futures_evening_fill_belongs_to_next_session():
     )
     assert b.trades[0].close_day == D
     assert b.realized_on(D, fills)["gross"] == 20.0
+
+
+def test_closed_trade_lists_its_executions():
+    from datetime import datetime, timezone
+    from companion.view import build_state
+    txns = [txn("2026-10-20T14:00:00+0000", "TSX", 100, 10.0, "OPENING"),
+            txn("2026-10-20T14:05:00+0000", "TSX", -60, 12.0, "CLOSING", fee=1.0),
+            txn("2026-10-20T14:06:00+0000", "TSX", -40, 9.0, "CLOSING")]
+    st = build_state(account=None, orders=[], txns=txns, quotes={}, prev_session={}, freshness={},
+                     history_complete=True, orders_fresh=True, auth_hours_left=100,
+                     now=datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc))
+    (t,) = st["closed"]
+    ex = t["executions"]
+    assert [(e["qty"], e["price"], e["effect"]) for e in ex] == [(100, 10.0, "OPENING"), (-60, 12.0, "CLOSING"),
+                                                                 (-40, 9.0, "CLOSING")]
+    assert ex[1]["fees"] == -1.0 and t["underlying"] == "TSX"
+
+
+def test_ticket_pnl_follows_the_round_trip_it_opened():
+    from companion.view import ticket_pnl
+    tk = lambda sym, fill, filled=100: {"symbol": sym, "first_fill": fill, "filled": filled}
+    positions = [{"symbol": "AAA", "opened": "2026-10-20T15:00:01+00:00", "open_pnl": 40.0, "realized_qty": 0, "realized": None},
+                 {"symbol": "BBB", "opened": "2026-10-20T14:00:00+00:00", "open_pnl": -10.0, "realized_qty": 50, "realized": 75.5}]
+    closed = [{"symbol": "AAA", "opened": "2026-10-20T14:00:00+00:00", "closed": "2026-10-20T14:30:00+00:00", "net": -20.0},
+              {"symbol": "CCC", "opened": "2026-10-20T13:00:00+00:00", "closed": "2026-10-20T13:10:00+00:00", "net": None}]
+    rows = [tk("AAA", "2026-10-20T15:00:00+0000"),     # the new AAA round trip, still open
+            tk("AAA", "2026-10-20T14:00:00+0000"),     # the earlier AAA ticket, closed at a loss
+            tk("BBB", "2026-10-20T14:00:00+0000"),     # partial out, rest open
+            tk("CCC", "2026-10-20T13:00:00+0000"),     # closed, basis unknown
+            tk("DDD", None, 0),                        # never filled
+            tk("EEE", "2026-10-20T14:00:00+0000")]     # filled, fills not in the ledger yet
+    ticket_pnl(rows, positions, closed)
+    assert rows[0]["pnl"] == {"state": "OPEN", "open": 40.0, "realized": None}
+    assert rows[1]["pnl"] == {"state": "CLOSED", "open": None, "realized": -20.0}
+    assert rows[2]["pnl"] == {"state": "PARTIAL", "open": -10.0, "realized": 75.5}
+    assert rows[3]["pnl"]["state"] == "CLOSED" and rows[3]["pnl"]["realized"] is None
+    assert "pnl" not in rows[4] and "pnl" not in rows[5]

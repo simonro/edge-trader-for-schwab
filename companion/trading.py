@@ -17,13 +17,14 @@ Safety that is engineering, not coaching:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from . import schwab
-from .bracket import MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, tick
+from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
 from .store import Store, now_iso
@@ -31,8 +32,18 @@ from .store import Store, now_iso
 log = logging.getLogger("companion.trading")
 
 LOCK_R = Decimal("0.1")       # the click keeps the displayed plan while price moved <= 0.1R against it
-LOCK_MIN_TICKS = 2            # ...and at least 2 ticks (2 cents above $1)
+LOCK_MIN_TICKS = 2            # ...and at least 2 ticks (2 cents above $1; 2 option ticks for an option)
+NO_STOP_LOCK = Decimal("0.001")   # no stop, no R: the lock is 0.1% of the price instead
 RISK_CHOICES = (250, 375, 500, 750)      # defaults; the user edits them with the gear on the ticket
+EXPIRATIONS_TTL = 300.0       # the option chain picker's expiry list, seconds
+CHAIN_TTL = 5.0               # one expiry's strikes (bid / ask move; the click re-quotes anyway)
+UNDERLYING_RE = re.compile(r"^\$?[A-Z][A-Z0-9./]{0,9}$")
+# Schwab's market data names indexes with a "$" ($SPX); a bare SPX on /chains is a 400.
+# A stop leg in one of these has been live at Schwab (ACCEPTED/QUEUED may still be rejected).
+WORKED = frozenset({"WORKING", "AWAITING_STOP_CONDITION", "PENDING_REPLACE", "PENDING_CANCEL",
+                    "FILLED", "CANCELED", "REPLACED", "EXPIRED"})
+INDEX_ROOTS = frozenset({"SPX", "NDX", "RUT", "XSP", "VIX", "DJX", "OEX", "XND", "MRUT"})
+OCC_RE = re.compile(r"^[A-Z0-9.]{1,6} {0,5}\d{6}[CP]\d{8}$")
 
 
 def _dec(v) -> Decimal | None:
@@ -147,8 +158,127 @@ def _basis_price(q: dict, basis: str):
 
 def _trail_txt(spec: dict) -> str:
     off = spec["offset"]
-    dist = f"{off:g}%" if spec["link"] == "PERCENT" else f"${fmt(Decimal(str(off)))}"
+    d = Decimal(str(off))
+    # Cents when the distance is whole cents (always for options), sub-penny stocks keep 4 decimals.
+    dist = f"{off:g}%" if spec["link"] == "PERCENT" else f"${d:.2f}" if d == d.quantize(Decimal("0.01")) else f"${fmt(d)}"
     return f"trailing {dist} from {spec['basis'].lower()}"
+
+
+def _units(asset: str | None) -> tuple[str, str]:
+    """(word, short) for the position's size in messages."""
+    return ("contracts", "ct") if asset == "OPTION" else ("shares", "sh")
+
+
+def _occ_root(symbol: str) -> str:
+    """The root of an OCC option symbol ("SPY   261120C00600000" -> "SPY")."""
+    return symbol[:6].strip() if len(symbol) > 15 else symbol
+
+
+def _odd_deliverable(q: dict, symbol: str = "") -> str | None:
+    """Why an option is an adjusted contract (after a split, merger or spin-off), or None when it
+    is standard. Adjusted contracts deliver something other than 100 shares of one underlying, so
+    their prices do not compare with the regular chain and the ticket refuses them. Fails closed:
+    only "100 <underlying>" (either order, "(Cash)" allowed for a cash-settled index like
+    "100 $SPX(Cash)") or no deliverables at all counts as standard, and an OCC root ending in a
+    digit (AAPL1) is an adjusted root."""
+    root = _occ_root(symbol) if symbol else ""
+    if root and root[-1].isdigit():
+        return f"adjusted root {root}"
+    d = q.get("deliverables")
+    if d is None or (isinstance(d, str) and not d.strip()):
+        return None
+    if not isinstance(d, str):
+        return f"deliverables {str(d)[:60]!r}"
+    und = (q.get("underlying") or root or "").upper().strip().lstrip("$")
+    parts = [x.lstrip("$").removesuffix("(CASH)") for x in d.upper().split()]
+    if und and len(parts) == 2 and sorted(parts) == sorted(["100", und]):
+        return None
+    return f"deliverables {d.strip()[:60]!r}"
+
+
+_ENTRY_INSTR = {"LONG": ("BUY", "BUY_TO_OPEN"), "SHORT": ("SELL_SHORT", "SELL_TO_OPEN")}
+
+
+def _fill_times(order: dict) -> list[str]:
+    """Execution times of an order's own fills (not its children's)."""
+    return [e["time"] for a in order.get("orderActivityCollection") or [] if a.get("executionType") == "FILL"
+            for e in a.get("executionLegs") or [] if e.get("time")]
+
+
+def _foreign_entry(orders: list[dict], symbol: str, side: str, since: str, own: set[int]) -> int | None:
+    """The id of an order outside `own` that filled an entry on `symbol` in `side`'s direction at or
+    after `since` (an ISO time; "" means any time in `orders`), or None."""
+    def walk(o):
+        legs = o.get("orderLegCollection") or []
+        if (o.get("orderId") not in own and float(o.get("filledQuantity") or 0) > 0
+                and any((l.get("instrument") or {}).get("symbol") == symbol
+                        and l.get("instruction") in _ENTRY_INSTR[side] for l in legs)
+                and (not _fill_times(o) or any(ft >= since for ft in _fill_times(o)))):   # no time: counts
+            return o.get("orderId")
+        for ch in o.get("childOrderStrategies") or []:
+            hit = walk(ch)
+            if hit:
+                return hit
+        return None
+    for o in orders:
+        hit = walk(o)
+        if hit:
+            return hit
+    return None
+
+
+def _option_id(ins: dict) -> tuple[str | None, str | None]:
+    """(underlying without "$", CALL | PUT) of a position's option instrument, from Schwab's
+    fields or else from the OCC symbol (index roots SPXW / NDXP -> SPX / NDX). None where
+    neither says."""
+    m = re.match(r"^([A-Z0-9.]{1,6}) *\d{6}([CP])\d{8}$", (ins.get("symbol") or "").upper())
+    root = m.group(1) if m else None
+    if root and len(root) > 1 and root[:-1] in INDEX_ROOTS and root[-1] in "WP":
+        root = root[:-1]
+    und = (ins.get("underlyingSymbol") or "").upper().lstrip("$") or root
+    pc = ins.get("putCall") or ({"C": "CALL", "P": "PUT"}[m.group(2)] if m else None)
+    return und, pc
+
+
+def _market_symbol(underlying: str) -> str:
+    """The symbol Schwab's chain endpoints expect: SPX -> $SPX, anything else unchanged."""
+    sym = (underlying or "").upper().strip()
+    return "$" + sym if sym in INDEX_ROOTS else sym
+
+
+def _greek(v, lo: float, hi: float):
+    """Schwab sends -999 (and the odd absurd value) when it has no greek: show nothing then."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(x, 3) if lo <= x <= hi else None
+
+
+def parse_chain(body: dict, pc: str) -> dict:
+    """One expiry of Schwab's option chain as compact rows for the picker, by strike."""
+    rows = []
+    for _exp, strikes in (body.get("callExpDateMap" if pc == "CALL" else "putExpDateMap") or {}).items():
+        for _k, contracts in (strikes or {}).items():
+            for c in contracts or []:
+                bid, ask = c.get("bid") or 0, c.get("ask") or 0
+                mark = c.get("mark") or ((bid + ask) / 2 if bid and ask else None)
+                mult = c.get("multiplier")
+                rows.append({
+                    "symbol": c.get("symbol"), "description": c.get("description"),
+                    "strike": c.get("strikePrice"), "bid": bid, "ask": ask, "mark": mark, "last": c.get("last"),
+                    "delta": _greek(c.get("delta"), -1.0, 1.0), "iv": _greek(c.get("volatility"), 0.0, 1000.0),
+                    "oi": c.get("openInterest"), "volume": c.get("totalVolume"),
+                    "spread_pct": round((ask - bid) / mark * 100, 1) if mark and ask >= bid > 0 else None,
+                    "itm": bool(c.get("inTheMoney")), "dte": c.get("daysToExpiration"),
+                    "penny": bool(c.get("pennyPilot") or c.get("isPennyPilot")),
+                    "standard": not (c.get("nonStandard") or c.get("mini")) and (mult in (None, 100, 100.0)),
+                })
+    rows = [r for r in rows if r["symbol"] and r["strike"] is not None]
+    rows.sort(key=lambda r: r["strike"])
+    und = body.get("underlying") or {}
+    return {"underlying_price": body.get("underlyingPrice") or und.get("mark") or und.get("last"),
+            "underlying_name": und.get("description"), "rows": rows}
 
 
 class Trader:
@@ -219,7 +349,7 @@ class Trader:
             # that a rebuild needs waits at most 5 s, so a stop is never held back for long.
             left = self.cooldown_left()
             if left > 0:
-                if endpoint in ("order_details", "ticket_quote"):
+                if endpoint in ("order_details", "ticket_quote", "option_expirations", "option_chain"):
                     return _Throttled()
                 end = time.monotonic() + left
                 if abs(end - self._waited_for) > 2.0:      # wait once per pause, at most 5 s
@@ -248,21 +378,99 @@ class Trader:
         r.raise_for_status()
         entry = (r.json() or {}).get(sym) or {}
         q, ref = entry.get("quote") or {}, entry.get("reference") or {}
+        asset = entry.get("assetMainType")
+        underlying = ref.get("underlying") or (_occ_root(sym) if asset == "OPTION" else None)
+        penny = ref.get("isPennyPilot")
         out = {"symbol": sym, "found": bool(q), "bid": q.get("bidPrice"), "ask": q.get("askPrice"),
-               "last": q.get("lastPrice"), "change_pct": q.get("netPercentChange"),
+               "last": q.get("lastPrice"), "mark": q.get("mark"), "change_pct": q.get("netPercentChange"),
                "name": ref.get("description"), "exchange": ref.get("exchangeName"),
-               "asset_type": entry.get("assetMainType")}
+               "asset_type": asset, "underlying": underlying, "multiplier": ref.get("multiplier"),
+               "is_penny": penny if isinstance(penny, bool) else None, "realtime": entry.get("realtime"),
+               "deliverables": ref.get("deliverables"), "put_call": put_call(sym) if asset == "OPTION" else None,
+               "expiration": (f"{ref['expirationYear']:04d}-{ref['expirationMonth']:02d}-{ref['expirationDay']:02d}"
+                              if all(isinstance(ref.get(k), int) for k in ("expirationYear", "expirationMonth",
+                                                                         "expirationDay")) else None),
+               "strike": ref.get("strikePrice"),
+               "ticks": ticks_for(asset, underlying, penny if isinstance(penny, bool) else None)}
         self._quote_cache[sym] = (time.monotonic(), out)
         return out
 
+    def _ticks(self, symbol: str, asset: str | None, q: dict | None = None) -> str:
+        """The price grid for an action on this position. A stock never needs a quote for it; an
+        option uses its quote's penny flag, and the nickel grid (valid everywhere) without one."""
+        if asset != "OPTION":
+            return EQUITY
+        if q is None:
+            try:
+                q = self.quote(symbol)
+            except Exception:
+                q = {}
+        if q.get("asset_type") == "OPTION" or q.get("is_penny") is not None:
+            return ticks_for("OPTION", q.get("underlying") or _occ_root(symbol), q.get("is_penny"))
+        return ticks_for("OPTION", _occ_root(symbol), None)
+
     def make_plan(self, req: dict, fresh: bool = False, q: dict | None = None, limit_override=None) -> Plan:
+        """Asset, multiplier and price grid always come from Schwab's quote, never from the page."""
         q = q or self.quote(req["symbol"], max_age=0 if fresh else 1.0)
-        return plan(req["symbol"], req["side"], req["stop"], req["risk"], req.get("r", 2),
-                    q.get("bid"), q.get("ask"), split=req.get("split") or 0, t1_r=req.get("t1_r") or 1,
-                    entry=req.get("entry") or "cross", target_price=req.get("target_price"),
-                    t1_price=req.get("t1_price"), stop_type=req.get("stop_type") or "fixed",
-                    trail_unit=req.get("trail_unit") or "R", trail_value=req.get("trail_value") or 1,
-                    trail_basis=req.get("trail_basis") or "MARK", limit_override=limit_override)
+        asset = "OPTION" if q.get("asset_type") == "OPTION" else "EQUITY"
+        mult = q.get("multiplier") or (100 if asset == "OPTION" else 1)
+        odd = _odd_deliverable(q, req["symbol"]) if asset == "OPTION" else None
+        p = plan(req["symbol"], req["side"], req["stop"], req["risk"], req.get("r", 2),
+                 q.get("bid"), q.get("ask"), split=req.get("split") or 0, t1_r=req.get("t1_r") or 1,
+                 entry=req.get("entry") or "cross", target_price=req.get("target_price"),
+                 t1_price=req.get("t1_price"), stop_type=req.get("stop_type") or "fixed",
+                 trail_unit=req.get("trail_unit") or "R", trail_value=req.get("trail_value") or 1,
+                 trail_basis=req.get("trail_basis") or "MARK", limit_override=limit_override,
+                 asset=asset, multiplier=mult, ticks=q.get("ticks") or ticks_for(asset),
+                 size_mode=req.get("size_mode") or "risk", qty=req.get("qty"),
+                 target=req.get("targets", 1) not in (0, "0"), limit_price=req.get("limit_price"))
+        if odd:
+            # Schwab's real deliverables format is unconfirmed: the reason is shown so a wrong refusal is easy to spot.
+            p.errors.insert(0, f"non-standard contract ({odd}): not traded from the ticket")
+        return p
+
+    # ---- option chain picker (only on a click in the ticket's Option mode) ---------------------
+
+    def expirations(self, underlying: str) -> list[dict]:
+        sym = (underlying or "").upper().strip()
+        if not UNDERLYING_RE.match(sym):
+            raise ValueError("type a stock or ETF symbol")
+        key = ("exp", sym)
+        hit = self._quote_cache.get(key)
+        if hit and time.monotonic() - hit[0] < EXPIRATIONS_TTL:
+            return hit[1]
+        r = self._logged("option_expirations",
+                         lambda: self._ensure().option_expiration_chain(_market_symbol(sym)))
+        r.raise_for_status()
+        rows = [{"date": e.get("expirationDate"), "dte": e.get("daysToExpiration"),
+                 "type": e.get("expirationType"), "standard": e.get("standard", True) is not False}
+                for e in (r.json() or {}).get("expirationList") or [] if e.get("expirationDate")]
+        rows.sort(key=lambda e: e["date"])
+        self._quote_cache[key] = (time.monotonic(), rows)
+        return rows
+
+    def chain(self, underlying: str, expiration: str, put_call_: str, strikes: int = 16) -> dict:
+        sym = (underlying or "").upper().strip()
+        pc = (put_call_ or "").upper().strip()
+        if not UNDERLYING_RE.match(sym):
+            raise ValueError("type a stock or ETF symbol")
+        if pc not in ("CALL", "PUT"):
+            raise ValueError("pick Calls or Puts")
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", expiration or ""):
+            raise ValueError("pick an expiry")
+        strikes = max(4, min(int(strikes or 16), 40))
+        key = ("chain", sym, expiration, pc, strikes)
+        hit = self._quote_cache.get(key)
+        if hit and time.monotonic() - hit[0] < CHAIN_TTL:
+            return hit[1]
+        r = self._logged("option_chain", lambda: self._ensure().option_chains(
+            _market_symbol(sym), contractType=pc, strikeCount=strikes, includeUnderlyingQuote=True,
+            fromDate=expiration, toDate=expiration))
+        r.raise_for_status()
+        out = parse_chain(r.json() or {}, pc)
+        out.update({"underlying": sym, "expiration": expiration, "put_call": pc})
+        self._quote_cache[key] = (time.monotonic(), out)
+        return out
 
     # ---- actions -----------------------------------------------------------
 
@@ -336,7 +544,7 @@ class Trader:
         except Exception:
             exp_limit = exp_target = Decimal(0)
             exp_qty = 0
-        if not (exp_limit.is_finite() and exp_target.is_finite()) or exp_limit <= 0 or exp_target <= 0 or exp_qty <= 0:
+        if not (exp_limit.is_finite() and exp_target.is_finite()) or exp_limit <= 0 or exp_target < 0 or exp_qty <= 0:
             return {"ok": False, "error": "ticket is missing the displayed plan; review and click again"}
         q = self.quote(req["symbol"], max_age=0)
         now = self.make_plan(req, q=q)          # what a fresh ticket would show
@@ -354,40 +562,52 @@ class Trader:
         # displayed limit caps the fill, so the risk cannot exceed what the ticket showed, and a
         # move in favour fills at a better price. A Mkt entry has no price cap: the lock only
         # refuses when the quote already sits more than 0.1R worse, and the fill can slip beyond.
-        lock = max(LOCK_R * p.per_share, LOCK_MIN_TICKS * tick(exp_limit))
+        f, unit_w = p.f, ("contracts" if p.option else "shares")
+        # Without a stop there is no R: the lock is 0.1% of the price (at least the 2 ticks).
+        lock = max(LOCK_R * p.per_share if p.per_share else exp_limit * NO_STOP_LOCK,
+                   LOCK_MIN_TICKS * tick(exp_limit, p.ticks))
         long = p.side == "LONG"
         against = now.limit - exp_limit if long else exp_limit - now.limit
         if against > lock:
-            return {"ok": False, "error": f"Price moved: entry is now {fmt(now.limit)} (ticket showed "
-                    f"{fmt(exp_limit)}, more than {fmt(lock)} away). Review and click again.",
+            return {"ok": False, "error": f"Price moved: entry is now {f(now.limit)} (ticket showed "
+                    f"{f(exp_limit)}, more than {f(lock)} away). Review and click again.",
                     "plan": now.as_dict()}
         # After a move in favour the fill comes nearer the stop: keep the minimum stop distance
         # from where it would fill now, not from the displayed price.
-        room = now.limit - p.stop if long else p.stop - now.limit
-        if room < MIN_STOP_TICKS * tick(now.limit):
-            return {"ok": False, "error": f"Price is within {MIN_STOP_TICKS} ticks of the stop {fmt(p.stop)}. "
+        room = (now.limit - p.stop if long else p.stop - now.limit) if p.stop else None
+        if room is not None and room < MIN_STOP_TICKS * tick(now.limit, p.ticks):
+            return {"ok": False, "error": f"Price is within {MIN_STOP_TICKS} ticks of the stop {f(p.stop)}. "
+                    "Review and click again.", "plan": now.as_dict()}
+        if p.size_mode == "qty" and p.qty != exp_qty:
+            return {"ok": False, "error": f"The ticket now says {p.qty} {unit_w} (it showed {exp_qty}). "
                     "Review and click again.", "plan": now.as_dict()}
         if p.qty < exp_qty:
-            return {"ok": False, "error": f"Size changed to {p.qty} shares (ticket showed {exp_qty}). "
+            return {"ok": False, "error": f"Size changed to {p.qty} {unit_w} (ticket showed {exp_qty}). "
                     "Review and click again.", "plan": now.as_dict()}
-        # Never more shares than displayed; recompute the numbers for that size.
+        if not p.has_stop and not req.get("confirm_no_stop"):
+            # The page asks "Send without a stop?" on every click; a request without that answer is refused.
+            return {"ok": False, "error": "Sending without a stop needs your confirmation. Click again and confirm.",
+                    "plan": now.as_dict()}
+        # Never more shares (contracts) than displayed; recompute the numbers for that size.
         p.qty = exp_qty
-        p.planned_risk = p.per_share * p.qty
-        p.notional = p.limit * p.qty
+        p.planned_risk = p.per_share * p.qty * p.multiplier
+        p.notional = p.limit * p.qty * p.multiplier
         # Same entry price and inputs give the same targets; a difference means the ticket's
         # inputs changed after it was displayed.
-        if p.target != exp_target:
-            return {"ok": False, "error": f"Target is now {fmt(p.target)} (ticket showed {fmt(exp_target)}). "
+        if not p.has_target and exp_target:
+            return {"ok": False, "error": "Ticket showed a target but the plan has none. Review.", "plan": now.as_dict()}
+        if p.has_target and p.target != exp_target:
+            return {"ok": False, "error": f"Target is now {f(p.target)} (ticket showed {f(exp_target) if exp_target else 'none'}). "
                     "Review and click again.", "plan": now.as_dict()}
         if p.two_targets:
             p.qty1 = int((p.qty * p.split).to_integral_value(rounding=ROUND_FLOOR))
             exp_qty1 = int(req.get("expected_qty1") or 0)
             exp_t1 = Decimal(str(req.get("expected_target1") or 0))
             if p.qty1 != exp_qty1 or p.qty1 < 1 or p.qty - p.qty1 < 1:
-                return {"ok": False, "error": f"Split changed to {p.qty1}/{p.qty - p.qty1} shares. "
+                return {"ok": False, "error": f"Split changed to {p.qty1}/{p.qty - p.qty1} {unit_w}. "
                         "Review and click again.", "plan": now.as_dict()}
             if p.target1 != exp_t1:
-                return {"ok": False, "error": f"Target 1 is now {fmt(p.target1)}. Review and click again.",
+                return {"ok": False, "error": f"Target 1 is now {f(p.target1)}. Review and click again.",
                         "plan": now.as_dict()}
         elif req.get("expected_qty1"):
             return {"ok": False, "error": "Ticket showed two targets but the plan has one. Review.",
@@ -405,17 +625,26 @@ class Trader:
                         "plan": now.as_dict()}
             looser = exp_start - p.trail_start if long else p.trail_start - exp_start
             if looser > lock:
-                return {"ok": False, "error": f"The trail would now start at {fmt(p.trail_start)} (ticket showed "
-                        f"{fmt(exp_start)}). Review and click again.", "plan": now.as_dict()}
+                return {"ok": False, "error": f"The trail would now start at {f(p.trail_start)} (ticket showed "
+                        f"{f(exp_start)}). Review and click again.", "plan": now.as_dict()}
         elif req.get("expected_trail_offset"):
             return {"ok": False, "error": "Ticket showed a trailing stop but the plan has a fixed one. Review.",
                     "plan": p.as_dict()}
         order = bracket_order(p)
+        if p.option and p.trail:
+            # Schwab does not document trailing stops on options: its preview decides first.
+            refused = self._preview_refusal(self._ensure(), order)
+            if refused:
+                rejected, why = refused
+                head = (f"Schwab does not accept a trailing stop on this option: {why}" if rejected else
+                        f"Schwab's preview did not confirm the trailing stop ({why})")
+                return {"ok": False, "error": head.rstrip(".") + ". Nothing was sent: use a fixed stop or Auto B/E.",
+                        "plan": now.as_dict()}
         intent = {"ticket_id": ticket_id, "symbol": p.symbol, "side": p.side, "qty": p.qty,
-                  "limit": fmt(p.limit), "stop": fmt(p.stop), "target": fmt(p.target),
+                  "limit": f(p.limit), "stop": f(p.stop) if p.stop else "", "target": f(p.target) if p.has_target else "",
                   "risk": float(p.planned_risk), "request": order}
         if p.stop_type == "autobe":
-            self.store.add_auto_be(ticket_id, p.symbol)     # Simon's consent for one stop move
+            self.store.add_auto_be(ticket_id, p.symbol)     # the user's consent for one stop move
         if not self.store.insert_ticket(intent):
             return {"ok": False, "error": "This ticket was already sent. Check thinkorswim."}
         log.warning("PLACE %s %s %s @ %s stop %s target %s", p.side, p.qty, p.symbol, p.limit,
@@ -657,17 +886,74 @@ class Trader:
         finally:
             self._send_lock.release()
 
-    def _position(self, client, symbol: str) -> tuple[float, str | None]:
+    def _positions(self, client) -> list[dict]:
         r = self._logged("account_details", lambda: client.account_details(self._hash, fields="positions"))
         r.raise_for_status()
-        for p in ((r.json() or {}).get("securitiesAccount") or {}).get("positions") or []:
+        return ((r.json() or {}).get("securitiesAccount") or {}).get("positions") or []
+
+    def _position(self, client, symbol: str, positions: list[dict] | None = None) -> tuple[float, str | None]:
+        for p in self._positions(client) if positions is None else positions:
             ins = p.get("instrument") or {}
             if ins.get("symbol") == symbol:
                 return (float(p.get("longQuantity") or 0) - float(p.get("shortQuantity") or 0),
                         ins.get("assetType"))
         return 0.0, None
 
-    def close_position(self, symbol: str, orders: list[dict], known_terminal: set[int]) -> dict:
+    @staticmethod
+    def _leg_risk(symbol: str, qty: float, asset: str | None, positions: list[dict],
+                  mixed: list[int]) -> str | None:
+        """Why closing (part of) this position may split a spread or uncover a short, or None.
+        An option leg is suspect when the account also holds the opposite side of the same type
+        (call or put) on the same underlying: closing the long leaves that short uncovered,
+        closing the short leaves the long alone. Long shares are suspect next to short calls
+        (covered calls), short shares next to short puts. A working multi-leg order on the
+        contract is suspect too. Positions alone cannot prove a pairing, so this asks, it never
+        decides; the close itself is still one order on this symbol only."""
+        def net(p):
+            return float(p.get("longQuantity") or 0) - float(p.get("shortQuantity") or 0)
+
+        def same(a, b):          # unknown on either side counts as a match: ask rather than miss
+            return a is None or b is None or a == b
+
+        me = next((p.get("instrument") or {} for p in positions
+                   if (p.get("instrument") or {}).get("symbol") == symbol), {"symbol": symbol})
+        if asset == "OPTION":
+            und, pc = _option_id(me)
+        else:
+            und, pc = symbol.upper().lstrip("$"), None
+        others = []
+        for p in positions:
+            ins = p.get("instrument") or {}
+            n = net(p)
+            if ins.get("symbol") == symbol or ins.get("assetType") != "OPTION" or abs(n) < 1e-9:
+                continue
+            o_und, o_pc = _option_id(ins)
+            if not same(o_und, und):
+                continue
+            if asset == "OPTION":
+                hit = same(o_pc, pc) and (n > 0) != (qty > 0)
+            elif asset == "EQUITY":
+                hit = n < 0 and same(o_pc, "CALL" if qty > 0 else "PUT")
+            else:
+                hit = False
+            if hit:
+                others.append((ins.get("symbol"), n))
+        if not others and not mixed:
+            return None
+        held = ", ".join(f"{'LONG' if n > 0 else 'SHORT'} {abs(n):g} {s}" for s, n in others)
+        if others and (asset == "EQUITY" or qty > 0) and any(n < 0 for _, n in others):
+            why = f"You also hold {held}: closing {symbol} can leave that short UNCOVERED."
+        elif others:
+            why = f"You also hold {held}: this looks like one leg of a spread, closing it leaves the other leg alone."
+        else:
+            why = ""
+        if mixed:
+            why = (why + " " if why else "") + (f"{len(mixed)} working multi-leg order(s) include {symbol} "
+                                                "(a spread order): Schwab may cancel or split them.")
+        return why
+
+    def close_position(self, symbol: str, orders: list[dict], known_terminal: set[int],
+                       confirm_leg: bool = False) -> dict:
         """One market order for the whole position. Schwab cancels the symbol's other working
         orders (stop, target) itself when it enters (previewOrder warning, 2026-10-22), the way
         thinkorswim's Flatten works; the companion checks afterwards and cleans up anything left."""
@@ -677,7 +963,7 @@ class Trader:
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
-            return self._close_locked(symbol, orders, known_terminal)
+            return self._close_locked(symbol, orders, known_terminal, confirm_leg)
         except Exception as e:
             log.exception("close failed")
             return {"ok": False, "symbol": symbol, "error": f"Close failed: {e}. Check thinkorswim."[:300]}
@@ -726,12 +1012,38 @@ class Trader:
         """the user checked thinkorswim after an unclear close or partial; allow orders again."""
         self.store.log_action("close", symbol.upper().strip(), None, "RESOLVED_MANUALLY", "resolved by the user")
 
-    def _close_locked(self, symbol: str, orders: list[dict], known_terminal: set[int]) -> dict:
+    def _guard_leg(self, symbol: str, qty: float, asset: str | None, positions: list[dict],
+                   orders: list[dict], known_terminal: set[int]) -> dict | None:
+        """Refuse (until the user confirms) a close or partial that may split a spread or uncover a
+        short. `orders` should be a fresh read for an option (working multi-leg orders on it).
+        A spread order still on its way out (PENDING_CANCEL / PENDING_REPLACE) counts: it can fill."""
+        terminal = terminal_ids(orders) | known_terminal
+        mixed: list[int] = []
+
+        def visit(node) -> None:
+            syms = {(leg.get("instrument") or {}).get("symbol") for leg in node.get("orderLegCollection") or []}
+            if (symbol in syms and syms - {symbol} and node.get("orderId") not in terminal
+                    and node.get("status") in LIVE | {"PENDING_CANCEL", "PENDING_REPLACE"}):
+                mixed.append(node.get("orderId"))
+            for ch in node.get("childOrderStrategies") or []:
+                visit(ch)
+
+        for o in orders:
+            visit(o)
+        why = self._leg_risk(symbol, qty, asset, positions, mixed)
+        if not why:
+            return None
+        log.warning("LEG GUARD %s: %s", symbol, why)
+        return {"ok": False, "symbol": symbol, "needs_confirm": True, "error": why + " Nothing was sent."}
+
+    def _close_locked(self, symbol: str, orders: list[dict], known_terminal: set[int],
+                      confirm_leg: bool = False) -> dict:
         client = self._ensure()
         blocked = self._blocked(symbol, client)
         if blocked:
             return blocked
-        qty, asset = self._position(client, symbol)
+        positions = self._positions(client)
+        qty, asset = self._position(client, symbol, positions)
         if abs(qty) < 1e-9:
             # Flat already: just make sure nothing is left working for the symbol.
             res = self._cancel_fast(client, symbol, self._fresh_orders(client, orders), known_terminal)
@@ -743,6 +1055,12 @@ class Trader:
                  ("OPTION", True): "SELL_TO_CLOSE", ("OPTION", False): "BUY_TO_CLOSE"}.get((asset, qty > 0))
         if not instr:
             return {"ok": False, "symbol": symbol, "error": f"Cannot close a {asset} position here."}
+        if not confirm_leg:
+            # Spread orders hold options: read them fresh only then, so a stock close stays as fast.
+            seen = self._fresh_orders(client, orders) if asset == "OPTION" else orders
+            guard = self._guard_leg(symbol, qty, asset, positions, seen, known_terminal)
+            if guard:
+                return guard
         size = abs(qty)
         order = {"orderStrategyType": "SINGLE", "orderType": "MARKET", "session": "NORMAL",
                  "duration": "DAY",
@@ -845,7 +1163,6 @@ class Trader:
         created, no trail rebuilt, and a stop that is already at or past the new price (checked on
         the final read of each stop) is left alone."""
         from .bracket import _to_tick
-        from decimal import ROUND_HALF_UP
         client = self._ensure()
         blocked = self._blocked(symbol, client)
         if blocked:
@@ -856,16 +1173,24 @@ class Trader:
         side = "LONG" if qty > 0 else "SHORT"
         if only and side != only:
             return {"ok": False, "symbol": symbol, "error": f"The position is {side} now, not {only}. Not moved."}
-        price = Decimal(str(new_stop))
-        price = _to_tick(price, ROUND_HALF_UP)
         q = self.quote(symbol, max_age=0)
+        tk = self._ticks(symbol, asset, q)
+        unit, us = _units(asset)
+
+        def f(v) -> str:
+            return fmt(v, tk)
+        price = Decimal(str(new_stop))
+        # An off-grid stop goes to the tighter tick, never the looser one (long up, short down).
+        price = _to_tick(price, ROUND_CEILING if side == "LONG" else ROUND_FLOOR, tk)
+        if price <= 0:
+            return {"ok": False, "symbol": symbol, "error": "Enter a stop price above 0."}
         bid, ask = Decimal(str(q.get("bid") or 0)), Decimal(str(q.get("ask") or 0))
         if side == "LONG" and bid and price >= bid:
             return {"ok": False, "symbol": symbol,
-                    "error": f"Stop {fmt(price)} is at or above the bid {fmt(bid)}: it would trigger now. Not moved."}
+                    "error": f"Stop {f(price)} is at or above the bid {f(bid)}: it would trigger now. Not moved."}
         if side == "SHORT" and ask and price <= ask:
             return {"ok": False, "symbol": symbol,
-                    "error": f"Stop {fmt(price)} is at or below the ask {fmt(ask)}: it would trigger now. Not moved."}
+                    "error": f"Stop {f(price)} is at or below the ask {f(ask)}: it would trigger now. Not moved."}
         fresh = self._fresh_orders(client, orders)
         terminal = terminal_ids(fresh) | known_terminal
         from .orders import pending_orders
@@ -885,7 +1210,7 @@ class Trader:
                 return {"ok": False, "symbol": symbol,
                         "error": f"{symbol} has other working orders that Schwab would cancel. Do this in thinkorswim."}
             _, target = self._exit_plan(pend, symbol, side, 0)
-            self.store.log_action("move_stop", symbol, None, "SENDING", f"trailing -> fixed {fmt(price)}")
+            self.store.log_action("move_stop", symbol, None, "SENDING", f"trailing -> fixed {f(price)}")
             return self._create_stop(client, symbol, side, abs(qty), asset, price, [], set(),
                                      target=Decimal(str(target)) if target is not None else None, rebuild=True)
         had_oco = any(p.oco_id is not None for p in stops)
@@ -904,13 +1229,13 @@ class Trader:
                     results.append({"order_id": p.order_id, "ok": False, "note": f"it is a {cur.get('orderType')} order now"})
                     continue
                 if was >= price if side == "LONG" else was <= price:
-                    results.append({"order_id": p.order_id, "ok": False, "note": f"already at {fmt(was)}, not loosened"})
+                    results.append({"order_id": p.order_id, "ok": False, "note": f"already at {f(was)}, not loosened"})
                     continue
             legs = cur.get("orderLegCollection") or []
             body = {
                 "orderStrategyType": "SINGLE", "orderType": cur.get("orderType", "STOP"),
                 "session": cur.get("session", "NORMAL"), "duration": cur.get("duration", "DAY"),
-                "stopPrice": fmt(price),
+                "stopPrice": f(price),
                 "orderLegCollection": [{"instruction": l.get("instruction"),
                                         "quantity": int(l.get("quantity")) if float(l.get("quantity") or 0).is_integer()
                                         else l.get("quantity"),
@@ -921,7 +1246,7 @@ class Trader:
             if cur.get("orderType") == "STOP_LIMIT" and cur.get("price") is not None:
                 body["price"] = cur.get("price")
             self.store.log_action("move_stop", symbol, p.order_id, "SENDING",
-                                  f"{fmt(Decimal(str(cur.get('stopPrice') or 0)))} -> {fmt(price)}")
+                                  f"{f(Decimal(str(cur.get('stopPrice') or 0)))} -> {f(price)}")
             try:
                 rr = self._logged("replace_order", lambda o=p.order_id, b=body: client.replace_order(self._hash, o, b))
             except Exception as e:
@@ -948,10 +1273,10 @@ class Trader:
         oco_kept = (not had_oco) or (bool(at_new) and all(p.oco_id is not None for p in at_new))
         covered = sum(p.qty for p in at_new)
         tq = sum(p.qty for p in live_targets)
-        notes = [f"Stop moved to {fmt(price)} on {covered:g} of {abs(qty):g} shares."]
+        notes = [f"Stop moved to {f(price)} on {covered:g} of {abs(qty):g} {unit}."]
         if had_oco:
             if live_targets and oco_kept:
-                notes.append(f"OCO kept: target(s) still working ({tq:g} sh) and linked to the stop.")
+                notes.append(f"OCO kept: target(s) still working ({tq:g} {us}) and linked to the stop.")
             elif live_targets:
                 notes.append("WARNING: the new stop is NOT linked to the target (OCO broken): fix in thinkorswim.")
             else:
@@ -965,20 +1290,21 @@ class Trader:
               and (bool(live_targets) or not had_targets))
         self.store.log_action("move_stop", symbol, None, "DONE" if ok else "CHECK",
                               " ".join(notes)[:900])
-        return {"ok": ok, "symbol": symbol, "stop": fmt(price), "moved": moved, "of": len(stops),
+        return {"ok": ok, "symbol": symbol, "stop": f(price), "moved": moved, "of": len(stops),
                 "oco_kept": oco_kept, "message": " ".join(notes), "error": None if ok else " ".join(notes)}
 
     # ---- auto B/E: the ticket's one stop move at +1R ------------------------------------------
 
     def auto_breakeven(self, ticket_id: str, symbol: str, side: str, entry: float,
                        orders: list[dict], known_terminal: set[int]) -> dict:
-        """Move the stop to break-even once, for a ticket sent with Auto B/E (Simon's consent for
+        """Move the stop to break-even once, for a ticket sent with Auto B/E (the user's consent for
         this one move). The poller calls it after claiming the ticket (PENDING -> SENDING), so it
         never runs twice. Only "another action holds the lock" or "market closed" put it back to
         PENDING (nothing was sent); every other outcome is final, never retried."""
         symbol = symbol.upper().strip()
         long = side == "LONG"
         be = _to_tick(Decimal(str(entry)), ROUND_CEILING if long else ROUND_FLOOR)   # never below entry
+        tk = EQUITY
 
         def done(state: str, text: str, ok: bool = False) -> dict:
             self.store.set_auto_be(ticket_id, state, text)
@@ -993,19 +1319,18 @@ class Trader:
             return {"ok": False, "state": "PENDING"}
         try:
             client = self._ensure()
-            qty, _ = self._position(client, symbol)
+            qty, asset = self._position(client, symbol)
             if abs(qty) < 1e-9 or (qty > 0) != long:
                 return done("SKIPPED", f"no {side.lower()} {symbol} position any more")
+            if asset == "OPTION":          # an option's B/E must sit on its own price grid
+                tk = self._ticks(symbol, asset)
+                be = _to_tick(Decimal(str(entry)), ROUND_CEILING if long else ROUND_FLOOR, tk)
             fresh = self._fresh_orders(client, orders)
             terminal = terminal_ids(fresh) | known_terminal
-            # Only stops inside this ticket's own order tree (Schwab keeps a replaced stop there):
-            # a re-entry or a stop rebuilt in a new OCO is not what Simon consented to move.
+            # Only stops inside this ticket's own order tree (Schwab keeps a replaced stop there),
+            # or in an exit OCO the companion itself rebuilt for it (new target, partial, set
+            # stop): a re-entry or a stop rebuilt in thinkorswim is not what the user consented to move.
             t = self.store.get_ticket(ticket_id) or {}
-            tree = self._find_in(fresh, t["order_id"]) if t.get("order_id") else None
-            for _ in range(10):
-                if not tree or tree.get("status") != "REPLACED":
-                    break
-                tree = _replacement(tree, fresh)
             allowed: set[int] = set()
 
             def walk(o):
@@ -1013,8 +1338,46 @@ class Trader:
                     allowed.add(o["orderId"])
                 for ch in o.get("childOrderStrategies") or []:
                     walk(ch)
-            if tree:
-                walk(tree)
+            roots = ([t["order_id"]] if t.get("order_id") else []) + self.store.auto_be_orders(ticket_id)
+            first_fill = ""
+            for i, oid in enumerate(roots):
+                tree = self._find_in(fresh, oid)
+                for _ in range(10):
+                    if not tree or tree.get("status") != "REPLACED":
+                        break
+                    tree = _replacement(tree, fresh)
+                if tree:
+                    walk(tree)
+                    if i == 0 and t.get("order_id"):
+                        first_fill = min(_fill_times(tree), default="")
+            # The position must still be the one the ticket opened: an entry fill on the symbol
+            # from any other order since (an add, or a close and re-entry in thinkorswim) means
+            # the user's consent no longer covers it. Unknown fill time: all of today's fills count.
+            # Older GTC entries come from the poller's sweep and can be up to a sweep old: re-read
+            # every entry on the symbol that still looks open (usually none) before trusting it.
+            # Every node counts: an entry can sit inside an older OCO or TRIGGER group.
+            open_entries: list[int] = []
+
+            def entries(o):
+                legs = o.get("orderLegCollection") or []
+                if (o.get("orderId") is not None and o.get("orderId") not in allowed and o.get("status") in LIVE
+                        and any((l.get("instrument") or {}).get("symbol") == symbol
+                                and l.get("instruction") in _ENTRY_INSTR[side] for l in legs)):
+                    open_entries.append(o["orderId"])
+                for ch in o.get("childOrderStrategies") or []:
+                    entries(ch)
+            for o in fresh:
+                entries(o)
+            reread = []
+            for oid in dict.fromkeys(open_entries):
+                rr = self._logged("order_details", lambda o=oid: client.order_details(self._hash, o))
+                if rr.status_code != 200:
+                    return done("SKIPPED", f"could not re-read entry order {oid} on {symbol}: left as it is")
+                reread.append(rr.json() or {})
+            foreign = _foreign_entry(fresh + reread, symbol, side, first_fill, allowed)
+            if foreign:
+                return done("SKIPPED", f"the position was added to or re-entered by order {foreign} "
+                                       "after this ticket's fill: left as it is")
             stops = [p for p in pending_orders(fresh, terminal)
                      if p.symbol == symbol and p.role == "STOP" and p.live and p.exits(side)]
             if not stops:
@@ -1027,10 +1390,10 @@ class Trader:
             past = [p for p in stops if p.stop is not None
                     and (Decimal(str(p.stop)) >= be if long else Decimal(str(p.stop)) <= be)]
             if len(past) == len(stops):
-                return done("DONE", f"stop already at or past B/E {fmt(be)}", ok=True)
+                return done("DONE", f"stop already at or past B/E {fmt(be, tk)}", ok=True)
             if past:
-                return done("SKIPPED", f"a stop is already past B/E {fmt(be)}: moving all would loosen it")
-            self.store.log_action("auto_be", symbol, None, "SENDING", f"+1R touched: stop to B/E {fmt(be)}")
+                return done("SKIPPED", f"a stop is already past B/E {fmt(be, tk)}: moving all would loosen it")
+            self.store.log_action("auto_be", symbol, None, "SENDING", f"+1R touched: stop to B/E {fmt(be, tk)}")
             r = self._move_stop_locked(symbol, be, fresh, terminal, only=side, allowed=allowed)
             return done("DONE" if r["ok"] else "FAILED",
                         (r.get("message") or r.get("error") or "")[:900], ok=r["ok"])
@@ -1080,16 +1443,19 @@ class Trader:
         qty, asset = self._position(client, symbol)
         if abs(qty) < 1e-9:
             return {"ok": False, "symbol": symbol, "error": f"No open {symbol} position."}
-        if asset != "EQUITY":
-            return {"ok": False, "symbol": symbol, "error": "Trailing stops here are for stocks only."}
+        if asset not in ("EQUITY", "OPTION"):
+            return {"ok": False, "symbol": symbol, "error": f"Trailing stops are not available for a {asset} position here."}
         side = "LONG" if qty > 0 else "SHORT"
+        q = self.quote(symbol, max_age=0)
+        tk = self._ticks(symbol, asset, q)
+        unit_w, us = _units(asset)
         rps = None
         if (unit or "").upper() == "R":
             if not rbasis or rbasis.get("side") != side or not rbasis.get("rps"):
                 return {"ok": False, "symbol": symbol,
                         "error": "A trail in R needs the frozen 1R of a companion entry. Use $ or %."}
             rps = Decimal(str(rbasis["rps"]))
-        spec, err = trail_spec(unit, value, rps, basis)
+        spec, err = trail_spec(unit, value, rps, basis, tk)
         if err:
             return {"ok": False, "symbol": symbol, "error": err}
         fresh = self._fresh_orders(client, orders)
@@ -1102,21 +1468,26 @@ class Trader:
         stop, target = self._exit_plan(pend, symbol, side, 0)
         if stop is None and prior_trail_level is not None:
             stop = prior_trail_level          # changing a trail: compare with where it has reached
-        q = self.quote(symbol, max_age=0)
         ref = Decimal(str(_basis_price(q, spec["basis"]) or 0))
-        start = trail_level(ref, spec, side) if ref else None
+        start = trail_level(ref, spec, side, tk) if ref else None
         looser = (start is not None and stop is not None
                   and (start < Decimal(str(stop)) if side == "LONG" else start > Decimal(str(stop))))
-        note = (f" It starts about {fmt(start)}, looser than your stop {fmt(Decimal(str(stop)))} by "
-                f"{fmt(abs(start - Decimal(str(stop))))}/sh." if looser else "")
+        note = (f" It starts about {fmt(start, tk)}, looser than your stop {fmt(Decimal(str(stop)), tk)} by "
+                f"{fmt(abs(start - Decimal(str(stop))), tk)}/{us}." if looser else "")
         self.store.log_action("trail", symbol, None, "SENDING",
-                              f"{_trail_txt(spec)}, {abs(qty):g} sh" + (f", start ~{fmt(start)}" if start else ""))
+                              f"{_trail_txt(spec)}, {abs(qty):g} {us}" + (f", start ~{fmt(start, tk)}" if start else ""))
+        # Schwab's API has no documented answer on trailing stops for options: ask its preview
+        # first and send nothing it would refuse (the working stop and target stay as they are).
         res = self._create_stop(client, symbol, side, abs(qty), asset, None, [], set(),
-                                target=Decimal(str(target)) if target is not None else None, rebuild=True, trail=spec)
+                                target=Decimal(str(target)) if target is not None else None, rebuild=True, trail=spec,
+                                preview=asset == "OPTION")
+        if res.get("not_sent"):
+            self.store.log_action("trail", symbol, None, "REJECTED", res["error"])
+            return {"ok": False, "symbol": symbol, "error": res["error"]}
         msg = (res.get("message") or res.get("error") or "Not confirmed: check thinkorswim.") + note
         self.store.log_action("trail", symbol, None, "DONE" if res.get("ok") else "CHECK", msg)
         return {"ok": bool(res.get("ok")), "symbol": symbol, "message": msg, "looser": looser,
-                "start": fmt(start) if start else None, "error": None if res.get("ok") else msg}
+                "start": fmt(start, tk) if start else None, "error": None if res.get("ok") else msg}
 
     # ---- set target (price or R) -----------------------------------------------------------
 
@@ -1130,11 +1501,12 @@ class Trader:
         ref = _basis_price(q, trail["basis"])
         if not ref:
             return " The trail restarts from the current price."
-        start = trail_level(Decimal(str(ref)), trail, side)
+        tk = q.get("ticks") or EQUITY
+        start = trail_level(Decimal(str(ref)), trail, side, tk)
         prior = Decimal(str(prior_level))
         looser = start < prior if side == "LONG" else start > prior
-        return (f" The trail restarts about {fmt(start)}, looser than the ~{fmt(prior)} it had reached."
-                if looser else f" The trail restarts about {fmt(start)}.")
+        return (f" The trail restarts about {fmt(start, tk)}, looser than the ~{fmt(prior, tk)} it had reached."
+                if looser else f" The trail restarts about {fmt(start, tk)}.")
 
     def set_target(self, symbol: str, price, r_mult, orders: list[dict], known_terminal: set[int],
                    basis: dict | None, prior_trail_level=None) -> dict:
@@ -1166,6 +1538,12 @@ class Trader:
         if abs(qty) < 1e-9:
             return {"ok": False, "symbol": symbol, "error": f"No open {symbol} position."}
         side = "LONG" if qty > 0 else "SHORT"
+        q = self.quote(symbol, max_age=0)
+        tk = self._ticks(symbol, asset, q)
+        unit_w, us = _units(asset)
+
+        def f(v) -> str:
+            return fmt(v, tk)
         if r_mult:
             b = basis
             if not b or b.get("side") != side or not b.get("rps"):
@@ -1173,17 +1551,21 @@ class Trader:
                         "error": "R needs the entry and original stop of a companion ticket. Type a price instead."}
             move = Decimal(str(b["rps"])) * Decimal(str(r_mult))
             raw = Decimal(str(b["entry"])) + (move if side == "LONG" else -move)
-            target = _to_tick(raw, ROUND_FLOOR if side == "LONG" else ROUND_CEILING)
+            target = _to_tick(raw, ROUND_FLOOR if side == "LONG" else ROUND_CEILING, tk)
         else:
             try:
-                target = _to_tick(Decimal(str(price)), ROUND_HALF_UP)
+                target = Decimal(str(price))
+                on_grid = target.is_finite() and target > 0 and _to_tick(target, ROUND_HALF_UP, tk) == target
             except Exception:
                 return {"ok": False, "symbol": symbol, "error": "Enter a target price."}
-        q = self.quote(symbol, max_age=0)
+            if not on_grid:       # a typed price is sent as typed or not at all, like the ticket
+                return {"ok": False, "symbol": symbol,
+                        "error": f"Target must be a valid price in "
+                                 f"{f(tick(target if target.is_finite() and target > 0 else Decimal(1), tk))} steps."}
         bid, ask = Decimal(str(q.get("bid") or 0)), Decimal(str(q.get("ask") or 0))
         if target <= 0 or (side == "LONG" and ask and target <= ask) or (side == "SHORT" and bid and target >= bid):
             return {"ok": False, "symbol": symbol,
-                    "error": f"Target {fmt(target)} is at or through the market ({fmt(bid)} / {fmt(ask)}): "
+                    "error": f"Target {f(target)} is at or through the market ({f(bid)} / {f(ask)}): "
                              "it would fill now. Use a partial or Close instead."}
         fresh = self._fresh_orders(client, orders)
         pend = pending_orders(fresh, terminal_ids(fresh) | known_terminal)
@@ -1194,16 +1576,17 @@ class Trader:
                              "Set this target in thinkorswim."}
         stop, _ = self._exit_plan(pend, symbol, side, 0)
         trail = self._trail_of(pend, symbol, side)
-        label = f"{r_mult:g}R = {fmt(target)}" if r_mult else fmt(target)
+        label = f"{r_mult:g}R = {f(target)}" if r_mult else f(target)
         if trail:
             self.store.log_action("set_target", symbol, None, "SENDING", f"target {label} + {_trail_txt(trail)}")
             res = self._create_stop(client, symbol, side, abs(qty), asset, None, [], set(), target=target,
                                     rebuild=True, trail=trail)
-            msg = ((f"Target set at {label} with the trailing stop ({_trail_txt(trail)}) as one OCO."
+            msg = (res["message"] if res.get("closed") else
+                   (f"Target set at {label} with the trailing stop ({_trail_txt(trail)}) as one OCO."
                     if res.get("ok") else res.get("error") or res.get("message") or "Not confirmed: check thinkorswim.")
                    + self._restart_note(symbol, side, trail, prior_trail_level))
             self.store.log_action("set_target", symbol, None, "DONE" if res.get("ok") else "CHECK", msg)
-            return {"ok": bool(res.get("ok")), "symbol": symbol, "target": fmt(target), "message": msg,
+            return {"ok": bool(res.get("ok")), "symbol": symbol, "target": f(target), "message": msg,
                     "error": None if res.get("ok") else msg}
         if stop is None:
             # No stop to pair it with: a lone target (the row keeps showing NO STOP SEEN).
@@ -1212,24 +1595,25 @@ class Trader:
             self.store.log_action("set_target", symbol, None, "SENDING", f"target {label}, no stop")
             r = self._place_exit(client, symbol, instr, asset, int(abs(qty)), target)
             ok = r.status_code in (200, 201)
-            msg = (f"Target set at {label} for {abs(qty):g} shares. WARNING: there is no stop: use Stop to B/E "
+            msg = (f"Target set at {label} for {abs(qty):g} {unit_w}. WARNING: there is no stop: use Stop to B/E "
                    "or Move stop." if ok else f"Schwab refused the target (HTTP {r.status_code}): {r.text[:150]}")
             self.store.log_action("set_target", symbol, None, "DONE" if ok else "REJECTED", msg)
             return {"ok": ok, "symbol": symbol, "message": msg, "error": None if ok else msg}
-        self.store.log_action("set_target", symbol, None, "SENDING", f"target {label} + stop {stop}, {abs(qty):g} sh")
+        self.store.log_action("set_target", symbol, None, "SENDING", f"target {label} + stop {stop}, {abs(qty):g} {us}")
         res = self._create_stop(client, symbol, side, abs(qty), asset, Decimal(str(stop)), [], set(),
                                 target=target, rebuild=True)
-        msg = (f"Target set at {label} with stop {stop} for {abs(qty):g} shares as one OCO."
+        msg = (res["message"] if res.get("closed") else
+               f"Target set at {label} with stop {stop} for {abs(qty):g} {unit_w} as one OCO." + res.get("note", "")
                if res.get("ok") else res.get("error") or res.get("message") or "Not confirmed: check thinkorswim.")
         self.store.log_action("set_target", symbol, None, "DONE" if res.get("ok") else "CHECK", msg)
-        return {"ok": bool(res.get("ok")), "symbol": symbol, "target": fmt(target), "message": msg,
+        return {"ok": bool(res.get("ok")), "symbol": symbol, "target": f(target), "message": msg,
                 "error": None if res.get("ok") else msg}
 
     # ---- partials --------------------------------------------------------------------------
 
     def take_partial(self, symbol: str, pct: float | None, shares: float | None,
                      orders: list[dict], known_terminal: set[int], mode: str = "mid",
-                     prior_trail_level=None) -> dict:
+                     prior_trail_level=None, confirm_leg: bool = False) -> dict:
         """Sell (or cover) part of the position at market, then put the stop and target back on
         the shares that are left, at the same prices, as one OCO.
 
@@ -1243,7 +1627,8 @@ class Trader:
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
             return self._partial_locked(symbol, pct, shares, orders, known_terminal,
-                                        mode if mode in ("mid", "market", "ask", "bid") else "mid", prior_trail_level)
+                                        mode if mode in ("mid", "market", "ask", "bid") else "mid", prior_trail_level,
+                                        confirm_leg)
         except Exception as e:
             log.exception("partial failed")
             return {"ok": False, "symbol": symbol,
@@ -1298,7 +1683,7 @@ class Trader:
                  "orderLegCollection": [{"instruction": instr, "quantity": n,
                                          "instrument": {"symbol": symbol, "assetType": asset}}]}
         if price:
-            order["price"] = fmt(price)
+            order["price"] = fmt(price, ticks_for(asset))
         return self._logged("place_order", lambda: client.place_order(self._hash, order))
 
     def _send_partial(self, client, symbol: str, instr: str, asset: str, n: int, mode: str) -> dict:
@@ -1311,16 +1696,18 @@ class Trader:
         selling = instr.startswith("SELL")
         price = None
         where = mode
+        tk = ticks_for(asset)
         if mode in ("mid", "ask", "bid"):
             q = self.quote(symbol, max_age=0)
+            tk = self._ticks(symbol, asset, q)
             bid, ask = Decimal(str(q.get("bid") or 0)), Decimal(str(q.get("ask") or 0))
-            if mode == "mid" and bid > 0 and ask > bid + tick(bid):
-                price = _to_tick((bid + ask) / 2, ROUND_FLOOR if selling else "ROUND_CEILING")
+            if mode == "mid" and bid > 0 and ask > bid + tick(bid, tk):
+                price = _to_tick((bid + ask) / 2, ROUND_FLOOR if selling else "ROUND_CEILING", tk)
             elif mode == "bid" and bid > 0:
-                price = _to_tick(bid, ROUND_FLOOR)          # literal bid (takes for a sell, rests for a cover)
+                price = _to_tick(bid, ROUND_FLOOR, tk)          # literal bid (takes for a sell, rests for a cover)
             elif mode == "ask" and ask > 0:
-                price = _to_tick(ask, "ROUND_CEILING")      # literal ask (rests for a sell, takes for a cover)
-        how = f"limit {fmt(price)} at the {where}" if price else "market"
+                price = _to_tick(ask, "ROUND_CEILING", tk)      # literal ask (rests for a sell, takes for a cover)
+        how = f"limit {fmt(price, tk)} at the {where}" if price else "market"
         uncertain_rest = False
         self.store.log_action("partial", symbol, None, "SENDING", f"{instr} {n} {how}")
         log.warning("PARTIAL %s %s %s %s", instr, n, symbol, how)
@@ -1392,30 +1779,37 @@ class Trader:
         return {"filled": filled, "avg": avg, "how": how}
 
     def _partial_locked(self, symbol: str, pct, shares, orders: list[dict], known_terminal: set[int],
-                        mode: str = "mid", prior_trail_level=None) -> dict:
+                        mode: str = "mid", prior_trail_level=None, confirm_leg: bool = False) -> dict:
         from .orders import pending_orders
         client = self._ensure()
         blocked = self._blocked(symbol, client)
         if blocked:
             return blocked
-        qty, asset = self._position(client, symbol)
+        positions = self._positions(client)
+        qty, asset = self._position(client, symbol, positions)
         if abs(qty) < 1e-9:
             return {"ok": False, "symbol": symbol, "error": f"No open {symbol} position."}
         side = "LONG" if qty > 0 else "SHORT"
         size = abs(qty)
+        unit_w, _ = _units(asset)
+        one = unit_w[:-1]
         if shares:
             n = int(float(shares))
         else:
             n = int(size * float(pct or 0))
         if n < 1:
-            return {"ok": False, "symbol": symbol, "error": f"{pct or shares} of {size:g} shares is less than 1 share."}
+            return {"ok": False, "symbol": symbol, "error": f"{pct or shares} of {size:g} {unit_w} is less than 1 {one}."}
         if n >= size:
-            return self._close_locked(symbol, orders, known_terminal)
+            return self._close_locked(symbol, orders, known_terminal, confirm_leg)
         instr = {("EQUITY", True): "SELL", ("EQUITY", False): "BUY_TO_COVER",
                  ("OPTION", True): "SELL_TO_CLOSE", ("OPTION", False): "BUY_TO_CLOSE"}.get((asset, side == "LONG"))
         if not instr:
             return {"ok": False, "symbol": symbol, "error": f"Cannot take a partial on a {asset} position here."}
         fresh = self._fresh_orders(client, orders)
+        if not confirm_leg:
+            guard = self._guard_leg(symbol, qty, asset, positions, fresh, known_terminal)
+            if guard:
+                return guard
         terminal = terminal_ids(fresh) | known_terminal
         pend = pending_orders(fresh, terminal)
         others = [p for p in pend if p.symbol == symbol and p.live and p.role not in ("STOP", "TARGET")]
@@ -1454,13 +1848,13 @@ class Trader:
             return {"ok": False, "symbol": symbol, "error": msg, "unresolved_close": True}
         size_note = ""
         if abs(abs(left) - expected) > 1e-9:
-            size_note = (f" CHECK: Schwab shows {abs(left):g} shares, expected {expected:g}; protecting "
+            size_note = (f" CHECK: Schwab shows {abs(left):g} {unit_w}, expected {expected:g}; protecting "
                          f"{min(abs(left), expected):g}.")
         if sent.get("unresolved"):
             # The partial may still fill: protect only what is left even if all of it fills, so the
             # new exits can never be larger than the position.
             expected = size - n
-            size_note += (f" The partial is not confirmed final: protecting {min(abs(left), expected):g} shares (what "
+            size_note += (f" The partial is not confirmed final: protecting {min(abs(left), expected):g} {unit_w} (what "
                           "remains even if it fully fills). Check thinkorswim, then press Resolve.")
         if expected < 1e-9:
             return {"ok": False, "symbol": symbol, "unresolved_close": True,
@@ -1474,34 +1868,61 @@ class Trader:
             msg = head + " " + (res.get("message") or res.get("error") or "") + self._restart_note(
                 symbol, side, trail, prior_trail_level)
             if not res.get("ok"):
-                msg += f" CHECK: the {abs(left):g} remaining shares may have no stop. Use Move stop or thinkorswim."
+                msg += f" CHECK: the {abs(left):g} remaining {unit_w} may have no stop. Use Move stop or thinkorswim."
             return {"ok": bool(res.get("ok")) and filled >= n - 1e-9, "symbol": symbol, "filled": filled, "avg": avg,
                     "message": msg, "error": None if res.get("ok") and filled >= n - 1e-9 else msg}
         if stop is None and target is None:
             return {"ok": filled > 0, "symbol": symbol,
-                    "message": head + f" {abs(left):g} shares left; there was no stop or target to put back."}
+                    "message": head + f" {abs(left):g} {unit_w} left; there was no stop or target to put back."}
         if stop is None:
+            # A target-only position: Schwab dropped the target when the partial entered, so put it
+            # back on what is left (a lone LIMIT, as Set target does without a stop).
+            nleft = int(left) if float(left).is_integer() else left
+            tk = ticks_for(asset)
+            self.store.log_action("partial", symbol, None, "SENDING", f"target {fmt(Decimal(str(target)), tk)}, no stop")
+            try:
+                r = self._place_exit(client, symbol, instr, asset, nleft, Decimal(str(target)))
+                ok = r.status_code in (200, 201)
+                if ok:
+                    tgt_txt = f" Target {fmt(Decimal(str(target)), tk)} put back on the {abs(left):g} {unit_w} left."
+                elif 400 <= r.status_code < 500:
+                    tgt_txt = (f" Schwab refused the target (HTTP {r.status_code}): {r.text[:150]}."
+                               " The target is GONE: use Set target.")
+                else:                             # a 5xx may still have placed it
+                    tgt_txt = (f" Schwab's answer on the target was unclear (HTTP {r.status_code}): it MAY be "
+                               "working. Check thinkorswim before using Set target.")
+            except Exception as e:
+                ok = False
+                tgt_txt = (f" No answer from Schwab on the target ({type(e).__name__}): it MAY be working. "
+                           "Check thinkorswim.")
+            self.store.log_action("partial", symbol, None, "DONE" if ok else "CHECK", tgt_txt.strip())
             return {"ok": False, "symbol": symbol,
-                    "error": head + f" {abs(left):g} shares left with NO STOP (there was none before). "
-                                    "Use Stop to B/E or Move stop."}
+                    "error": head + tgt_txt + f" {abs(left):g} {unit_w} left with NO STOP (there was none before). "
+                                              "Use Stop to B/E or Move stop.",
+                    "unresolved_close": bool(sent.get("unresolved"))}
         res = self._create_stop(client, symbol, side, left, asset, Decimal(str(stop)), [], set(),
                                 target=Decimal(str(target)) if target is not None else None, rebuild=True)
         msg = head + " " + (res.get("message") or res.get("error") or "")
         if not res.get("ok"):
-            msg += f" CHECK: the {abs(left):g} remaining shares may have no stop. Use Move stop or thinkorswim."
+            msg += f" CHECK: the {abs(left):g} remaining {unit_w} may have no stop. Use Move stop or thinkorswim."
         return {"ok": bool(res.get("ok")) and filled >= n - 1e-9, "symbol": symbol, "filled": filled, "avg": avg,
                 "message": msg, "error": None if res.get("ok") and filled >= n - 1e-9 else msg,
                 "unresolved_close": bool(sent.get("unresolved"))}
 
     def _create_stop(self, client, symbol: str, side: str, qty: float, asset: str | None,
                      price: Decimal | None, fresh: list[dict], terminal: set[int],
-                     target: Decimal | None = None, rebuild: bool = False, trail: dict | None = None) -> dict:
+                     target: Decimal | None = None, rebuild: bool = False, trail: dict | None = None,
+                     preview: bool = False) -> dict:
         """Create a stop for the whole position. Schwab cancels an instrument's working orders
         when a new order is entered, so an existing single target is re-sent together with the
         new stop as one OCO (the target survives and gets linked).
 
         rebuild=True (after a partial): Schwab already cancelled the old exits; send exactly
-        `target` (if any) + stop for `qty`, without looking at what is working."""
+        `target` (if any) + stop for `qty`, without looking at what is working.
+
+        preview=True asks Schwab's order preview first and sends nothing it refuses (the result
+        then has not_sent=True). Only for a change that keeps the current exits working until the
+        new order enters; never after a partial, where Schwab has already dropped them."""
         from .orders import pending_orders
         instr = {("EQUITY", True): "SELL", ("EQUITY", False): "BUY_TO_COVER",
                  ("OPTION", True): "SELL_TO_CLOSE", ("OPTION", False): "BUY_TO_CLOSE"}.get((asset, side == "LONG"))
@@ -1511,8 +1932,10 @@ class Trader:
         n = int(size) if float(size).is_integer() else size
         leg = [{"instruction": instr, "quantity": n, "instrument": {"symbol": symbol, "assetType": asset}}]
         from .bracket import stop_leg
-        stop = stop_leg(trail or price, leg)
-        stop_txt = _trail_txt(trail) if trail else f"stop {fmt(price)}"
+        tk = ticks_for(asset)              # formatting only: the prices are already on their grid
+        unit_w, us = _units(asset)
+        stop = stop_leg(trail or price, leg, ticks=tk)
+        stop_txt = _trail_txt(trail) if trail else f"stop {fmt(price, tk)}"
         targets = []
         if not rebuild:
             targets = [p for p in pending_orders(fresh, terminal)
@@ -1532,13 +1955,22 @@ class Trader:
         if target is not None:
             order = {"orderStrategyType": "OCO", "childOrderStrategies": [
                 {"orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
-                 "duration": "DAY", "price": fmt(target), "orderLegCollection": leg},
+                 "duration": "DAY", "price": fmt(target, tk), "orderLegCollection": leg},
                 stop]}
-            what = f"{stop_txt} + target {fmt(target)} as one OCO"
+            what = f"{stop_txt} + target {fmt(target, tk)} as one OCO"
             targets = targets or [True]
         else:
             order, what = stop, stop_txt
-        self.store.log_action("create_stop", symbol, None, "SENDING", f"{what}, {n} sh")
+        if preview:
+            refused = self._preview_refusal(client, order)
+            if refused:
+                rejected, why = refused
+                what_txt = "trailing stop" if trail else "order"
+                head = (f"Schwab does not accept this {what_txt} on {symbol}: {why}" if rejected else
+                        f"Schwab's preview did not confirm this {what_txt} on {symbol} ({why})")
+                return {"ok": False, "symbol": symbol, "not_sent": True,
+                        "error": head.rstrip(".") + ". Nothing was sent; your current stop and target are still working."}
+        self.store.log_action("create_stop", symbol, None, "SENDING", f"{what}, {n} {us}")
         log.warning("CREATE STOP %s %s %s", symbol, n, what)
         try:
             r = self._logged("place_order", lambda: client.place_order(self._hash, order))
@@ -1553,6 +1985,15 @@ class Trader:
                              + ("Your target is still working." if targets else "The position has no stop.")}
         tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
         new_id = int(tail) if tail.isdigit() else None
+        # Auto B/E follows a stop the companion rebuilt itself (never a trailing one). Linked as
+        # soon as Schwab accepts it, so a slow read below cannot lose it; auto_breakeven still
+        # checks the stop is live, fixed and not loosened before it moves anything.
+        linked = False
+        if new_id is not None and not trail:
+            since = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            linked = bool(self.store.link_auto_be(symbol, new_id, since.isoformat()))
+            if price is not None:
+                self.store.record_stop(symbol, price, new_id)   # r_basis checks it worked before using it
         time.sleep(0.6)
         after = self._fresh_orders(client)
         # Only the order we just sent counts (a delayed read can still show the previous exits).
@@ -1572,15 +2013,91 @@ class Trader:
         tgt_ok = not targets or any(p.role == "TARGET" and p.oco_id is not None
                                     and any(s.oco_id == p.oco_id for s in new_stops) for p in live)
         ok = covered >= size - 1e-9 and tgt_ok
-        msg = ((f"Trailing stop ({_trail_txt(trail)}) working" if trail else f"Stop created at {fmt(price)}")
-               + f" for {covered:g} of {size:g} shares"
+        msg = ((f"Trailing stop ({_trail_txt(trail)}) working" if trail else f"Stop created at {fmt(price, tk)}")
+               + f" for {covered:g} of {size:g} {unit_w}"
                + (", linked with the target in one OCO." if targets and tgt_ok else ".")
                + ("" if tgt_ok else " WARNING: the target is not working now: check thinkorswim.")
                + ("" if covered >= size - 1e-9 else " Not confirmed yet: check thinkorswim."))
+        # A target at or through the market fills as it enters: the new OCO is then already done
+        # (target filled, stop cancelled by the OCO), which is a close, not a missing stop.
+        tgt_fill = self._filled_target(after, new_id) if new_id is not None and target is not None and not ok else None
+        note, closed = "", False
+        if tgt_fill:
+            filled, avg = tgt_fill
+            fill_txt = f"The target {fmt(target, tk)} filled {filled:g} {unit_w}" + (f" @ {avg:g}" if avg else "") + " as it entered"
+            if filled >= size - 1e-9:
+                # The exit size can be less than the position (a partial whose outcome is open):
+                # only a fresh flat position is a close.
+                try:
+                    left, _ = self._position(client, symbol)
+                except Exception:
+                    left = None
+                if left is not None and abs(left) < 1e-9:
+                    ok = closed = True
+                    msg = fill_txt + ": position closed."
+                else:
+                    msg = fill_txt + (f", but {abs(left):g} {unit_w} are still open" if left is not None
+                                      else ", and the position could not be read") + ": check their stop in thinkorswim."
+            else:
+                msg = fill_txt + f" ({filled:g} of {size:g}). Check the stop on the rest in thinkorswim."
+        elif linked:
+            note = " Auto B/E stays on this stop."
+            msg += note
         self.store.log_action("create_stop", symbol, None, "DONE" if ok else "CHECK", msg)
-        return {"ok": ok, "symbol": symbol, "stop": fmt(price) if price is not None else None, "created": True,
-                "trail": bool(trail), "message": msg,
+        return {"ok": ok, "symbol": symbol, "stop": fmt(price, tk) if price is not None else None, "created": True,
+                "trail": bool(trail), "message": msg, "note": note, "closed": closed,
                 "error": None if ok else msg}
+
+    def _filled_target(self, orders: list[dict], oco_id: int) -> tuple[float, float | None] | None:
+        """(filled quantity, average price) of the LIMIT target inside the OCO just sent, or None."""
+        tree = self._find_in(orders, oco_id)
+        for ch in (tree or {}).get("childOrderStrategies") or []:
+            if ch.get("orderType") != "LIMIT":
+                continue
+            filled = float(ch.get("filledQuantity") or 0)
+            if filled <= 0:
+                return None
+            legs = [e for a in ch.get("orderActivityCollection") or [] if a.get("executionType") == "FILL"
+                    for e in a.get("executionLegs") or []]
+            q = sum(float(e.get("quantity") or 0) for e in legs)
+            avg = sum(float(e["price"]) * float(e["quantity"]) for e in legs) / q if q else None
+            return filled, avg
+        return None
+
+    def _preview_refusal(self, client, order: dict) -> tuple[bool, str] | None:
+        """Ask Schwab's order preview about `order`. None = Schwab would accept it; otherwise
+        (rejected, reason): rejected=True when Schwab said no, False when the preview gave no clear
+        answer (no reply, a rate limit, a server error, an unreadable body). Either way nothing is
+        sent: when unsure, refuse."""
+        try:
+            r = self._logged("preview_order", lambda: client.preview_order(self._hash, order))
+        except Exception as e:
+            return False, f"no answer: {type(e).__name__}"
+        if isinstance(r, _Throttled) or r.status_code == 429:
+            return False, "rate limit; try again in a few seconds"
+        if 400 <= r.status_code < 500:
+            return True, f"HTTP {r.status_code} {r.text[:200]}".strip()
+        if r.status_code not in (200, 201):
+            return False, f"HTTP {r.status_code}"
+        try:
+            body = r.json() or {}
+        except Exception:
+            return False, "its answer could not be read"
+        # Only a body shaped like Schwab's preview counts as an answer: {}, null, a list or an
+        # unrelated object is unclear, never "no rejects".
+        if not isinstance(body, dict):
+            return False, "its answer was not a preview"
+        result = body.get("orderValidationResult")
+        if not isinstance(result, dict) and not isinstance(body.get("orderStrategy"), dict):
+            return False, "its answer was not a preview"
+        rejects = result.get("rejects", []) if isinstance(result, dict) else []
+        if not isinstance(rejects, list):         # "rejects": null or a string is unreadable, not "none"
+            return False, "its answer could not be read"
+        if rejects:
+            msgs = [str(x.get("message") or x.get("activityMessage") or x.get("validationRuleName") or "")
+                    for x in rejects if isinstance(x, dict)]
+            return True, "; ".join(m for m in msgs if m)[:300] or "the preview lists a rejection"
+        return None
 
     def resolve(self, ticket_id: str) -> None:
         """the user checked thinkorswim; unblock new submissions."""
@@ -1598,14 +2115,36 @@ class Trader:
             except (TypeError, ValueError):
                 return None
 
+        def stop_of(k):
+            if k.get("orderType") in ("STOP", "STOP_LIMIT"):
+                return num(k.get("stopPrice"))
+            if k.get("orderType") == "TRAILING_STOP":
+                return ("TRAIL", k.get("stopPriceLinkType"), k.get("stopPriceLinkBasis"), num(k.get("stopPriceOffset")))
+            return None
+
         legs = o.get("orderLegCollection") or []
-        if o.get("orderStrategyType") != "TRIGGER" or len(legs) != 1:
+        if o.get("orderStrategyType") not in ("TRIGGER", "SINGLE") or len(legs) != 1:
             return None
         entry = (legs[0].get("instruction"), (legs[0].get("instrument") or {}).get("symbol"),
                  num(legs[0].get("quantity") or o.get("quantity")), num(o.get("price")))
+        if o.get("orderStrategyType") == "SINGLE":
+            # An entry sent without stop or target: only an opening order can be a ticket's entry.
+            return ((entry, ()) if not o.get("childOrderStrategies") and entry[0] in OPENING_INSTRUCTIONS | {"BUY"}
+                    else None)
         exits = []
         for oco in o.get("childOrderStrategies") or []:
             kids = oco.get("childOrderStrategies") or []
+            if oco.get("orderStrategyType") == "SINGLE":
+                # A stop alone or a target alone under the entry.
+                leg = (oco.get("orderLegCollection") or [{}])[0]
+                q = num(oco.get("quantity") or leg.get("quantity"))
+                if oco.get("orderType") == "LIMIT":
+                    exits.append((q, leg.get("instruction"), num(oco.get("price")), None))
+                elif stop_of(oco) is not None:
+                    exits.append((q, leg.get("instruction"), None, stop_of(oco)))
+                else:
+                    return None
+                continue
             if oco.get("orderStrategyType") != "OCO" or len(kids) != 2:
                 return None
             kl = [(k.get("orderLegCollection") or [{}])[0] for k in kids]
@@ -1619,7 +2158,7 @@ class Trader:
             if len(qtys) != 1 or len(stops) != 1 or len(targets) != 1:
                 return None
             exits.append((qtys.pop(), kl[0].get("instruction"), targets[0], stops[0]))
-        return (entry, tuple(sorted(exits))) if exits else None
+        return (entry, tuple(sorted(exits, key=repr))) if exits else None
 
     @classmethod
     def _matches(cls, o: dict, t: dict) -> bool:
@@ -1659,8 +2198,12 @@ class Trader:
         by_id = {o["orderId"]: o for o in orders_today}
         start = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         out, seen = [], set()
+        from .view import pretty_symbol
         for t in self.store.tickets_since(start.isoformat()):   # newest first
             row = dict(t)
+            legs = (t.get("request") or {}).get("orderLegCollection") or [{}]
+            row["asset_type"] = (legs[0].get("instrument") or {}).get("assetType") or "EQUITY"
+            row["display"] = pretty_symbol(t["symbol"], row["asset_type"])
             tree = by_id.get(t["order_id"]) if t["order_id"] else None
             # Only a filled ticket claims the symbol, so a newer rejected or unfilled ticket
             # never hides the protection status of a position an earlier ticket opened.
@@ -1676,7 +2219,13 @@ class Trader:
                 row["protection"] = "CHECKING"
             else:
                 filled = float(tree.get("filledQuantity") or 0)
-                row.update({"entry_status": tree.get("status"), "filled": filled})
+                fill_times = [e.get("time") for a in tree.get("orderActivityCollection") or []
+                              if a.get("executionType") == "FILL" for e in a.get("executionLegs") or []
+                              if e.get("time")]
+                row.update({"entry_status": tree.get("status"), "filled": filled,
+                            "first_fill": min(fill_times) if fill_times else None})
+                if tree.get("status") == "REJECTED" and tree.get("statusDescription"):
+                    row["entry_reason"] = str(tree["statusDescription"])[:200]   # accepted, then refused
                 direction = 1 if t["side"] == "LONG" else -1
                 exposure = max(0.0, positions.get(t["symbol"], 0.0) * direction)
                 if filled == 0:
@@ -1701,12 +2250,37 @@ class Trader:
     def r_basis(self, orders_today: list[dict]) -> dict[str, dict]:
         """Frozen R per symbol from the latest filled companion ticket today: the entry's average
         fill and the ORIGINAL stop. Later stop moves or adds never redefine R. An entry edited in
-        thinkorswim before it filled is followed to the order that replaced it."""
+        thinkorswim before it filled is followed to the order that replaced it. Older filled
+        tickets on the symbol ride along in "alts" (newest first) so the poller can pick the one
+        that opened the current position."""
         by_id = {o["orderId"]: o for o in orders_today}
+        nodes: dict[int, dict] = {}
+
+        def walk(o):
+            if o.get("orderId") is not None:
+                nodes.setdefault(o["orderId"], o)
+            for c in o.get("childOrderStrategies") or []:
+                walk(c)
+        for o in orders_today:
+            walk(o)
+
+        def stop_state(oid) -> str:
+            # A recorded stop (a single stop or the OCO it went in) counts once its stop leg has
+            # worked; REJECTED anywhere in it skips it; anything else means wait (no R yet).
+            node, sub = nodes.get(oid), []
+            stack = [node] if node else []
+            while stack:
+                n = stack.pop()
+                sub.append(n)
+                stack.extend(n.get("childOrderStrategies") or [])
+            if any(n.get("status") == "REJECTED" for n in sub):
+                return "rejected"
+            legs = [n for n in sub if n.get("orderType") in ("STOP", "STOP_LIMIT")]
+            return "ok" if legs and legs[0].get("status") in WORKED else "wait"
         start = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-        out: dict[str, dict] = {}
+        cands: dict[str, list[dict]] = {}
         for t in self.store.tickets_since(start.isoformat()):   # newest first
-            if t["symbol"] in out or t["status"] != "ACCEPTED" or not t["order_id"]:
+            if t["status"] != "ACCEPTED" or not t["order_id"]:
                 continue
             tree = by_id.get(t["order_id"])
             for _ in range(10):
@@ -1719,13 +2293,37 @@ class Trader:
             if qty <= 0:
                 continue
             entry = sum(float(e["price"]) * float(e["quantity"]) for e in legs) / qty
-            stop = float(t["stop"])
-            rps = abs(entry - stop)
             first_fill = min((e.get("time") for e in legs if e.get("time")), default=None)
+            stop_txt = t["stop"] if _dec(t["stop"]) else self.store.frozen_stop(t["ticket_id"])
+            if stop_txt is None and first_fill:
+                # A ticket sent without a stop takes its R from the first fixed stop the companion
+                # set and saw working after the fill (Set stop), on the risk side of the entry.
+                # Fill times have whole seconds: only stops from the next second on count, so a
+                # stop of the trade before (same-second re-entry) is never borrowed.
+                try:
+                    since = (datetime.strptime(first_fill, "%Y-%m-%dT%H:%M:%S%z")
+                             + timedelta(seconds=1)).astimezone(timezone.utc)
+                except ValueError:
+                    since = None
+                first = None
+                for st, oid in self.store.stops_since(t["symbol"], since.isoformat()) if since else []:
+                    state = stop_state(oid)
+                    if state != "rejected":
+                        first = st if state == "ok" else None   # a later stop never jumps an unconfirmed one
+                        break
+                if first and _dec(first) and (float(first) < entry if t["side"] == "LONG" else float(first) > entry):
+                    # Frozen on the ticket the first time it qualifies: later rejections of other
+                    # legs, status changes or a missing listing never take it back or replace it.
+                    stop_txt = self.store.freeze_stop(t["ticket_id"], first)
+            if stop_txt is None:
+                continue                  # no stop price yet: no R
+            stop = float(stop_txt)
+            rps = abs(entry - stop)
             if rps > 0:
-                out[t["symbol"]] = {"side": t["side"], "entry": entry, "stop": stop, "rps": rps,
-                                    "ticket_id": t["ticket_id"], "first_fill": first_fill}
-        return out
+                cands.setdefault(t["symbol"], []).append(
+                    {"side": t["side"], "entry": entry, "stop": stop, "rps": rps,
+                     "ticket_id": t["ticket_id"], "first_fill": first_fill})
+        return {sym: {**c[0], "alts": c[1:]} for sym, c in cands.items()}
 
     def status(self) -> dict:
         return {"armed": self.armed, "market_open": market_open(),

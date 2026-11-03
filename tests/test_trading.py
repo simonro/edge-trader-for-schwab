@@ -255,6 +255,15 @@ def test_rejected_newer_ticket_does_not_hide_open_position(trader):
     assert {r["ticket_id"]: r for r in stale}["ticket-0001"]["protection"] == "UNKNOWN"
 
 
+def test_entry_rejected_after_acceptance_shows_schwabs_reason(trader):
+    trader._client.resp = Resp(201, {"Location": ".../orders/555"})
+    trader.submit(req())
+    refused = {**_tree(555), "status": "REJECTED",
+               "statusDescription": "You do not have enough available cash/buying power for this order."}
+    (row,) = trader.brackets([refused], pend=[], positions={}, orders_fresh=True)
+    assert row["protection"] == "NOT_FILLED" and "buying power" in row["entry_reason"]
+
+
 class JsonResp(Resp):
     def __init__(self, status, body):
         super().__init__(status)
@@ -358,8 +367,9 @@ class Broker(FakeClient):
     """Fake Schwab with order states and one position."""
 
     def __init__(self, orders, position=("MXR", -57.0, "EQUITY"), stuck=(), auto_cancel=True, after_qty=None,
-                 fill_limits=False):
+                 fill_limits=False, ins=None, others=()):
         super().__init__()
+        self.ins, self.others = ins or {}, list(others)   # extra instrument fields; other positions held
         self.orders = {o["orderId"]: o for o in orders}
         self.sym, self.qty, self.asset = position
         self.stuck, self.cancelled = set(stuck), []
@@ -424,8 +434,9 @@ class Broker(FakeClient):
         return Resp(400, text="not found")
 
     def account_details(self, _h, fields=None):
-        pos = [] if not self.qty else [{"instrument": {"symbol": self.sym, "assetType": self.asset},
+        pos = [] if not self.qty else [{"instrument": {"symbol": self.sym, "assetType": self.asset, **self.ins},
                                         "longQuantity": max(self.qty, 0), "shortQuantity": max(-self.qty, 0)}]
+        pos += self.others
         return JsonResp(200, {"securitiesAccount": {"positions": pos}})
 
     def _kill_symbol_orders(self):
@@ -783,6 +794,7 @@ def test_move_stop_on_a_trailing_position_goes_back_to_fixed(trader, monkeypatch
     (order,) = trader._client.placed
     target, stop = order["childOrderStrategies"]
     assert stop["orderType"] == "STOP" and stop["stopPrice"] == "910.00" and target["price"] == "900.18"
+    assert [st for st, _ in trader.store.stops_since("MXR", "2000-01-01")] == ["910.00"]   # recorded for R
 
 
 def test_set_target_keeps_the_trailing_stop(trader, monkeypatch):
@@ -883,6 +895,155 @@ def test_auto_breakeven_leaves_a_stop_from_another_order_alone(trader, monkeypat
     assert not getattr(trader._client, "replaced", [])
     r = trader._move_stop_locked("MXR", Decimal("908.00"), [], set(), only="SHORT", allowed={40, 45, 46})
     assert not r["ok"] and not getattr(trader._client, "replaced", [])
+
+
+def test_auto_breakeven_follows_an_oco_the_companion_rebuilt(trader, monkeypatch):
+    # META 2026-11-02: Replace target rebuilt the OCO and Auto B/E then skipped at +1R.
+    _mu_quote(trader, monkeypatch)
+    trader._client = Broker([_ticket_tree(_mu_oco())])              # MXR short 57, stop 913.23
+    trader.store.insert_ticket({"ticket_id": "t-mxr", "symbol": "MXR", "side": "SHORT", "qty": 57, "limit": "908.00",
+                                "stop": "913.23", "target": "900.18", "risk": 300.0, "request": {}})
+    trader.store.update_ticket("t-mxr", "ACCEPTED", order_id=40)
+    trader.store.add_auto_be("t-mxr", "MXR")
+    r = trader.set_target("MXR", "898.00", None, [], set(), None)
+    assert r["ok"] and "Auto B/E stays on this stop" in r["message"], r
+    new_oco = trader._client.placed[0]
+    assert trader.store.auto_be_orders("t-mxr") == [max(trader._client.orders)]
+    assert new_oco["orderStrategyType"] == "OCO"
+    assert trader.store.set_auto_be("t-mxr", "SENDING", only_from="PENDING")
+    r = trader.auto_breakeven("t-mxr", "MXR", "SHORT", 908.0, [], set())
+    assert r["state"] == "DONE", r
+    (oid, body), = trader._client.replaced
+    assert body["stopPrice"] == "908.00"
+    # A trailing stop the companion sets is never linked: Auto B/E does not touch trails.
+    assert trader.store.link_auto_be("MXR", 1, "2000-01-01") == []   # no PENDING ticket left
+
+
+def test_a_target_that_fills_as_it_enters_reports_the_close(trader, monkeypatch):
+    # TSLA 2026-11-02: the new target filled within a second and the result said "check thinkorswim".
+    _mu_quote(trader, monkeypatch)
+
+    class FillsAtOnce(Broker):
+        def place_order(self, h, order):
+            r = super().place_order(h, order)
+            oco = self.orders[max(self.orders)]
+            tgt, stop = oco["childOrderStrategies"]
+            tgt.update(status="FILLED", filledQuantity=57, orderActivityCollection=[
+                {"executionType": "FILL", "executionLegs": [{"quantity": 57, "price": 899.5}]}])
+            stop["status"], oco["status"], self.qty = "CANCELED", "FILLED", 0.0
+            return r
+    trader._client = FillsAtOnce([_mu_oco()])
+    r = trader.set_target("MXR", "900.00", None, [], set(), None)
+    assert r["ok"] and "as it entered: position closed" in r["message"], r
+    assert "check thinkorswim" not in r["message"]
+
+
+def _pending_autobe(trader, tid="t-mxr"):
+    trader.store.insert_ticket({"ticket_id": tid, "symbol": "MXR", "side": "SHORT", "qty": 57, "limit": "908.00",
+                                "stop": "913.23", "target": "900.18", "risk": 300.0, "request": {}})
+    trader.store.update_ticket(tid, "ACCEPTED", order_id=40)
+    trader.store.add_auto_be(tid, "MXR")
+    return tid
+
+
+def _filled_entry(oco, when="2026-11-02T14:00:00+0000"):
+    t = _ticket_tree(oco)
+    t["orderActivityCollection"] = [{"executionType": "FILL", "executionLegs": [{"quantity": 57, "price": 908.0, "time": when}]}]
+    return t
+
+
+def test_auto_breakeven_refuses_a_position_re_entered_by_another_order(trader, monkeypatch):
+    # ChatGPT audit 2026-11-02 (high): a close and re-entry in thinkorswim must not inherit the
+    # old ticket's consent, even when the companion linked the new exits to it.
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    reentry = {"orderId": 70, "orderStrategyType": "SINGLE", "status": "FILLED", "filledQuantity": 57,
+               "orderLegCollection": [{"instruction": "SELL_SHORT", "quantity": 57, "instrument": {"symbol": "MXR"}}],
+               "orderActivityCollection": [{"executionType": "FILL", "executionLegs": [
+                   {"quantity": 57, "price": 905.0, "time": "2026-11-02T14:30:00+0000"}]}]}
+    trader._client = Broker([_filled_entry(_mu_oco()), reentry])
+    tid = _pending_autobe(trader)
+    trader.store.link_auto_be("MXR", 50, "2000-01-01")
+    assert trader.store.set_auto_be(tid, "SENDING", only_from="PENDING")
+    r = trader.auto_breakeven(tid, "MXR", "SHORT", 908.0, [], set())
+    assert r["state"] == "SKIPPED" and "re-entered by order 70" in r["message"], r
+    assert not getattr(trader._client, "replaced", [])
+    # An entry fill from BEFORE the ticket's own fill is not a re-entry.
+    reentry["orderActivityCollection"][0]["executionLegs"][0]["time"] = "2026-11-02T13:00:00+0000"
+    trader._client = Broker([_filled_entry(_mu_oco()), reentry])
+    tid2 = _pending_autobe(trader, "t2")
+    assert trader.store.set_auto_be(tid2, "SENDING", only_from="PENDING")
+    assert trader.auto_breakeven(tid2, "MXR", "SHORT", 908.0, [], set())["state"] == "DONE"
+
+
+def test_auto_breakeven_rereads_an_old_gtc_entry_that_looks_open(trader, monkeypatch):
+    # ChatGPT audit pass 2 (high): an older GTC entry filled after the ticket, but the poller's
+    # snapshot still shows it WORKING and today's order read does not include it.
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    leg = [{"instruction": "SELL_SHORT", "quantity": 57, "instrument": {"symbol": "MXR"}}]
+    stale = {"orderId": 80, "orderStrategyType": "SINGLE", "status": "WORKING", "filledQuantity": 0,
+             "duration": "GOOD_TILL_CANCEL", "orderLegCollection": leg}
+    filled = {**stale, "status": "FILLED", "filledQuantity": 57, "orderActivityCollection": [
+        {"executionType": "FILL", "executionLegs": [{"quantity": 57, "price": 905.0, "time": "2026-11-02T14:30:00+0000"}]}]}
+
+    class OldGtc(Broker):
+        def order_details(self, h, oid):
+            return JsonResp(200, filled) if oid == 80 else super().order_details(h, oid)
+    trader._client = OldGtc([_filled_entry(_mu_oco())])
+    tid = _pending_autobe(trader)
+    assert trader.store.set_auto_be(tid, "SENDING", only_from="PENDING")
+    r = trader.auto_breakeven(tid, "MXR", "SHORT", 908.0, [stale], set())
+    assert r["state"] == "SKIPPED" and "order 80" in r["message"], r
+    assert not getattr(trader._client, "replaced", [])
+    # Pass 3: the same entry nested inside an older OCO group.
+    group = {"orderId": 79, "orderStrategyType": "OCO", "status": "WORKING", "childOrderStrategies": [stale]}
+    trader._client = OldGtc([_filled_entry(_mu_oco())])
+    tid2 = _pending_autobe(trader, "t2")
+    assert trader.store.set_auto_be(tid2, "SENDING", only_from="PENDING")
+    r = trader.auto_breakeven(tid2, "MXR", "SHORT", 908.0, [group], set())
+    assert r["state"] == "SKIPPED" and "order 80" in r["message"], r
+
+
+def test_a_claimed_ticket_still_gets_the_rebuilt_exits(trader, monkeypatch):
+    # ChatGPT audit 2026-11-02 (high): +1R claimed while Replace target holds the order lock.
+    _mu_quote(trader, monkeypatch)
+    trader._client = Broker([_filled_entry(_mu_oco())])
+    tid = _pending_autobe(trader)
+    assert trader.store.set_auto_be(tid, "SENDING", only_from="PENDING")
+    assert trader.set_target("MXR", "898.00", None, [], set(), None)["ok"]
+    assert trader.auto_breakeven(tid, "MXR", "SHORT", 908.0, [], set())["state"] == "DONE"
+
+
+def test_the_link_is_kept_when_the_check_read_is_late(trader, monkeypatch):
+    # ChatGPT audit 2026-11-02 (medium): Schwab accepted the OCO but the read after it missed it.
+    _mu_quote(trader, monkeypatch)
+    trader._client = Broker([_filled_entry(_mu_oco())])
+    tid = _pending_autobe(trader)
+    real, calls = trader._fresh_orders, []
+
+    def late(client, orders=None):
+        calls.append(1)
+        return real(client, orders) if len(calls) == 1 else []
+    monkeypatch.setattr(trader, "_fresh_orders", late)
+    r = trader.set_target("MXR", "898.00", None, [], set(), None)
+    assert not r["ok"]                                              # not confirmed: says so
+    assert trader.store.auto_be_orders(tid) == [max(trader._client.orders)]
+
+
+def test_a_filled_target_is_only_a_close_when_the_account_is_flat(trader, monkeypatch):
+    # ChatGPT audit 2026-11-02 (medium): the exit size can be smaller than the position.
+    _mu_quote(trader, monkeypatch)
+
+    class FillsButNotFlat(Broker):
+        def place_order(self, h, order):
+            r = super().place_order(h, order)
+            oco = self.orders[max(self.orders)]
+            tgt, stop = oco["childOrderStrategies"]
+            tgt.update(status="FILLED", filledQuantity=57)
+            stop["status"], oco["status"], self.qty = "CANCELED", "FILLED", -28.0
+            return r
+    trader._client = FillsButNotFlat([_mu_oco()])
+    r = trader.set_target("MXR", "900.00", None, [], set(), None)
+    assert not r["ok"] and "28 shares are still open" in r["message"] and "position closed" not in r["message"], r
 
 
 def test_auto_breakeven_waits_when_the_market_is_closed(trader, monkeypatch):
@@ -1024,3 +1185,702 @@ def test_partial_at_bid_and_ask_uses_the_literal_price(trader, monkeypatch):
     trader._client = Broker([_mu_oco()], fill_limits=True)
     trader.take_partial("MXR", 0.5, None, [], set(), mode="ask")
     assert trader._client.placed[0]["price"] == "906.30"             # cover at the ask: takes
+
+
+# ---- options: price grids, contracts wording, and trailing stops behind Schwab's preview -------
+
+OPT = "AAPL  261120C00230000"
+
+
+class OptBroker(Broker):
+    """The Broker fake holding a long option position, with Schwab's order preview."""
+
+    def __init__(self, orders, qty=4.0, preview=None, preview_exc=None, **kw):
+        super().__init__(orders, position=(OPT, qty, "OPTION"), **kw)
+        self.previewed, self.preview_resp, self.preview_exc = [], preview, preview_exc
+
+    def preview_order(self, _h, order):
+        self.previewed.append(order)
+        if self.preview_exc:
+            raise self.preview_exc
+        return self.preview_resp or JsonResp(200, {"orderValidationResult": {"rejects": []}})
+
+
+def _opt_leaf(oid, otype, qty, **px):
+    return {"orderId": oid, "orderStrategyType": "SINGLE", "status": "WORKING", "orderType": otype,
+            "quantity": qty, "filledQuantity": 0, **px,
+            "orderLegCollection": [{"instruction": "SELL_TO_CLOSE", "positionEffect": "CLOSING",
+                                    "quantity": qty, "instrument": {"symbol": OPT, "assetType": "OPTION"}}]}
+
+
+def _opt_oco(stop=0.30, target=0.95, qty=4):
+    return {"orderId": 50, "orderStrategyType": "OCO", "status": "WORKING", "childOrderStrategies": [
+        _opt_leaf(51, "STOP", qty, stopPrice=stop), _opt_leaf(52, "LIMIT", qty, price=target)]}
+
+
+def _opt_quote(trader, monkeypatch, bid=0.55, ask=0.60, penny=False, underlying="AAPL"):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    q = {"bid": bid, "ask": ask, "mark": round((bid + ask) / 2, 4), "asset_type": "OPTION",
+         "underlying": underlying, "is_penny": penny}
+    monkeypatch.setattr(trader, "quote", lambda s, max_age=0: q)
+
+
+def test_option_move_stop_lands_on_the_nickel_grid(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.move_stop(OPT, "0.37", [], set())
+    assert r["ok"] and r["stop"] == "0.40", r                  # long: the tighter tick, never 0.35
+    (oid, body), = trader._client.replaced
+    assert oid == 51 and body["stopPrice"] == "0.40"
+    assert body["orderLegCollection"][0]["instrument"]["assetType"] == "OPTION"
+    assert "4 contracts" in r["message"] and "shares" not in r["message"]
+
+
+def test_option_move_stop_rounds_a_short_stop_down(trader, monkeypatch):
+    # Short 4 calls (bid 0.55 / ask 0.60): a stop typed 0.73 goes to 0.70 on the nickel grid, not 0.75.
+    _opt_quote(trader, monkeypatch)
+    oco = _opt_oco(stop=0.80, target=0.30)
+    for k in oco["childOrderStrategies"]:
+        k["orderLegCollection"][0]["instruction"] = "BUY_TO_CLOSE"
+    trader._client = OptBroker([oco], qty=-4)
+    r = trader.move_stop(OPT, "0.73", [], set())
+    assert r["ok"] and r["stop"] == "0.70", r
+
+
+def test_option_move_stop_on_a_penny_class_keeps_pennies(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, penny=True)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.move_stop(OPT, "0.37", [], set())
+    assert r["ok"] and trader._client.replaced[0][1]["stopPrice"] == "0.37"
+
+
+def test_option_set_target_refuses_an_off_grid_price(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.set_target(OPT, "0.93", None, [], set(), None)     # nickel grid: sent as typed or not at all
+    assert not r["ok"] and "0.05 steps" in r["error"] and trader._client.placed == []
+    r = trader.set_target(OPT, "0.95", None, [], set(), None)
+    assert r["ok"] and r["target"] == "0.95", r
+    (order,) = trader._client.placed
+    target, stop = order["childOrderStrategies"]
+    assert target["price"] == "0.95" and stop["stopPrice"] == "0.30"
+    assert target["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE"
+    assert trader._client.previewed == []                     # a fixed stop needs no preview
+
+
+def test_option_target_in_r_uses_the_frozen_premium_basis(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.set_target(OPT, None, 2, [], set(), {"side": "LONG", "entry": 0.52, "rps": 0.22})
+    assert r["ok"] and r["target"] == "0.95", r               # 0.52 + 0.44 = 0.96, floored to 0.95
+
+
+def test_option_partial_at_the_mid_uses_option_ticks(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, bid=0.55, ask=0.70)
+    trader._client = OptBroker([_opt_oco()], fill_limits=True)
+    r = trader.take_partial(OPT, 0.5, None, [], set(), mode="mid")
+    assert r["ok"], r
+    partial, rebuild = trader._client.placed
+    assert partial["price"] == "0.60"                         # mid 0.625, sell rounds down on 0.05s
+    assert partial["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE"
+    assert rebuild["childOrderStrategies"][1]["stopPrice"] == "0.30"
+    assert "contracts" in r["message"] or "Took 2 of 4" in r["message"]
+    assert "share" not in trader.take_partial(OPT, 0.1, None, [], set())["error"]
+
+
+def test_option_trail_is_sent_when_schwab_preview_accepts_it(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, bid=0.70, ask=0.75)
+    trader._client = OptBroker([_opt_oco()])
+    r = trader.set_trail(OPT, "$", "0.13", "MARK", [], set(), None)
+    assert r["ok"], r
+    (previewed,) = trader._client.previewed
+    (order,) = trader._client.placed
+    assert previewed == order
+    target, stop = order["childOrderStrategies"]
+    assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceOffset"] == 0.15   # 0.13 -> nickel
+    assert stop["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE" and target["price"] == "0.95"
+
+
+def test_option_trail_refused_by_the_preview_sends_nothing(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, bid=0.70, ask=0.75)
+    no = JsonResp(200, {"orderValidationResult": {"rejects": [
+        {"validationRuleName": "TrailingStop", "message": "Trailing stop orders are not allowed for options."}]}})
+    trader._client = OptBroker([_opt_oco()], preview=no)
+    r = trader.set_trail(OPT, "$", "0.15", "MARK", [], set(), None)
+    assert not r["ok"] and "does not accept" in r["error"] and "not allowed for options" in r["error"]
+    assert "still working" in r["error"] and trader._client.placed == []
+    assert trader._client.orders[50]["childOrderStrategies"][0]["status"] == "WORKING"   # stop untouched
+
+
+@pytest.mark.parametrize("kw", [{"preview": Resp(500, text="boom")}, {"preview_exc": TimeoutError("read timed out")},
+                                {"preview": Resp(429)}, {"preview": JsonResp(200, {})}, {"preview": JsonResp(200, None)},
+                                {"preview": JsonResp(200, [])}, {"preview": JsonResp(200, {"error": "invalid"})},
+                                {"preview": JsonResp(200, {"orderValidationResult": {"rejects": "no"}})},
+                                {"preview": JsonResp(200, {"orderValidationResult": {"rejects": None}})}])
+def test_option_trail_without_a_clear_preview_is_refused(trader, monkeypatch, kw):
+    _opt_quote(trader, monkeypatch, bid=0.70, ask=0.75)
+    trader._client = OptBroker([_opt_oco()], **kw)
+    r = trader.set_trail(OPT, "$", "0.15", "MARK", [], set(), None)
+    assert not r["ok"] and "Nothing was sent" in r["error"] and trader._client.placed == []
+    assert "did not confirm" in r["error"]                    # unclear, not "Schwab does not accept"
+
+
+def test_stock_trail_is_not_previewed(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_oco()])
+    trader._client.preview_order = lambda *a: pytest.fail("a stock trail must not need a preview")
+    assert trader.set_trail("MXR", "$", 2.5, "MARK", [], set(), None)["ok"]
+
+
+def test_option_auto_breakeven_rounds_up_to_the_nickel(trader, monkeypatch):
+    _opt_quote(trader, monkeypatch, bid=0.75, ask=0.80)
+    tree = {"orderId": 40, "orderStrategyType": "TRIGGER", "status": "FILLED", "filledQuantity": 4,
+            "orderLegCollection": [{"instruction": "BUY_TO_OPEN", "positionEffect": "OPENING", "quantity": 4,
+                                    "instrument": {"symbol": OPT, "assetType": "OPTION"}}],
+            "childOrderStrategies": [_opt_oco()]}
+    trader._client = OptBroker([tree])
+    trader.store.insert_ticket({"ticket_id": "t-opt", "symbol": OPT, "side": "LONG", "qty": 4, "limit": "0.52",
+                                "stop": "0.30", "target": "0.95", "risk": 88.0, "request": {}})
+    trader.store.update_ticket("t-opt", "ACCEPTED", order_id=40)
+    trader.store.add_auto_be("t-opt", OPT)
+    assert trader.store.set_auto_be("t-opt", "SENDING", only_from="PENDING")
+    r = trader.auto_breakeven("t-opt", OPT, "LONG", 0.52, [], set())
+    assert r["ok"] and r["state"] == "DONE", r
+    (oid, body), = trader._client.replaced
+    assert oid == 51 and body["stopPrice"] == "0.55"          # 0.52 is off the grid: up, never below entry
+
+
+def test_quote_reads_the_option_fields(tmp_path):
+    from companion.bracket import EQUITY, OPT_NICKEL, OPT_PENNY, OPT_PENNY_ALL
+    t = Trader(Store(tmp_path / "q.db"))
+
+    class Q(FakeClient):
+        def quotes(self, syms):
+            return JsonResp(200, {
+                OPT: {"assetMainType": "OPTION", "realtime": True,
+                      "quote": {"bidPrice": 0.55, "askPrice": 0.6, "lastPrice": 0.57, "mark": 0.575},
+                      "reference": {"underlying": "AAPL", "isPennyPilot": True, "multiplier": 100.0}},
+                "XYZ   261120P00050000": {"assetMainType": "OPTION", "quote": {"bidPrice": 3.1, "askPrice": 3.3},
+                                         "reference": {"underlying": "XYZ", "isPennyPilot": False}},
+                "SPY   261120C00600000": {"assetMainType": "OPTION", "quote": {"bidPrice": 4.0, "askPrice": 4.02},
+                                         "reference": {"isPennyPilot": True}},
+                "MXR": {"assetMainType": "EQUITY", "quote": {"bidPrice": 906.0, "askPrice": 906.2}}})
+    t._client, t._hash = Q(), "H" * 64
+    q = t.quote(OPT)
+    assert q["mark"] == 0.575 and q["multiplier"] == 100.0 and q["underlying"] == "AAPL" and q["ticks"] == OPT_PENNY
+    assert t.quote("XYZ   261120P00050000")["ticks"] == OPT_NICKEL
+    assert t.quote("SPY   261120C00600000")["ticks"] == OPT_PENNY_ALL     # underlying from the OCC root
+    assert t.quote("MXR")["ticks"] == EQUITY
+    assert t._ticks("MXR", "EQUITY") == EQUITY and t._ticks(OPT, "OPTION") == OPT_PENNY
+
+
+# ---- option entries from the ticket ------------------------------------------------------------
+
+CALL = "AAPL  261120C00232500"
+
+
+def _opt_ticket_quote(trader, monkeypatch, bid=0.77, ask=0.79, **extra):
+    from companion.bracket import ticks_for
+    q = {"bid": bid, "ask": ask, "mark": (bid + ask) / 2, "asset_type": "OPTION", "underlying": "AAPL",
+         "multiplier": 100.0, "is_penny": True, "deliverables": "100 AAPL", "ticks": ticks_for("OPTION", "AAPL", True)}
+    q.update(extra)
+    monkeypatch.setattr(trader, "quote", lambda sym, max_age=1.0: q)
+
+
+def opt_req(**kw):
+    base = {"ticket_id": "opt-ticket-01", "symbol": CALL, "side": "LONG", "stop": "0.50", "risk": 375, "r": 2,
+            "entry": "mid", "expected_limit": "0.78", "expected_qty": 13, "expected_target": "1.34"}
+    return {**base, **kw}
+
+
+def test_option_ticket_sends_a_buy_to_open_bracket(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    r = trader.submit(opt_req())
+    assert r["ok"], r
+    (order,) = trader._client.placed
+    leg = order["orderLegCollection"][0]
+    assert leg == {"instruction": "BUY_TO_OPEN", "quantity": 13, "instrument": {"symbol": CALL, "assetType": "OPTION"}}
+    assert order["price"] == "0.78"
+    t = trader.store.get_ticket("opt-ticket-01")
+    assert t["limit_price"] == "0.78" and t["risk"] == 364.0          # 13 x 0.28 x 100
+
+
+def test_option_ticket_lock_uses_option_ticks(trader, monkeypatch):
+    # 1R = 0.28: the lock is max(0.028, 2 penny ticks) = 0.028. The mid moving up 2c still sends.
+    _opt_ticket_quote(trader, monkeypatch, bid=0.79, ask=0.81)
+    assert trader.submit(opt_req())["ok"]
+    _opt_ticket_quote(trader, monkeypatch, bid=0.81, ask=0.83)       # mid 0.82: 4c against, refused
+    r = trader.submit(opt_req(ticket_id="opt-ticket-02"))
+    assert not r["ok"] and "Price moved: entry is now 0.82" in r["error"]
+
+
+def test_option_ticket_size_message_says_contracts(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    r = trader.submit(opt_req(expected_qty=14))
+    assert not r["ok"] and "13 contracts" in r["error"]
+
+
+def test_option_ticket_refuses_an_adjusted_contract(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch, deliverables="100 AAPL, 50 XYZ")
+    r = trader.submit(opt_req())
+    assert not r["ok"] and "non-standard" in r["error"] and trader._client.placed == []
+    _opt_ticket_quote(trader, monkeypatch, multiplier=10.0)
+    assert "non-standard" in trader.make_plan(opt_req()).errors[0]
+
+
+def test_adjusted_contract_check_fails_closed():
+    from companion.trading import _odd_deliverable
+    std = {"underlying": "AAPL"}
+    assert _odd_deliverable({**std, "deliverables": "100 AAPL"}, CALL) is None
+    assert _odd_deliverable({**std, "deliverables": "AAPL 100"}, CALL) is None
+    assert _odd_deliverable({**std}, CALL) is None and _odd_deliverable({**std, "deliverables": " "}, CALL) is None
+    assert _odd_deliverable({"underlying": "$SPX", "deliverables": "100 $SPX"}, "SPXW  261120C06000000") is None
+    # Cash-settled index: Schwab's real format (2026-11-02).
+    assert _odd_deliverable({"underlying": "$SPX", "deliverables": "100 $SPX(Cash)"}, "SPXW  261102P06800000") is None
+    for d in ("$USD 1191.0;IBM 100", "IBM 100", "150 AAPL", "100 AAPL, 50 XYZ", "100 MSFT", ["100 AAPL"], {"x": 1},
+              "100 MSFT(Cash)", "150 AAPL(Cash)"):
+        assert _odd_deliverable({**std, "deliverables": d}, CALL), d          # no crash, refused
+    assert "adjusted root AAPL1" in _odd_deliverable({**std, "deliverables": "100 AAPL"}, "AAPL1 261120C00232500")
+
+
+def test_option_ticket_shows_why_a_contract_is_non_standard(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch, deliverables="$USD 1191.0;IBM 100")
+    p = trader.make_plan(opt_req())
+    assert not p.ok and "non-standard contract" in p.errors[0] and "$USD 1191.0;IBM 100" in p.errors[0]
+    _opt_ticket_quote(trader, monkeypatch, deliverables=["100 AAPL"])      # an unexpected type: refused, no crash
+    assert not trader.make_plan(opt_req()).ok
+    r = trader.submit(opt_req())
+    assert not r["ok"] and trader._client.placed == []
+
+
+def test_option_ticket_with_a_trail_asks_the_preview_first(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    trader._client.preview_order = lambda h, o: JsonResp(200, {"orderValidationResult": {"rejects": [
+        {"message": "Trailing stops are not supported for this security."}]}})
+    req = opt_req(stop_type="trail", trail_unit="$", trail_value=0.10, trail_basis="MARK",
+                  expected_trail_offset=0.10, expected_trail_start="0.68")
+    r = trader.submit(req)
+    assert not r["ok"] and "does not accept a trailing stop" in r["error"] and "Nothing was sent" in r["error"]
+    assert trader._client.placed == [] and trader.store.get_ticket("opt-ticket-01") is None
+    trader._client.preview_order = lambda h, o: JsonResp(200, {"orderValidationResult": {"rejects": []}})
+    r = trader.submit(req)
+    assert r["ok"], r
+    stop = trader._client.placed[0]["childOrderStrategies"][0]["childOrderStrategies"][1]
+    assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceOffset"] == 0.1
+
+
+def test_option_autobe_ticket_is_recorded(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    r = trader.submit(opt_req(stop_type="autobe"))
+    assert r["ok"] and r["plan"]["be_trigger"] == "1.06"              # 0.78 + 1R (0.28)
+    assert trader.store.auto_be("opt-ticket-01")["state"] == "PENDING"
+
+
+def test_option_ticket_shows_its_readable_name(trader, monkeypatch):
+    _opt_ticket_quote(trader, monkeypatch)
+    trader.submit(opt_req())
+    (row,) = trader.brackets([], [], {}, True)
+    assert row["asset_type"] == "OPTION" and row["display"] == "AAPL 20 Nov 26 232.5C"
+
+
+def test_parse_chain_cleans_schwab_values():
+    from companion.trading import parse_chain
+    body = {"underlyingPrice": 229.84, "underlying": {"description": "Apple Inc"}, "callExpDateMap": {"2026-11-20:20": {
+        "235.0": [{"symbol": "AAPL  261120C00235000", "strikePrice": 235.0, "bid": 0.40, "ask": 0.42, "mark": 0.41,
+                   "delta": 0.12, "volatility": 27.1, "openInterest": 6200, "totalVolume": 900, "pennyPilot": True,
+                   "multiplier": 100.0, "nonStandard": False, "inTheMoney": False, "daysToExpiration": 20}],
+        "230.0": [{"symbol": "AAPL  261120C00230000", "strikePrice": 230.0, "bid": 1.38, "ask": 1.41, "mark": 1.40,
+                   "delta": -999.0, "volatility": 7805.0, "openInterest": 12000, "pennyPilot": True,
+                   "multiplier": 100.0, "nonStandard": False, "inTheMoney": True}],
+        "100.0": [{"symbol": "AAPL1 261120C00100000", "strikePrice": 100.0, "bid": 129.0, "ask": 131.0,
+                   "multiplier": 100.0, "nonStandard": True}]}}}
+    out = parse_chain(body, "CALL")
+    assert out["underlying_price"] == 229.84 and out["underlying_name"] == "Apple Inc"
+    assert [r["strike"] for r in out["rows"]] == [100.0, 230.0, 235.0]          # by strike
+    adj, atm, otm = out["rows"]
+    assert adj["standard"] is False and atm["standard"] and otm["penny"]
+    assert atm["delta"] is None and atm["iv"] is None                           # -999 and junk IV hidden
+    assert otm["delta"] == 0.12 and otm["spread_pct"] == 4.9
+    assert parse_chain(body, "PUT")["rows"] == []
+
+
+class ChainClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def option_expiration_chain(self, sym):
+        self.calls.append(("exp", sym))
+        return JsonResp(200, {"expirationList": [
+            {"expirationDate": "2026-11-06", "daysToExpiration": 6, "expirationType": "W", "standard": True},
+            {"expirationDate": "2026-11-02", "daysToExpiration": 2, "expirationType": "W", "standard": True}]})
+
+    def option_chains(self, sym, **kw):
+        self.calls.append(("chain", sym, kw))
+        return JsonResp(200, {"underlyingPrice": 229.84, "callExpDateMap": {}})
+
+
+def test_expirations_and_chain_are_validated_and_cached(trader):
+    trader._client = ChainClient()
+    exps = trader.expirations("aapl")
+    assert [e["date"] for e in exps] == ["2026-11-02", "2026-11-06"]
+    trader.expirations("AAPL")
+    out = trader.chain("AAPL", "2026-11-02", "call")
+    trader.chain("AAPL", "2026-11-02", "CALL")
+    assert out["put_call"] == "CALL" and out["rows"] == []
+    kinds = [c[0] for c in trader._client.calls]
+    assert kinds == ["exp", "chain"]                                            # second calls came from the cache
+    kw = trader._client.calls[1][2]
+    assert kw["contractType"] == "CALL" and kw["fromDate"] == kw["toDate"] == "2026-11-02"
+    for bad in (("AAPL; DROP", "2026-11-02", "CALL"), ("AAPL", "next friday", "CALL"), ("AAPL", "2026-11-02", "BOTH")):
+        with pytest.raises(ValueError):
+            trader.chain(*bad)
+
+
+def test_index_underlyings_get_schwabs_dollar_prefix(trader):
+    # A bare SPX on /chains is a 400 at Schwab (2026-11-02); $SPX typed by hand stays as it is.
+    trader._client = ChainClient()
+    trader.expirations("spx")
+    trader.chain("SPX", "2026-11-02", "PUT")
+    trader.chain("$NDX", "2026-11-02", "PUT")
+    trader.chain("SPY", "2026-11-02", "PUT")
+    assert [c[1] for c in trader._client.calls] == ["$SPX", "$SPX", "$NDX", "SPY"]
+
+
+def test_only_the_order_client_may_read_option_chains():
+    from companion import schwab
+    assert {"option_chains", "option_expiration_chain"} <= schwab._TRADING
+    assert not ({"option_chains", "option_expiration_chain"} & schwab._ALLOWED)
+    assert trading.OCC_RE.match(CALL) and trading.OCC_RE.match("SPY   261120P00600000")
+    assert not trading.OCC_RE.match("AAPL")
+
+
+# ---- size by quantity, no stop, no target ------------------------------------------------------
+
+def qty_req(**kw):
+    # Fixture quote 338.70 / 338.77: the mid entry is 338.74.
+    base = {"ticket_id": "qty-ticket-01", "symbol": "BRVO", "side": "LONG", "stop": "336.00", "risk": 0, "r": 2,
+            "entry": "mid", "size_mode": "qty", "qty": 50, "targets": 0,
+            "expected_limit": "338.74", "expected_qty": 50, "expected_target": None}
+    return {**base, **kw}
+
+
+def test_quantity_ticket_with_stop_only(trader):
+    r = trader.submit(qty_req())
+    assert r["ok"], r
+    (order,) = trader._client.placed
+    assert order["orderStrategyType"] == "TRIGGER" and order["orderLegCollection"][0]["quantity"] == 50
+    (stop,) = order["childOrderStrategies"]
+    assert stop["orderType"] == "STOP" and stop["stopPrice"] == "336.00"
+    t = trader.store.get_ticket("qty-ticket-01")
+    assert t["target"] == "" and t["stop"] == "336.00" and t["risk"] == 137.0      # 50 x 2.74
+
+
+def test_no_stop_ticket_needs_the_confirmation(trader):
+    req = qty_req(stop="", stop_type="none")
+    r = trader.submit(req)
+    assert not r["ok"] and "confirmation" in r["error"] and trader._client.placed == []
+    r = trader.submit({**req, "confirm_no_stop": True})
+    assert r["ok"], r
+    (order,) = trader._client.placed
+    assert order["orderStrategyType"] == "SINGLE" and "childOrderStrategies" not in order
+    t = trader.store.get_ticket("qty-ticket-01")
+    assert t["stop"] == "" and t["target"] == ""
+    assert trader.r_basis([]) == {}                     # no stop, no R
+
+
+def _stopless_fill(trader):
+    assert trader.submit(qty_req(stop="", stop_type="none", confirm_no_stop=True))["ok"]
+    oid = trader.store.get_ticket("qty-ticket-01")["order_id"]
+    return {"orderId": oid, "status": "FILLED", "orderStrategyType": "SINGLE", "orderActivityCollection": [
+        {"executionType": "FILL", "executionLegs": [{"quantity": 50, "price": 338.74,
+                                                     "time": "2099-01-01T14:00:20+0000"}]}]}
+
+
+def _stop_at(trader, stop, oid, created):
+    trader.store.record_stop("BRVO", stop, oid)
+    trader.store._con.execute("update companion_stops set created=? where order_id=?", (created, oid))
+
+
+def _stop_order(oid, status="WORKING", stop=337.74):
+    return {"orderId": oid, "status": status, "orderStrategyType": "SINGLE", "orderType": "STOP",
+            "stopPrice": stop}
+
+
+def test_no_stop_ticket_takes_r_from_the_first_stop_set_after_the_fill(trader):
+    filled = _stopless_fill(trader)
+    _stop_at(trader, "339.50", 1, "2099-01-01T14:00:30.000+00:00")   # above a long entry: not a risk stop
+    assert trader.r_basis([filled, _stop_order(1, stop=339.5)]) == {}
+    _stop_at(trader, "339.50", 1, "2099-01-01T14:00:10.000+00:00")   # moved before the fill
+    _stop_at(trader, "337.74", 2, "2099-01-01T14:01:00.000+00:00")
+    _stop_at(trader, "338.00", 3, "2099-01-01T14:02:00.000+00:00")   # a later stop never redefines R
+    orders = [filled, _stop_order(2, "REPLACED"), _stop_order(3, stop=338.0)]
+    b = trader.r_basis(orders)["BRVO"]
+    assert b["stop"] == 337.74 and abs(b["rps"] - 1.0) < 1e-9 and b["entry"] == 338.74
+
+
+def test_stopless_r_skips_a_rejected_stop_and_the_fill_second(trader):
+    filled = _stopless_fill(trader)
+    _stop_at(trader, "337.00", 1, "2099-01-01T14:00:20.500+00:00")   # same second as the fill: the trade before
+    _stop_at(trader, "337.24", 2, "2099-01-01T14:00:40.000+00:00")   # an OCO whose stop leg Schwab rejected
+    _stop_at(trader, "337.74", 3, "2099-01-01T14:01:00.000+00:00")
+    oco = {"orderId": 2, "status": "WORKING", "orderStrategyType": "OCO", "childOrderStrategies": [
+        {"orderId": 21, "status": "WORKING", "orderType": "LIMIT", "price": 340.0},
+        _stop_order(22, "REJECTED", 337.24)]}
+    orders = [filled, _stop_order(1, stop=337.0), oco, _stop_order(3)]
+    assert trader.r_basis(orders)["BRVO"]["stop"] == 337.74
+
+
+def test_stopless_r_waits_for_the_first_stop_to_show_working(trader):
+    filled = _stopless_fill(trader)
+    _stop_at(trader, "337.74", 1, "2099-01-01T14:01:00.000+00:00")   # accepted, not seen yet
+    _stop_at(trader, "338.24", 2, "2099-01-01T14:02:00.000+00:00")   # a later rebuild after a move
+    assert trader.r_basis([filled, _stop_order(2, stop=338.24)]) == {}            # no R, not the later stop
+    assert trader.r_basis([filled, _stop_order(1, "ACCEPTED"), _stop_order(2, stop=338.24)]) == {}
+    b = trader.r_basis([filled, _stop_order(1), _stop_order(2, stop=338.24)])["BRVO"]
+    assert b["stop"] == 337.74
+
+
+def test_stopless_r_stays_frozen_once_shown(trader):
+    filled = _stopless_fill(trader)
+    _stop_at(trader, "337.74", 1, "2099-01-01T14:01:00.000+00:00")
+    _stop_at(trader, "338.24", 2, "2099-01-01T14:02:00.000+00:00")
+    oco = {"orderId": 1, "status": "WORKING", "orderStrategyType": "OCO", "childOrderStrategies": [
+        {"orderId": 11, "status": "ACCEPTED", "orderType": "LIMIT", "price": 340.0},
+        _stop_order(12, "AWAITING_STOP_CONDITION")]}
+    assert trader.r_basis([filled, oco])["BRVO"]["stop"] == 337.74
+    oco["childOrderStrategies"][0]["status"] = "REJECTED"           # the target leg, later
+    assert trader.r_basis([filled, oco, _stop_order(2, stop=338.24)])["BRVO"]["stop"] == 337.74
+    assert trader.r_basis([filled])["BRVO"]["stop"] == 337.74       # gone from the listing
+
+
+def test_a_set_stop_is_recorded_as_soon_as_schwab_accepts_it(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_trailing()])
+    monkeypatch.setattr(trader, "_fresh_orders", lambda client, orders=None: [])   # never shows up
+    r = trader.move_stop("MXR", "910.00", [], set())
+    assert trader._client.placed and "Not confirmed" in r.get("message", r.get("error", ""))
+    assert [st for st, _ in trader.store.stops_since("MXR", "2000-01-01")] == ["910.00"]
+
+
+def test_no_stop_lock_is_a_tenth_of_a_percent(trader, monkeypatch):
+    req = qty_req(stop="", stop_type="none", confirm_no_stop=True)
+    _quote(monkeypatch, trader, 338.80, 338.95)           # mid 338.875: 0.135 against, under 0.1% (0.339)
+    assert trader.submit(req)["ok"]
+    _quote(monkeypatch, trader, 339.05, 339.20)           # mid 339.125: 0.385 against, refused
+    r = trader.submit({**req, "ticket_id": "qty-ticket-02"})
+    assert not r["ok"] and "Price moved" in r["error"]
+
+
+def test_quantity_ticket_refuses_a_changed_quantity_or_target(trader):
+    r = trader.submit(qty_req(expected_qty=40))
+    assert not r["ok"] and "now says 50 shares" in r["error"]
+    r = trader.submit(qty_req(targets=1))                 # the plan has a target, the page showed none
+    assert not r["ok"] and "ticket showed none" in r["error"]
+    r = trader.submit(qty_req(expected_target="344.22"))  # the page showed a target, the plan has none
+    assert not r["ok"] and "plan has none" in r["error"]
+    assert trader._client.placed == []
+
+
+def test_target_only_ticket(trader):
+    r = trader.submit(qty_req(stop="", stop_type="none", targets=1, target_price="342.00",
+                              expected_target="342.00", confirm_no_stop=True))
+    assert r["ok"], r
+    (tgt,) = trader._client.placed[0]["childOrderStrategies"]
+    assert tgt["orderType"] == "LIMIT" and tgt["price"] == "342.00"
+
+
+def test_reconcile_matches_the_new_order_shapes():
+    from companion.bracket import bracket_order, plan
+    kw = dict(symbol="NVDA", side="LONG", stop="186.50", risk=0, r_multiple=2, bid="188.62", ask="188.68",
+              entry="mid", size_mode="qty", qty=100)
+
+    def as_schwab(o):
+        """What Schwab reports back: ids, statuses, numbers instead of strings."""
+        import copy
+        o = copy.deepcopy(o)
+        ids = iter(range(100, 200))
+
+        def walk(n):
+            n["orderId"], n["status"] = next(ids), "WORKING"
+            for k in ("price", "stopPrice"):
+                if k in n:
+                    n[k] = float(n[k])
+            for ch in n.get("childOrderStrategies") or []:
+                walk(ch)
+        walk(o)
+        return o
+    for p in (plan(**kw, target=False), plan(**{**kw, "stop_type": "none"}, target=False),
+              plan(**{**kw, "stop_type": "none"}, target_price="195.00")):
+        sent = bracket_order(p)
+        assert Trader._matches(as_schwab(sent), {"request": sent}), sent
+    a, b = bracket_order(plan(**kw, target=False)), bracket_order(plan(**{**kw, "qty": 99}, target=False))
+    assert not Trader._matches(as_schwab(a), {"request": b})
+
+
+def test_typed_limit_does_not_follow_the_quote(trader, monkeypatch):
+    req = {"ticket_id": "lmt-ticket-01", "symbol": "BRVO", "side": "LONG", "stop": "336.00", "risk": 500, "r": 2,
+           "entry": "limit", "limit_price": "338.00", "expected_limit": "338.00", "expected_qty": 250,
+           "expected_target": "342.00"}
+    _quote(monkeypatch, trader, 339.40, 339.50)          # the market moved up: your limit stays your limit
+    r = trader.submit(req)
+    assert r["ok"], r
+    assert trader._client.placed[0]["price"] == "338.00"
+    _quote(monkeypatch, trader, 335.90, 336.00)          # now the stop is at the bid: refused, nothing sent
+    r = trader.submit({**req, "ticket_id": "lmt-ticket-02"})
+    assert not r["ok"] and len(trader._client.placed) == 1
+
+
+def _mu_target_only():
+    return _leaf(70, "LIMIT", 57, price=900.18)
+
+
+def test_partial_on_a_target_only_position_puts_the_target_back(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_target_only()])              # short 57, target only, no stop
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    partial, target = trader._client.placed
+    assert partial["orderType"] == "MARKET" and partial["orderLegCollection"][0]["quantity"] == 28
+    assert target["orderStrategyType"] == "SINGLE" and target["orderType"] == "LIMIT" and target["price"] == "900.18"
+    assert target["orderLegCollection"][0] == {"instruction": "BUY_TO_COVER", "quantity": 29,
+                                               "instrument": {"symbol": "MXR", "assetType": "EQUITY"}}
+    assert not r["ok"] and "put back on the 29" in r["error"] and "NO STOP" in r["error"]
+
+
+def test_partial_on_a_target_only_position_says_when_the_target_is_lost(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    broker = Broker([_mu_target_only()])
+    real = broker.place_order
+    broker.place_order = lambda h, o: Resp(400, text="bad price") if o.get("orderType") == "LIMIT" else real(h, o)
+    trader._client = broker
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert not r["ok"] and "target is GONE" in r["error"]
+
+
+def test_partial_target_only_with_a_server_error_says_it_may_be_working(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    broker = Broker([_mu_target_only()])
+    real = broker.place_order
+    broker.place_order = lambda h, o: Resp(500, text="boom") if o.get("orderType") == "LIMIT" else real(h, o)
+    trader._client = broker
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert not r["ok"] and "MAY be working" in r["error"] and "GONE" not in r["error"]
+
+
+# ---- leg guard: Close / partial on one leg of a spread or on covered shares ----------------
+
+LONG_C, SHORT_C = "META  261120C00615000", "META  261120C00620000"
+
+
+def _opt(sym, qty, put_call="CALL", und="META"):
+    return {"instrument": {"symbol": sym, "assetType": "OPTION", "putCall": put_call, "underlyingSymbol": und},
+            "longQuantity": max(qty, 0), "shortQuantity": max(-qty, 0)}
+
+
+def _call_leg(qty, others, orders=()):
+    return Broker(list(orders), position=(LONG_C if qty > 0 else SHORT_C, qty, "OPTION"),
+                  ins={"putCall": "CALL", "underlyingSymbol": "META"}, others=others)
+
+
+def test_closing_the_long_leg_of_a_call_spread_asks_first(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = _call_leg(2.0, [_opt(SHORT_C, -2.0)])
+    r = trader.close_position(LONG_C, [], set())
+    assert not r["ok"] and r["needs_confirm"] and "UNCOVERED" in r["error"] and SHORT_C in r["error"]
+    assert trader._client.placed == []
+    r = trader.close_position(LONG_C, [], set(), confirm_leg=True)
+    (order,) = trader._client.placed
+    assert order["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE"
+
+
+def test_closing_the_short_leg_says_the_long_is_left_alone(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = _call_leg(-2.0, [_opt(LONG_C, 2.0)])
+    r = trader.close_position(SHORT_C, [], set())
+    assert r["needs_confirm"] and "other leg alone" in r["error"] and trader._client.placed == []
+
+
+def test_closing_shares_under_a_covered_call_asks_first(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([], position=("META", 100.0, "EQUITY"), others=[_opt(SHORT_C, -1.0)])
+    r = trader.close_position("META", [], set())
+    assert r["needs_confirm"] and "UNCOVERED" in r["error"] and trader._client.placed == []
+
+
+def test_unrelated_options_do_not_trigger_the_leg_guard(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    others = [_opt("META  261120P00590000", -1.0, "PUT"),                 # a put, not the call's pair
+              _opt("AMD   261120C00200000", -1.0, und="AMD"),             # another underlying
+              _opt("META  261120C00630000", 1.0)]                         # same side as the closed leg
+    trader._client = _call_leg(2.0, others)
+    r = trader.close_position(LONG_C, [], set())
+    assert r["ok"] and len(trader._client.placed) == 1
+    trader._client = Broker([], position=("META", 100.0, "EQUITY"), others=[_opt("META  261120P00590000", -1.0, "PUT")])
+    assert trader.close_position("META", [], set())["ok"]                 # a short put is not covered by shares
+
+
+def test_a_working_spread_order_on_the_leg_asks_first(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    spread = {"orderId": 81, "orderStrategyType": "SINGLE", "status": "WORKING", "filledQuantity": 0,
+              "orderLegCollection": [
+                  {"instruction": "SELL_TO_CLOSE", "instrument": {"symbol": LONG_C}},
+                  {"instruction": "BUY_TO_CLOSE", "instrument": {"symbol": SHORT_C}}]}
+    trader._client = _call_leg(2.0, [], orders=[spread])
+    r = trader.close_position(LONG_C, [], set())
+    assert r["needs_confirm"] and "multi-leg" in r["error"] and trader._client.placed == []
+
+
+def test_a_partial_on_a_spread_leg_asks_first(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = _call_leg(4.0, [_opt(SHORT_C, -4.0)])
+    r = trader.take_partial(LONG_C, 0.5, None, [], set())
+    assert r["needs_confirm"] and "UNCOVERED" in r["error"] and trader._client.placed == []
+    r = trader.take_partial(LONG_C, 1.0, None, [], set())                # 100% goes through Close's guard
+    assert r["needs_confirm"] and trader._client.placed == []
+    trader.take_partial(LONG_C, 0.5, None, [], set(), confirm_leg=True)
+    assert trader._client.placed and trader._client.placed[0]["orderLegCollection"][0]["quantity"] == 2
+
+
+def test_leg_guard_falls_back_to_the_contract_symbol(trader, monkeypatch):
+    """Schwab fields missing on one side: underlying and call/put come from the OCC symbol,
+    and SPXW legs pair with an SPX-underlying leg."""
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    bare = {"instrument": {"symbol": SHORT_C, "assetType": "OPTION"}, "longQuantity": 0, "shortQuantity": 2}
+    trader._client = _call_leg(2.0, [bare])
+    assert trader.close_position(LONG_C, [], set())["needs_confirm"]
+    put = {"instrument": {"symbol": "META  261120P00590000", "assetType": "OPTION"}, "longQuantity": 0,
+           "shortQuantity": 1}
+    trader._client = Broker([], position=(LONG_C, 2.0, "OPTION"), others=[put])     # no fields at all
+    assert trader.close_position(LONG_C, [], set())["ok"]                          # a put: no pair
+    trader._client = Broker([], position=("SPXW  261102P07600000", 1.0, "OPTION"),
+                            others=[_opt("SPXW  261102P07610000", -1.0, "PUT", und="$SPX")])
+    assert trader.close_position("SPXW  261102P07600000", [], set())["needs_confirm"]
+
+
+def test_short_shares_under_a_short_put_ask_first(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([], position=("META", -100.0, "EQUITY"),
+                            others=[_opt("META  261120P00590000", -1.0, "PUT")])
+    r = trader.close_position("META", [], set())
+    assert r["needs_confirm"] and "UNCOVERED" in r["error"]
+
+
+def test_a_stock_close_reads_orders_no_more_than_before(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_oco()])
+    calls = []
+    real = trader._client.account_orders
+    trader._client.account_orders = lambda *a, **k: calls.append(1) or real(*a, **k)
+    assert trader.close_position("MXR", list(trader._client.orders.values()), set())["ok"]
+    assert len(calls) == 1                                  # only the cleanup read after the close
+
+
+def test_a_spread_order_pending_cancel_still_asks_first(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    spread = {"orderId": 82, "orderStrategyType": "SINGLE", "status": "PENDING_CANCEL", "filledQuantity": 0,
+              "orderLegCollection": [
+                  {"instruction": "SELL_TO_CLOSE", "instrument": {"symbol": LONG_C}},
+                  {"instruction": "SELL_TO_CLOSE", "instrument": {"symbol": "META  261120P00590000"}}]}
+    trader._client = _call_leg(1.0, [_opt("META  261120P00590000", 1.0, "PUT")], orders=[spread])
+    r = trader.close_position(LONG_C, [], set())
+    assert r["needs_confirm"] and "multi-leg" in r["error"] and trader._client.placed == []
