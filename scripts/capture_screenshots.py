@@ -32,6 +32,19 @@ def main():
         page.locator("#workspace").screenshot(path=str(OUT / "screenshot-workbench.png"))
         # The empty ticket shows the controls (demo has invented quotes if you want a filled one).
         page.locator("#ticket").screenshot(path=str(OUT / "screenshot-ticket.png"))
+        # The spread ticket on the invented AAPL chain: a 225/220 bull put spread about a week out
+        page.click("#t-asset [data-v='SPREAD']")
+        page.fill("#sp-und", "AAPL")
+        page.press("#sp-und", "Enter")
+        page.wait_for_selector("#sp-exp [data-exp]", timeout=10000)
+        page.locator("#sp-exp [data-exp]").nth(4).click()
+        page.wait_for_selector("#sp-chain tr.row[data-sym$='P00225000']", timeout=10000)
+        page.click("#sp-chain tr.row[data-sym$='P00225000']")
+        page.wait_for_timeout(800)
+        page.locator("#sp-width button").nth(1).click()
+        page.wait_for_selector("#sp-why .hd", timeout=10000)
+        page.wait_for_timeout(1500)
+        page.locator("#ticket").screenshot(path=str(OUT / "screenshot-spread-ticket.png"))
         # The floating Manage window view
         m = browser.new_page(viewport={"width": 560, "height": 620}, device_scale_factor=2)
         m.goto(BASE + "/?view=manage", wait_until="networkidle")

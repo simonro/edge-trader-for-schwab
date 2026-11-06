@@ -239,6 +239,8 @@
   .planbox .tot { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 5px; }
   .planbox .err { color: var(--red); }
   #t-go { height: 46px; font-size: 15px; width: 100%; }
+  #t-cancel { display: flex; flex-direction: column; gap: 6px; }
+  #t-cancel .btn { width: 100%; height: 36px; }
   .tk-msg { font-size: 12px; min-height: 16px; }
   .tk-msg.ok { color: var(--green); } .tk-msg.bad { color: var(--red); } .tk-msg.warn { color: var(--amber); }
   .hint { font-size: 11.5px; color: var(--muted); }
@@ -390,6 +392,7 @@
       <div class="planbox" id="t-calc"><span class="mut">Enter symbol, stop and risk.</span></div>
       <button id="t-go" class="btn buy" type="button" disabled>Place trade</button>
       <div class="tk-msg" id="t-msg"></div>
+      <div id="t-cancel"></div>
       <div class="hint" id="t-hint"></div>
     </div>
   </section>
@@ -1028,6 +1031,12 @@ document.addEventListener("click", async e => {
   try {
     const r = act === "all" ? await post("/api/ticket/cancel_entries", {})
                             : await post("/api/ticket/cancel", {order_id: Number(b.dataset.order)});
+    // The ticket's own entry confirmed CANCELED with nothing filled: the same ticket can be sent again.
+    if (T.sentOrderId != null && (act === "all" ? r.results || [] : [r])
+          .some(x => x.ok && String(x.order_id) === String(T.sentOrderId))) {
+      T.sentKey = null; T.sentOrderId = null; T.ticketId = crypto.randomUUID();
+      renderTicket(); scheduleRefresh(100);
+    }
     if (act === "all") {
       const bad = (r.results || []).filter(x => !x.ok);
       msg.className = "tk-msg " + (bad.length ? "bad" : "ok");
@@ -1492,11 +1501,19 @@ function renderTicket() {
   const live = HEALTH === "live";
   go.disabled = !(current && !sent && T.armed && open && !blocked && !T.busy && live);
   go.title = !live ? "Waiting for live data" : !T.armed ? "Arm entries first" : !open ? "Regular hours only" : blocked ? "Resolve the unconfirmed order first" : "";
+  // Unfilled entries for the order just sent or the ticket's symbol: cancel them right here
+  // (same button and server checks as Pending orders).
+  const tsym = ticketReq().symbol;
+  const waiting = (lastState?.orders || []).filter(o => o.cancellable
+    && ((T.sentOrderId != null && String(o.order_id) === String(T.sentOrderId)) || (tsym && o.symbol === tsym)));
+  $("t-cancel").innerHTML = waiting.map(o => actionBtn(`o:${o.order_id}`,
+    `Cancel entry · ${o.instruction.replaceAll("_", " ").toLowerCase()} ${qty(o.qty)} ${o.display || o.symbol} @ ${px(o.price)}`,
+    "entry", {order: o.order_id}, "", false, "danger")).join("");
   $("t-hint").textContent = !T.armed ? "Entries are disarmed: click Entries disarmed to arm until the close."
     : T.entry === "limit" ? (p && p.ok && (p.side === "LONG" ? +p.limit >= p.ask : +p.limit <= p.bid) ? ""
-        : "Your limit rests until the price reaches it, and may not fill. An unfilled entry shows in Pending orders with Cancel entry.")
+        : "Your limit rests until the price reaches it, and may not fill. Cancel entry shows here while it waits.")
     : T.entry === "mid" || (T.entry === "bid" && T.side === "LONG") || (T.entry === "ask" && T.side === "SHORT")
-      ? "This entry rests and may not fill. An unfilled entry shows in Pending orders with Cancel entry."
+      ? "This entry rests and may not fill. Cancel entry shows here while it waits."
       : T.entry === "market" ? (T.sizeMode === "qty" ? "Market entry: fills at once at the market price." : "Market entry: fills at once; shares are sized from the quote, so the risk is an estimate.") : "";
 }
 async function submitTicket() {
@@ -1523,6 +1540,7 @@ async function submitTicket() {
     const r = await post("/api/ticket/submit", body);
     if (r.ok) {
       T.sentKey = T.intentKey;
+      T.sentOrderId = r.order_id ?? null;
       msg.className = "tk-msg ok";
       msg.textContent = r.duplicate ? `Already sent: order ${r.order_id ?? "(id pending)"}.`
         : `Sent: order ${r.order_id ?? "(id pending)"}, ${r.plan.asset === "OPTION" ? (r.plan.side === "LONG" ? "buy to open" : "sell to open") : r.plan.side} ${r.plan.qty} ${r.plan.asset === "OPTION" ? optName(r.plan.symbol) : r.plan.symbol} ${r.plan.market ? "at market" : "@ " + r.plan.limit}, stop ${r.plan.has_stop ? (r.plan.stop || "trailing") : "none"}, target ${r.plan.has_target ? r.plan.target : "none"}.`;
@@ -1684,6 +1702,18 @@ $("t-brackets").addEventListener("click", async e => {
 renderTargets();
 renderStopType();
 
+// Optional features the server names (not part of every build) bring their own page script.
+const FEATURES_LOADED = new Set();
+function loadFeatures(st) {
+  for (const f of st.features || []) {
+    if (FEATURES_LOADED.has(f) || !/^[a-z]+$/.test(f)) continue;
+    FEATURES_LOADED.add(f);
+    const el = document.createElement("script");
+    el.src = `/features/${f}.js`;
+    document.head.appendChild(el);
+  }
+}
+
 let lastState = null;
 let lastOk = 0;          // when the browser last got a state from the companion server
 let TICKING = false;     // one state request at a time: a slow answer never stacks up
@@ -1699,6 +1729,7 @@ async function tick() {
     lastOk = Date.now();
     updateHealth();          // health first, so the render below draws buttons with the right state
     render(lastState);
+    loadFeatures(lastState);
     try { announceTrades(lastState); } catch (e) { console.error("trade voice", e); }
   } catch (e) { /* updateHealth turns the page red */ }
   TICKING = false;

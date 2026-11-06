@@ -68,6 +68,7 @@ class Poller:
         self.orders_sweep: dict[int, dict] = {}
         self.orders_followed: dict[int, dict] = {}   # final state of vanished orders
         self.followed_at: dict[int, float] = {}      # when each followed order was last asked
+        self.spread_follow: list[int] = []           # companion spread orders to ask about (private)
         self.quotes: dict = {}
         self.trail_best: dict[int, float] = {}   # trailing stop order id -> best price seen
         self.hours: dict = {}       # today's and the next regular session (Schwab, holidays and early closes)
@@ -241,7 +242,9 @@ class Poller:
             # was cancelled later never keeps counting as protection.
             stale = sorted((oid for oid in self.orders_followed if oid not in found and oid not in self.orders_today),
                            key=lambda o: self.followed_at.get(o, 0.0))      # least recently asked first
-            self._follow((vanished + stale)[:DETAILS_PER_SWEEP])
+            # A companion spread's own orders come first: their final fills settle the spread.
+            spread = [o for o in self.spread_follow if o not in found and o not in self.orders_today]
+            self._follow(list(dict.fromkeys(spread + vanished + stale))[:DETAILS_PER_SWEEP])
         elif name == "transactions":
             if not self._fetch_transactions(name, self._session_start_utc() - timedelta(hours=1), now):
                 return False
@@ -321,6 +324,20 @@ class Poller:
         age = (datetime.now(timezone.utc) - datetime.fromisoformat(f["ok_at"])).total_seconds()
         return age <= f["interval"] * 3
 
+    def _regular_session(self) -> bool:
+        """Inside today's regular session: Schwab's own hours when known (holidays, early closes),
+        else the plain 9:30 to 16:00 weekday rule."""
+        from .trading import market_open
+        if not market_open():
+            return False
+        if "today" not in (self.hours or {}):
+            return True
+        s = self.hours["today"]
+        if not s:
+            return False                     # Schwab says the market is closed today
+        now = datetime.now(timezone.utc)
+        return datetime.fromisoformat(s["open"]) <= now < datetime.fromisoformat(s["close"])
+
     def _fetch_hours(self, name: str, now: datetime) -> bool:
         """Today's regular session and the next one that has not ended (up to a week ahead, so a
         weekend or holiday costs a few calls every 30 min)."""
@@ -372,6 +389,19 @@ class Poller:
                 sym = (p.get("instrument") or {}).get("symbol")
                 if sym:
                     positions[sym] = float(p.get("longQuantity") or 0) - float(p.get("shortQuantity") or 0)
+            if self.trader.spreads:
+                # Companion spreads: persist fills, judge each one against the account, show them.
+                fresh = self._orders_fresh() and self._fresh("account") and self.account is not None
+                merged = self._merged_orders()
+                st["spreads"] = [self.trader.spreads.view(sp) for sp in self.trader.spreads.reconcile(
+                                     merged, positions if fresh else None, datetime.now(ET).date(), fresh,
+                                     observation=(self.fresh["account"]["ok_at"],
+                                                  self.fresh["orders_sweep"]["ok_at"]))]
+                self.spread_follow = self.trader.spreads.to_follow(merged)
+                st["spreads"] = self.trader.spreads.watch_stops(st["spreads"], self.quotes, self._regular_session())
+                midnight = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
+                st["spreads_closed"] = [self.trader.spreads.view(sp) for sp in self.trader.spreads.closed_since(
+                    midnight.astimezone(timezone.utc).isoformat())]
             st["trading"] = self.trader.status()
             st["brackets"] = self.trader.brackets(
                 today, pending_orders(self._merged_orders(), self.terminal), positions,

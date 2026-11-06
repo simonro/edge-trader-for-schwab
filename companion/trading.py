@@ -29,6 +29,11 @@ from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage,
 from .pnl import ET
 from .store import Store, now_iso
 
+try:                      # optional feature (companion/spreads); the app runs without it
+    from .spreads.spreads import SpreadBook
+except ImportError:
+    SpreadBook = None
+
 log = logging.getLogger("companion.trading")
 
 LOCK_R = Decimal("0.1")       # the click keeps the displayed plan while price moved <= 0.1R against it
@@ -97,6 +102,26 @@ def unfilled_entry(o: dict) -> tuple[bool, str]:
             if kid.get("status") in LIVE:
                 return False, "its stop or target is already live, so part of it filled"
     return True, ""
+
+
+# Statuses an older order can still execute from; Resolve reads each over the 59-day window.
+RESOLVE_SWEEP = ("WORKING", "PENDING_ACTIVATION", "QUEUED", "ACCEPTED", "AWAITING_PARENT_ORDER",
+                 "AWAITING_CONDITION", "AWAITING_STOP_CONDITION", "PENDING_REPLACE", "PENDING_CANCEL")
+
+
+def _nodes(orders: list[dict]):
+    """Every order node in the trees, children included."""
+    for o in orders:
+        yield o
+        yield from _nodes(o.get("childOrderStrategies") or [])
+
+
+def _all_symbols(o: dict) -> set[str]:
+    """Every contract in an order tree (legs of the order and of all its children)."""
+    out = {(leg.get("instrument") or {}).get("symbol") for leg in o.get("orderLegCollection") or []}
+    for ch in o.get("childOrderStrategies") or []:
+        out |= _all_symbols(ch)
+    return {x for x in out if x}
 
 
 def _symbol(o: dict) -> str | None:
@@ -292,6 +317,7 @@ class Trader:
         self._hash: str | None = None
         self._send_lock = threading.Lock()
         self._quote_cache: dict[str, tuple[float, dict]] = {}
+        self.spreads = SpreadBook(store) if SpreadBook else None
 
     # ---- plumbing ----------------------------------------------------------
 
@@ -555,7 +581,7 @@ class Trader:
         p = self.make_plan(req, q=q, limit_override=exp_limit)
         if not p.ok:
             return {"ok": False, "error": "; ".join(p.errors), "plan": now.as_dict()}
-        blocked = self._blocked(p.symbol, self._ensure())
+        blocked = self._blocked(p.symbol, self._ensure()) or self._spread_gate([p.symbol])
         if blocked:
             return {"ok": False, "error": blocked["error"]}
         # Lock: a move against the entry up to 0.1R keeps the displayed plan. For a limit entry the
@@ -705,6 +731,9 @@ class Trader:
             return {"ok": False, "order_id": order_id, "error": f"Could not read the order (HTTP {r.status_code})."}
         o = r.json()
         sym = _symbol(o)
+        gate = self._spread_gate(_all_symbols(o), order_id=order_id, symbol=sym)
+        if gate:
+            return gate
         ok, why = unfilled_entry(o)
         if not ok:
             self.store.log_action("cancel_entry", sym, order_id, "REFUSED", why)
@@ -863,6 +892,9 @@ class Trader:
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "error": "Another order action is in progress."}
         try:
+            gate = self._spread_gate([symbol], symbol=symbol)
+            if gate:
+                return gate
             client = self._ensure()
             res = self._cancel_fast(client, symbol, self._fresh_orders(client, orders), known_terminal)
             n = len(res["results"])
@@ -963,6 +995,9 @@ class Trader:
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
+            gate = self._spread_gate([symbol], symbol=symbol)
+            if gate:
+                return gate
             return self._close_locked(symbol, orders, known_terminal, confirm_leg)
         except Exception as e:
             log.exception("close failed")
@@ -976,8 +1011,9 @@ class Trader:
         """The latest close or partial for this symbol, if its outcome is still open: SENDING /
         UNKNOWN (no answer), or a Schwab status that is not final (WORKING, QUEUED, SENT...). An
         open Schwab status is asked again first; once Schwab says it is final, it stops blocking.
-        Until then no new close, partial, stop, target or trail is sent for the symbol."""
-        start = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        Until then no new close, partial, stop, target or trail is sent for the symbol. Looks back
+        30 days, not just today: an unclear close before an overnight hold must still block."""
+        start = datetime.now(timezone.utc) - timedelta(days=30)
         acts = [a for a in self.store.actions_since(start.isoformat())
                 if a["kind"] in ("close", "partial") and a["symbol"] == symbol]
         if not acts:
@@ -1007,6 +1043,59 @@ class Trader:
         return {"ok": False, "symbol": symbol, "unresolved_close": True,
                 "error": f"A previous {symbol} {prior['kind']} ({prior['created'][11:19]} UTC, {prior['status']}) has an "
                          "open outcome. Check thinkorswim, then press Resolve before sending another order for it."}
+
+    def _spread_gate(self, symbols, **extra) -> dict | None:
+        """Refuse any single-leg action on a contract an active companion spread holds: a leg is
+        never closed, stopped, targeted, trailed or cancelled alone (confirm_leg does not bypass
+        this). Only the spread's own actions may touch it, or the user resolves the spread first."""
+        sp = self.spreads.owner_of(symbols) if self.spreads else None
+        if not sp:
+            return None
+        legs = " / ".join(l["symbol"].strip() for l in sp["legs"])
+        return {"ok": False, **extra, "spread_id": sp["spread_id"],
+                "error": f"That contract is a leg of a companion spread ({sp['kind']} {legs}, {sp['state']}). "
+                         "Use the spread's own actions, or Resolve the spread first. Nothing was sent."}
+
+    def resolve_spread(self, spread_id: str, orders: list[dict] | None = None) -> dict:
+        """The user checked thinkorswim: release a spread that is BROKEN, EXPIRED_CHECK, NEEDS_ACTION or
+        UNKNOWN (its contracts are free for single-leg actions again). Sends nothing. Refused while
+        any working order (a fresh read) touches one of its contracts: an order replaced in
+        thinkorswim gets a new id Schwab does not link to the old one."""
+        sp = self.spreads.get(spread_id) if self.spreads else None
+        if not sp:
+            return {"ok": False, "error": "No such spread."}
+        if not self._send_lock.acquire(blocking=False):
+            return {"ok": False, "error": "Another order action is in progress."}
+        try:
+            client = self._ensure()
+            fresh = self._fresh_orders(client, orders or [])
+            # Older working orders too (a GTC replaced days ago), read now, never from a cache.
+            now = datetime.now(timezone.utc)
+            for status in RESOLVE_SWEEP:
+                r = self._logged("account_orders", lambda st=status: client.account_orders(
+                    self._hash, now - timedelta(days=59), now, status=st))
+                if r.status_code != 200:
+                    return {"ok": False, "spread_id": spread_id,
+                            "error": f"Could not read older working orders (HTTP {r.status_code}): nothing released."}
+                fresh += r.json() or []
+            legs = {l["symbol"] for l in sp["legs"]}
+            terminal = terminal_ids(fresh)
+            live = sorted({o.get("orderId") for o in _nodes(fresh)
+                           if o.get("orderId") not in terminal and o.get("status") not in TERMINAL
+                           and _all_symbols({"orderLegCollection": o.get("orderLegCollection")}) & legs})
+            if live:
+                return {"ok": False, "spread_id": spread_id,
+                        "error": f"Working order(s) {', '.join(map(str, live))} still touch this spread's "
+                                 "contracts: cancel them in thinkorswim first, then Resolve."}
+            ok, why = self.spreads.resolve(spread_id)
+        except Exception as e:
+            log.exception("resolve spread failed")
+            return {"ok": False, "spread_id": spread_id, "error": f"Could not check the orders: {e}"[:300]}
+        finally:
+            self._send_lock.release()
+        if ok:
+            self.store.log_action("spread", None, None, "RESOLVED_MANUALLY", spread_id)
+        return {"ok": ok, "spread_id": spread_id, "error": why}
 
     def resolve_close(self, symbol: str) -> None:
         """the user checked thinkorswim after an unclear close or partial; allow orders again."""
@@ -1143,6 +1232,9 @@ class Trader:
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
+            gate = self._spread_gate([symbol], symbol=symbol)
+            if gate:
+                return gate
             return self._move_stop_locked(symbol, new_stop, orders, known_terminal)
         except Exception as e:
             log.exception("move stop failed")
@@ -1318,6 +1410,9 @@ class Trader:
             self.store.set_auto_be(ticket_id, "PENDING", "another order action was running")
             return {"ok": False, "state": "PENDING"}
         try:
+            gate = self._spread_gate([symbol], symbol=symbol)
+            if gate:
+                return done("SKIPPED", gate["error"])
             client = self._ensure()
             qty, asset = self._position(client, symbol)
             if abs(qty) < 1e-9 or (qty > 0) != long:
@@ -1426,6 +1521,9 @@ class Trader:
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
+            gate = self._spread_gate([symbol], symbol=symbol)
+            if gate:
+                return gate
             return self._set_trail_locked(symbol, unit, value, basis, orders, known_terminal, rbasis, prior_trail_level)
         except Exception as e:
             log.exception("trail failed")
@@ -1519,6 +1617,9 @@ class Trader:
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
+            gate = self._spread_gate([symbol], symbol=symbol)
+            if gate:
+                return gate
             return self._set_target_locked(symbol, price, r_mult, orders, known_terminal, basis, prior_trail_level)
         except Exception as e:
             log.exception("set target failed")
@@ -1626,6 +1727,9 @@ class Trader:
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
+            gate = self._spread_gate([symbol], symbol=symbol)
+            if gate:
+                return gate
             return self._partial_locked(symbol, pct, shares, orders, known_terminal,
                                         mode if mode in ("mid", "market", "ask", "bid") else "mid", prior_trail_level,
                                         confirm_leg)
@@ -2069,10 +2173,20 @@ class Trader:
         (rejected, reason): rejected=True when Schwab said no, False when the preview gave no clear
         answer (no reply, a rate limit, a server error, an unreadable body). Either way nothing is
         sent: when unsure, refuse."""
+        return self._preview_answer(client, order)[0]
+
+    def _preview_answer(self, client, order: dict) -> tuple[tuple[bool, str] | None, dict | None]:
+        """One previewOrder call: (refusal as in _preview_refusal, the preview body when Schwab
+        accepted the order, else None)."""
         try:
             r = self._logged("preview_order", lambda: client.preview_order(self._hash, order))
         except Exception as e:
-            return False, f"no answer: {type(e).__name__}"
+            return (False, f"no answer: {type(e).__name__}"), None
+        refused = self._read_preview(r)
+        return refused, (r.json() if refused is None else None)
+
+    @staticmethod
+    def _read_preview(r) -> tuple[bool, str] | None:
         if isinstance(r, _Throttled) or r.status_code == 429:
             return False, "rate limit; try again in a few seconds"
         if 400 <= r.status_code < 500:

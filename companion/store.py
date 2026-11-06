@@ -288,6 +288,12 @@ class Store:
             rows = self._con.execute("select order_id from tickets where order_id is not null").fetchall()
         return {r[0] for r in rows}
 
+    def get_order(self, order_id: int) -> dict | None:
+        """The latest saved version of one top-level order, or None."""
+        with self._lock:
+            row = self._con.execute("select payload from orders where order_id = ?", (order_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
     def all_orders(self) -> list[dict]:
         with self._lock:
             rows = self._con.execute("select payload from orders").fetchall()
