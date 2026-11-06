@@ -5,4 +5,4 @@ python-dotenv>=1.0
 requests>=2.31
 pywebview>=6.2     # floating Entry / Manage windows (companion/floating.py)
 pytest>=8          # tests
-httpx>=0.27        # tests (FastAPI TestClient)
+httpx>=0.28.1        # tests (FastAPI TestClient)
