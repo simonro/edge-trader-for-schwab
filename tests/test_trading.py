@@ -27,6 +27,11 @@ class FakeClient:
             raise self.exc
         return self.resp
 
+    def account_details(self, _hash, fields=None):      # no positions: a new ticket is never on a held symbol
+        r = Resp(200)
+        r.json = lambda: {"securitiesAccount": {"positions": []}}
+        return r
+
 
 @pytest.fixture
 def trader(tmp_path, monkeypatch):
@@ -435,7 +440,8 @@ class Broker(FakeClient):
 
     def account_details(self, _h, fields=None):
         pos = [] if not self.qty else [{"instrument": {"symbol": self.sym, "assetType": self.asset, **self.ins},
-                                        "longQuantity": max(self.qty, 0), "shortQuantity": max(-self.qty, 0)}]
+                                        "longQuantity": max(self.qty, 0), "shortQuantity": max(-self.qty, 0),
+                                        **({"averagePrice": self.avg} if getattr(self, "avg", None) else {})}]
         pos += self.others
         return JsonResp(200, {"securitiesAccount": {"positions": pos}})
 
@@ -778,7 +784,7 @@ def _mu_trailing():
 def test_partial_on_a_trailing_position_rebuilds_a_trailing_stop(trader, monkeypatch):
     _quote_mark(trader, monkeypatch)
     trader._client = Broker([_mu_trailing()])
-    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market", trail_choice=RESTART)
     assert r["ok"], r
     rebuild = trader._client.placed[-1]
     target, stop = rebuild["childOrderStrategies"]
@@ -800,10 +806,123 @@ def test_move_stop_on_a_trailing_position_goes_back_to_fixed(trader, monkeypatch
 def test_set_target_keeps_the_trailing_stop(trader, monkeypatch):
     _quote_mark(trader, monkeypatch)
     trader._client = Broker([_mu_trailing()])
-    r = trader.set_target("MXR", "898.00", None, [], set(), None)
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None, RESTART)
     assert r["ok"], r
     target, stop = trader._client.placed[0]["childOrderStrategies"]
     assert target["price"] == "898.00" and stop["orderType"] == "TRAILING_STOP"
+
+
+# A new OCO restarts a trailing stop from the current price (INTC live test, 2026-11-09). Mark 906,
+# $2.50 trail on a short (order 51): the restart sits at 908.50. Nothing is sent until the user
+# picks "restart" or "fixed" for that trailing order; "fixed" uses the level the user was shown.
+RESTART = {"choice": "restart", "order": 51}
+
+
+def _row_trail(best=905.3, order_id=51, **kw):
+    """The dashboard row's trail: the app's best mark since the order entered (estimate)."""
+    return {"order_id": order_id, "estimated": True, "best": best, "level": round(best + 2.5, 2), **kw}
+
+
+def test_set_target_on_a_trail_always_asks_first(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_trailing()])
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None, None, _row_trail())
+    assert not r["ok"] and r["needs_trail_choice"] and r["trail_order"] == 51, r
+    assert r["reached"] == "907.80" and r["start"] == "908.50" and "0.70 looser" in r["error"]
+    # Restart tighter than the app's estimate: still asked (Schwab's real level can be tighter).
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None, None, _row_trail(best=906.8))
+    assert r["needs_trail_choice"] and "can be tighter" in r["error"], r
+    # No level known (no row trail, or the row's trail is another order): restart only.
+    for info in (None, _row_trail(order_id=99)):
+        r = trader.set_target("MXR", "898.00", None, [], set(), None, None, None, info)
+        assert r["needs_trail_choice"] and r["reached"] is None and "cannot be kept" in r["error"], r
+    assert trader._client.placed == []
+
+
+def test_set_target_fixed_choice_ends_the_trail_at_the_approved_level(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_trailing()])
+    info = _row_trail(best=905.303)                  # raw 907.803: a short's stop rounds UP, never tighter
+    assert trader.set_target("MXR", "898.00", None, [], set(), None, None, None, info)["reached"] == "907.81"
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None,
+                          {"choice": "fixed", "order": 51, "reached": "907.81"}, info)
+    assert r["ok"] and "trail ended" in r["message"], r
+    (order,) = trader._client.placed
+    target, stop = order["childOrderStrategies"]
+    assert stop["orderType"] == "STOP" and stop["stopPrice"] == "907.81"
+    assert stop["orderLegCollection"][0]["quantity"] == 57 and target["price"] == "898.00"
+
+
+def test_fixed_level_from_schwab_is_used_as_is(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_trailing()])
+    info = {"order_id": 51, "estimated": False, "level": 907.25, "best": None}
+    assert trader.set_target("MXR", "898.00", None, [], set(), None, None, None, info)["reached"] == "907.25"
+
+
+def test_trail_choice_is_bound_to_the_order_and_the_level(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_trailing()])
+    info = _row_trail()                              # reached 907.80
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None, {"choice": "restart", "order": 77}, info)
+    assert r["needs_trail_choice"] and "trailing order changed" in r["error"], r
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None,
+                          {"choice": "fixed", "order": 51, "reached": "907.50"}, info)   # tighter than known
+    assert r["needs_trail_choice"] and "changed since you chose" in r["error"], r
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None,
+                          {"choice": "fixed", "order": 51, "reached": "908.00"}, info)   # looser than known: ok
+    assert r["ok"] and trader._client.placed[0]["childOrderStrategies"][1]["stopPrice"] == "908.00", r
+
+
+def test_a_choice_for_a_trail_that_is_gone_sends_nothing(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_oco()])             # the trail was replaced by a fixed stop
+    for choice in (RESTART, {"choice": "fixed", "order": 51, "reached": "907.80"}):
+        r = trader.set_target("MXR", "898.00", None, [], set(), None, None, choice, _row_trail())
+        assert not r["ok"] and "is gone" in r["error"], r
+        r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market", trail_choice=choice)
+        assert not r["ok"] and "is gone" in r["error"], r
+    # A choice made for a partial never becomes a close of everything.
+    r = trader.take_partial("MXR", None, 57, [], set(), mode="market", trail_choice=RESTART)
+    assert not r["ok"] and "close all of it" in r["error"], r
+    assert trader._client.placed == []
+    assert trader.set_target("MXR", "898.00", None, [], set(), None)["ok"]   # no choice, no trail: as before
+
+
+def test_set_target_restart_choice_rebuilds_the_trail(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_trailing()])
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, 907.80, RESTART, _row_trail())
+    assert r["ok"] and "restarts about 908.50" in r["message"], r
+    _, stop = trader._client.placed[0]["childOrderStrategies"]
+    assert stop["orderType"] == "TRAILING_STOP" and stop["stopPriceOffset"] == 2.5
+
+
+def test_fixed_choice_through_the_market_sends_nothing(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)                 # ask 906.10
+    trader._client = Broker([_mu_trailing()])
+    info = _row_trail(best=903.55)                   # reached 906.05
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None,
+                          {"choice": "fixed", "order": 51, "reached": "906.05"}, info)
+    assert not r["ok"] and "through the market" in r["error"], r
+    r = trader.set_target("MXR", "898.00", None, [], set(), None, None,
+                          {"choice": "fixed", "order": 51, "reached": "907.80"}, None)
+    assert "No trail level" in r["error"], r
+    assert trader._client.placed == []
+
+
+def test_partial_on_a_trail_asks_before_anything_is_sent(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_trailing()])
+    info = _row_trail()
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market", trail_info=info)
+    assert r["needs_trail_choice"] and trader._client.placed == [], r     # the partial itself waits too
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market",
+                            trail_choice={"choice": "fixed", "order": 51, "reached": "907.80"}, trail_info=info)
+    assert r["ok"], r
+    target, stop = trader._client.placed[-1]["childOrderStrategies"]
+    assert stop["orderType"] == "STOP" and stop["stopPrice"] == "907.80"
+    assert stop["orderLegCollection"][0]["quantity"] == 29 and target["price"] == "900.18"
 
 
 def test_autobe_ticket_sends_a_fixed_stop_and_records_one_move(trader):
@@ -1884,3 +2003,417 @@ def test_a_spread_order_pending_cancel_still_asks_first(trader, monkeypatch):
     trader._client = _call_leg(1.0, [_opt("META  261120P00590000", 1.0, "PUT")], orders=[spread])
     r = trader.close_position(LONG_C, [], set())
     assert r["needs_confirm"] and "multi-leg" in r["error"] and trader._client.placed == []
+
+
+# ---- Add shares ---------------------------------------------------------------------------------
+
+def _long_oco(stop=890.0, target=920.0, qty=100):
+    def leaf(oid, otype, **px):
+        return {"orderId": oid, "orderStrategyType": "SINGLE", "status": "WORKING", "orderType": otype,
+                "quantity": qty, "filledQuantity": 0, **px,
+                "orderLegCollection": [{"instruction": "SELL", "positionEffect": "CLOSING", "quantity": qty,
+                                        "instrument": {"symbol": "MXR", "assetType": "EQUITY"}}]}
+    return {"orderId": 70, "orderStrategyType": "OCO", "status": "WORKING", "childOrderStrategies": [
+        leaf(71, "STOP", stopPrice=stop), leaf(72, "LIMIT", price=target)]}
+
+
+def _add_broker(trader, monkeypatch, orders=None, qty=100.0, asset="EQUITY"):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    monkeypatch.setattr(trader, "quote", lambda sym, max_age=1.0: {"bid": 906.40, "ask": 906.60})
+    b = Broker([_long_oco()] if orders is None else orders, position=("MXR", qty, asset))
+    b.avg = 900.0                                  # long 100 @ 900, stop 890: $1,000 at risk
+    trader._client = b
+    return b
+
+
+def test_add_keep_stop_sends_the_add_then_one_oco_for_the_full_size(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), "2099-01-01T14:00:00+00:00")
+    assert r["ok"], r
+    add, oco = b.placed
+    assert add["orderType"] == "MARKET" and add["orderLegCollection"][0] == {
+        "instruction": "BUY", "quantity": 50, "instrument": {"symbol": "MXR", "assetType": "EQUITY"}}
+    target, stop = oco["childOrderStrategies"]
+    assert stop["stopPrice"] == "890.00" and target["price"] == "920.00"
+    assert stop["orderLegCollection"][0]["quantity"] == 150 and target["orderLegCollection"][0]["quantity"] == 150
+    reset = trader.store.r_resets()[("MXR", "LONG", "2099-01-01T14:00:00+00:00")]
+    assert abs(reset["entry"] - (900 * 100 + 906.5 * 50) / 150) < 1e-9 and reset["stop"] == 890.0
+    assert "1R is now" in r["message"]
+
+
+def test_add_keep_risk_moves_the_stop_so_the_dollar_risk_stays(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    r = trader.add_shares("MXR", 50, "market", "risk", [], set(), "2099-01-01T14:00:00+00:00")
+    assert r["ok"], r
+    stop = b.placed[1]["childOrderStrategies"][1]
+    assert stop["stopPrice"] == "895.50"            # (100 x 890 + 50 x 906.50) / 150
+    avg = (900 * 100 + 906.5 * 50) / 150
+    assert abs((avg - 895.5) * 150 - 1000) < 1e-6     # same $1,000 at risk as before
+    assert trading.Trader.keep_risk_stop("SHORT", 100, 110.0, 50, 100.01) == Decimal("106.67")   # rounded tighter
+
+
+def test_add_keep_risk_through_the_market_keeps_the_old_stop(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    monkeypatch.setattr(trader, "quote", lambda sym, max_age=1.0: {"bid": 895.00, "ask": 895.20})   # fell after the fill
+    r = trader.add_shares("MXR", 50, "market", "risk", [], set(), None)
+    assert b.placed[1]["childOrderStrategies"][1]["stopPrice"] == "890.00"
+    assert "through the market" in r["message"]
+
+
+def test_add_refuses_without_arming_or_for_options_or_keep_risk_without_a_stop(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    trader.arm(False)
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), None)
+    assert not r["ok"] and "arm" in r["error"] and b.placed == []
+    trader.arm(True)
+    b = _add_broker(trader, monkeypatch, orders=[])
+    r = trader.add_shares("MXR", 50, "market", "risk", [], set(), None)
+    assert not r["ok"] and "needs a stop" in r["error"] and b.placed == []
+    b = _add_broker(trader, monkeypatch, asset="OPTION")
+    r = trader.add_shares("MXR", 1, "market", "price", [], set(), None)
+    assert not r["ok"] and "stock positions only" in r["error"] and b.placed == []
+
+
+def test_add_mid_not_filled_goes_to_market_then_rebuilds(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    b.fill_limits = False
+    r = trader.add_shares("MXR", 50, "mid", "price", [], set(), None)
+    kinds = [o["orderType"] if o.get("orderType") else o["orderStrategyType"] for o in b.placed]
+    assert kinds == ["LIMIT", "MARKET", "OCO"], kinds
+    assert b.placed[0]["price"] == "906.50" and "rest at market" in r["message"]
+
+
+def test_add_ends_auto_be_and_an_unclear_add_blocks_the_symbol(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    trader.store.add_auto_be("t9", "MXR")
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), None)
+    assert r["ok"] and trader.store.auto_be("t9")["state"] == "SKIPPED" and "Auto B/E ended" in r["message"]
+    b.place_order = lambda h, o: (_ for _ in ()).throw(TimeoutError("read timed out"))
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), None)
+    assert r["unresolved_close"] and "MAY have been sent" in r["error"]
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert not r["ok"] and "Resolve" in r["error"]
+
+
+def test_an_add_without_an_order_id_stays_unknown_and_blocks(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    real = b.place_order
+
+    def no_location(h, o):
+        r = real(h, o)
+        return Resp(201) if o.get("orderType") == "MARKET" else r   # accepted, but no Location header
+    b.place_order = no_location
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), None)
+    assert r["unresolved_close"] and not r["ok"]
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert not r["ok"] and "Resolve" in r["error"]
+
+
+def test_a_failure_after_the_add_blocks_and_a_failed_quote_keeps_the_stop(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    monkeypatch.setattr(trader, "quote", lambda sym, max_age=1.0: (_ for _ in ()).throw(RuntimeError("HTTP 429")))
+    r = trader.add_shares("MXR", 50, "market", "risk", [], set(), None)
+    assert b.placed[1]["childOrderStrategies"][1]["stopPrice"] == "890.00" and "No fresh quote" in r["message"]
+    trader.resolve_close("MXR")
+    b = _add_broker(trader, monkeypatch)
+    monkeypatch.setattr(trader, "_create_stop", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), None)
+    assert r["unresolved_close"] and "MAY have NO STOP" in r["error"]
+    assert "Resolve" in trader.take_partial("MXR", 0.5, None, [], set(), mode="market")["error"]
+
+
+def test_a_stop_past_the_new_average_gives_no_r(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch, orders=[_long_oco(stop=903.0)])   # avg 900, stop locked in profit
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), "2099-01-01T14:00:00+00:00")
+    assert r["ok"] and "R is not set" in r["message"]
+    assert trader.store.r_resets()[("MXR", "LONG", "2099-01-01T14:00:00+00:00")]["stop"] is None
+
+
+# ---- Review 2026-11-08 fixes ------------------------------------------------------------------------
+
+def test_market_rest_is_sized_from_filled_quantity_when_legs_lag(trader, monkeypatch):
+    """The cancel shows filledQuantity 20 before Schwab lists the execution legs: the market rest is 8, not 28."""
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    b = Broker([_mu_oco()], fill_limits=False)              # short 57: a 50% partial is 28 shares
+    real_cancel = b.cancel_order
+
+    def cancel(h, oid):
+        r = real_cancel(h, oid)
+        o = b._find(oid)
+        if o.get("orderType") == "LIMIT" and o.get("orderStrategyType") == "SINGLE" and not o.get("childOrderStrategies"):
+            o["filledQuantity"] = 20                         # filled, legs not listed yet
+        return r
+    b.cancel_order = cancel
+    trader._client = b
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="mid")
+    market = [o for o in b.placed if o.get("orderType") == "MARKET"]
+    assert market and market[0]["orderLegCollection"][0]["quantity"] == 8, b.placed
+    assert r.get("unresolved_close"), r                      # fill price incomplete: stays open until Resolve
+
+
+def test_rebuilt_exits_keep_gtc(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    oco = _mu_oco()
+    for ch in oco["childOrderStrategies"]:
+        ch["duration"] = "GOOD_TILL_CANCEL"
+    trader._client = Broker([oco])
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert r["ok"], r
+    target, stop = trader._client.placed[1]["childOrderStrategies"]
+    assert target["duration"] == "GOOD_TILL_CANCEL" and stop["duration"] == "GOOD_TILL_CANCEL"
+
+
+def test_rebuilt_day_exits_stay_day(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_oco()])
+    trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    target, stop = trader._client.placed[1]["childOrderStrategies"]
+    assert target["duration"] == "DAY" and stop["duration"] == "DAY"
+
+
+def test_add_whose_new_shares_do_not_show_is_never_ok_and_blocks(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    b.after_qty = 100.0                                     # Schwab keeps showing the old size
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), None)
+    assert not r["ok"] and r["unresolved_close"] and "50 shares may have NO STOP" in r["message"], r
+    assert b.placed[1]["childOrderStrategies"][1]["orderLegCollection"][0]["quantity"] == 100
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert not r["ok"] and "Resolve" in r["error"]
+
+
+def test_new_ticket_on_a_held_symbol_with_working_exits_is_refused(trader, monkeypatch):
+    b = Broker([_long_oco()], position=("MXR", 100.0, "EQUITY"))
+    trader._client = b
+    r = trader.submit(req(symbol="MXR"))
+    assert not r["ok"] and "already hold 100 MXR" in r["error"] and b.placed == [], r
+
+
+def test_new_ticket_on_a_held_symbol_without_orders_is_allowed(trader, monkeypatch):
+    b = Broker([], position=("MXR", 100.0, "EQUITY"))
+    trader._client = b
+    r = trader.submit(req(symbol="MXR"))
+    assert "already hold" not in (r.get("error") or ""), r
+
+
+def test_a_server_error_on_a_rebuilt_stop_says_it_may_be_placed(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    b = Broker([_mu_oco()])
+    real = b.place_order
+    b.place_order = lambda h, o: Resp(503, text="busy") if o.get("orderStrategyType") == "OCO" else real(h, o)
+    trader._client = b
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert not r["ok"] and "MAY have been placed" in r["message"] and "still working" not in r["message"], r
+
+
+def test_new_ticket_sees_an_older_gtc_exit_from_the_poller_snapshot(trader, monkeypatch):
+    b = Broker([], position=("MXR", 100.0, "EQUITY"))     # today's order read has nothing
+    trader._client = b
+    r = trader.submit(req(symbol="MXR"), [_long_oco()], set())   # last week's GTC OCO, from the 59-day sweep
+    assert not r["ok"] and "already hold 100 MXR" in r["error"] and b.placed == [], r
+
+
+def test_a_replaced_limit_never_sends_the_rest_at_market(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    b = Broker([_mu_oco()], fill_limits=False)
+    real_cancel = b.cancel_order
+
+    def cancel(h, oid):
+        r = real_cancel(h, oid)
+        o = b._find(oid)
+        if o.get("orderType") == "LIMIT" and not o.get("childOrderStrategies"):
+            o["status"] = "REPLACED"                       # replaced in thinkorswim meanwhile
+        return r
+    b.cancel_order = cancel
+    trader._client = b
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="mid")
+    assert not [o for o in b.placed if o.get("orderType") == "MARKET"], b.placed
+    assert r.get("unresolved_close"), r
+
+
+def test_market_rest_with_missing_legs_stays_open(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    b = Broker([_mu_oco()], fill_limits=False)
+    real = b.place_order
+
+    def place(h, o):
+        r = real(h, o)
+        if o.get("orderType") == "MARKET":
+            oid = int(r.headers["Location"].rsplit("/", 1)[-1])
+            b.orders[oid]["orderActivityCollection"] = []   # FILLED, legs not listed yet
+        return r
+    b.place_order = place
+    trader._client = b
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="mid")
+    assert r.get("unresolved_close"), r
+
+
+def test_add_that_flips_during_the_longer_wait_sends_no_exits(trader, monkeypatch):
+    b = _add_broker(trader, monkeypatch)
+    b.after_qty = 100.0                           # the add fills but Schwab keeps showing the old size...
+    real = b.account_details
+    reads = {"n": 0}
+
+    def details(h, fields=None):
+        if b.placed:                              # reads after the add was sent
+            reads["n"] += 1
+            if reads["n"] > 7:                    # ...then, past the first wait, a short position
+                b.qty = -50.0
+        return real(h, fields)
+    b.account_details = details
+    r = trader.add_shares("MXR", 50, "market", "price", [], set(), None)
+    assert not r["ok"] and "the other way" in r["error"], r
+    assert [o for o in b.placed if o.get("orderStrategyType") == "OCO"] == []
+
+
+def test_a_refused_rebuild_that_did_not_cancel_anything_says_the_exits_still_work(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    b = Broker([_mu_oco()])
+    b.place_order = lambda h, o: Resp(400, text="bad")
+    trader._client = b
+    r = trader._create_stop(b, "MXR", "SHORT", 57, "EQUITY", Decimal("914.00"), [], set(),
+                            target=Decimal("900.18"), rebuild=True)
+    assert "should still be working" in r["error"] and "NO STOP" not in r["error"], r
+
+
+def test_a_limit_already_replaced_at_the_first_check_stays_open(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    b = Broker([_mu_oco()], fill_limits=False)
+    real = b.place_order
+
+    def place(h, o):
+        r = real(h, o)
+        if o.get("orderType") == "LIMIT" and o.get("orderStrategyType") == "SINGLE":
+            b.orders[int(r.headers["Location"].rsplit("/", 1)[-1])]["status"] = "REPLACED"
+        return r
+    b.place_order = place
+    trader._client = b
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="mid")
+    assert not [o for o in b.placed if o.get("orderType") == "MARKET"] and r.get("unresolved_close"), r
+
+
+def test_status_lists_symbols_blocked_by_an_unclear_close(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_oco()])
+    trader._client.place_order = lambda h, o: (_ for _ in ()).throw(TimeoutError("read timed out"))
+    assert trader.status()["unresolved"] == []
+    trader.close_position("MXR", [], set())
+    assert trader.status()["unresolved"] == ["MXR"]          # the Cockpit attention bar shows it
+    trader.resolve_close("MXR")
+    assert trader.status()["unresolved"] == []
+
+
+def test_cockpit_files_and_no_stop_by_choice_prefs(monkeypatch):
+    from fastapi.testclient import TestClient
+    from companion import app as appmod
+
+    class Mem:
+        def __init__(self): self.d = {}
+        def get_setting(self, k, default=None): return self.d.get(k, default)
+        def set_setting(self, k, v): self.d[k] = v
+    monkeypatch.setattr(appmod.trader, "store", Mem())
+    c = TestClient(appmod.app, base_url="http://127.0.0.1:8770")
+    assert c.get("/cockpit.js").status_code == 200 and c.get("/cockpit.css").status_code == 200
+    h = {"X-Companion": "1", "Origin": "http://127.0.0.1:8770"}
+    r = c.post("/api/ui/prefs", json={"nostopOk": {"MSFT|LONG|50": "2026-11-08T15:00:00Z"}}, headers=h)
+    assert r.status_code == 200 and c.get("/api/ui/prefs").json()["nostopOk"] == {"MSFT|LONG|50": "2026-11-08T15:00:00Z"}
+    assert c.post("/api/ui/prefs", json={"nostopOk": ["MSFT"]}, headers=h).status_code == 400
+    assert c.post("/api/ui/prefs", json={"nostopOk": {"X": 1}}, headers=h).status_code == 400
+
+
+def test_login_button_opens_one_fixed_sign_in_window(monkeypatch):
+    import subprocess
+    from fastapi.testclient import TestClient
+    from companion import app as appmod
+    calls = []
+
+    class FakeProc:
+        def __init__(self, cmd, **kw): calls.append(cmd); self.done = None
+        def poll(self): return self.done
+    monkeypatch.setattr(subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(appmod, "LOGIN_PROC", None)
+    c = TestClient(appmod.app, base_url="http://127.0.0.1:8770")
+    assert c.post("/api/auth/login", json={}).status_code == 403             # no X-Companion header
+    h = {"X-Companion": "1", "Origin": "http://127.0.0.1:8770"}
+    assert c.post("/api/auth/login", json={"cmd": "evil"}, headers=h).json()["ok"]
+    assert calls[0][1:] == ["-m", "companion.login", "--reauth", "--pause"]   # nothing from the request
+    r = c.post("/api/auth/login", json={}, headers=h).json()
+    assert not r["ok"] and "already open" in r["error"] and len(calls) == 1
+
+
+def test_page_scripts_parse():
+    """A syntax error in a page script blanks the whole dashboard: parse each one with node when it is there."""
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    root = Path(__file__).resolve().parent.parent / "companion"
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+    scripts += [(root / f).read_text(encoding="utf-8") for f in
+                ("static/cockpit.js", "spreads/static/spreads.js", "journal/static/journal.js") if (root / f).exists()]
+    for js in scripts:
+        r = subprocess.run([node, "-e", "new Function(require('fs').readFileSync(0, 'utf8'))"], input=js,
+                           capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, r.stderr[:400]
+
+
+# ---- Today's tickets lists every entry of the day, not only the companion's own tickets --------------
+
+def _now_utc(minutes=0):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+
+
+def _single(oid, instruction, symbol="NVDA", qty=1, price=6.5, status="FILLED", tag="API_TOS:TRADE_ALL",
+            asset="EQUITY", legs=1, filled=None, entered=None):
+    leg = {"instruction": instruction, "quantity": qty, "instrument": {"symbol": symbol, "assetType": asset}}
+    f = qty if filled is None else filled
+    return {"orderId": oid, "orderStrategyType": "SINGLE", "orderType": "LIMIT", "price": price, "tag": tag,
+            "enteredTime": entered or _now_utc(), "status": status, "filledQuantity": f,
+            "orderLegCollection": [leg] * legs,
+            "orderActivityCollection": [{"executionType": "FILL", "executionLegs": [{"quantity": f, "price": price}]}] if f else []}
+
+
+def test_entries_made_in_thinkorswim_are_listed(trader):
+    put = _single(901, "SELL_TO_OPEN", symbol="NVDA  261120P00165000", asset="OPTION")
+    rows = trader.brackets([put], [], {"NVDA  261120P00165000": -1.0}, True)
+    (row,) = rows
+    assert row["source"] == "TOS" and row["side"] == "SHORT" and row["limit_price"] == "6.5"
+    assert row["display"] != row["symbol"] and row["protection"] == "NO_STOP" and "tree" not in row
+
+
+def test_exits_spreads_and_refused_orders_elsewhere_are_not_entries(trader):
+    orders = [_single(902, "SELL", symbol="AAPL"),                         # an exit
+              _single(903, "BUY_TO_CLOSE", symbol="X  261120P00010000"),  # an exit
+              _single(904, "SELL_TO_OPEN", legs=2),                       # a spread
+              _single(905, "BUY", symbol="MSFT", status="REJECTED", filled=0),
+              _single(906, "BUY", symbol="MSFT", entered="2020-01-01T15:00:00+0000")]   # not today
+    assert trader.brackets(orders, [], {}, True) == []
+
+
+def test_a_working_outside_entry_waits_for_its_fill(trader):
+    (row,) = trader.brackets([_single(907, "BUY", symbol="AMD", status="WORKING", filled=0, price=150.0)], [], {}, True)
+    assert row["protection"] == "WAITING_FILL" and row["limit_price"] == "150"
+
+
+def test_the_companions_add_is_labeled_and_its_ticket_keeps_its_tree(trader):
+    trader._client.resp = Resp(201, {"Location": ".../orders/555"})
+    trader.submit(req())
+    ticket = {**_tree(555, entered=_now_utc(-5)), "filledQuantity": 170, "status": "FILLED"}
+    add = _single(908, "BUY", symbol="BRVO", qty=30, price=339.10, tag="TA_x", entered=_now_utc(1))
+    trader.store.log_action("add", "BRVO", 908, "FILLED", "BUY 30")
+    rows = trader.brackets([ticket, add], [], {"BRVO": 200.0}, True)
+    assert [(r["source"], r["ticket_id"]) for r in rows] == [("ADD", "o908"), ("EDGE", "ticket-0001")]
+    assert rows[0]["protection"] == "NO_STOP" and rows[1]["protection"] == "EARLIER"   # newest shows the position
+
+
+def test_an_entry_edited_in_thinkorswim_stays_the_tickets(trader):
+    trader._client.resp = Resp(201, {"Location": ".../orders/555"})
+    trader.submit(req())
+    old = {**_tree(555, entered=_now_utc(-5)), "status": "REPLACED", "closeTime": _now_utc(-2)}
+    new = {**_tree(556, entered=_now_utc(-2)), "status": "WORKING", "tag": "API_TOS:TRADE_ALL"}
+    rows = trader.brackets([old, new], [], {}, True)
+    assert [r["ticket_id"] for r in rows] == ["ticket-0001"]

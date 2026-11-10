@@ -21,7 +21,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from ..bracket import PENNY_ALL_ROOTS, put_call
 from ..orders import TERMINAL
 from ..pnl import ET
-from ..trading import INDEX_ROOTS, _odd_deliverable, _occ_root, _all_symbols, _nodes, market_open, terminal_ids
+from ..trading import INDEX_ROOTS, _odd_deliverable, _occ_root, _all_symbols, _nodes, market_open, regular_hours_text, terminal_ids
 from .spreads import expiration_of, leg_fills
 
 log = logging.getLogger("companion.spreads")
@@ -344,7 +344,7 @@ class SpreadDesk:
         if not self.t.armed:
             return {"ok": False, "error": "Trading is not armed. Use the ARM switch on the ticket."}
         if not market_open():
-            return {"ok": False, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "error": regular_hours_text()}
         if self.t.store.open_tickets():
             return {"ok": False, "error": "A previous ticket is not confirmed yet. Check thinkorswim, then press Resolve."}
         stuck = self.book.unconfirmed()
@@ -627,7 +627,7 @@ class SpreadDesk:
         if not sp:
             return {"ok": False, "error": "No such spread."}
         if not market_open():
-            return {"ok": False, "spread_id": sid, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "spread_id": sid, "error": regular_hours_text()}
         if not self.t._send_lock.acquire(blocking=False):
             return {"ok": False, "spread_id": sid, "error": "Another order action is in progress."}
         sent = {"v": False}
@@ -764,7 +764,7 @@ class SpreadDesk:
             # The stop's close: natural read now (after the cancels), plus its tolerance, never past max loss.
             exp_limit = self._stop_price(sid, debit)
             if exp_limit is None:
-                return {"ok": False, "spread_id": sid, "error": "no valid quote to price the close; close it yourself"}
+                return {"ok": False, "spread_id": sid, "error": "no valid quote to price the close; nothing was sent"}
         order = close_order(sp["legs"], debit, exp_limit, qty)
         pv = self._preview(client, order)
         if not pv["ok"]:
@@ -937,7 +937,9 @@ class SpreadDesk:
         if not p["ok"]:
             return {"ok": False, "error": "; ".join(p["errors"])}
         send = req.get("send") is True
-        self.book.stops.set(sid, float(p["limit"]), p["r"], send=send)
+        if not self.book.stops.set(sid, float(p["limit"]), p["r"], send=send):
+            return {"ok": False, "error": "The stop's close is being sent right now: too late to change it. "
+                                          "Check thinkorswim."}
         return {"ok": True, "spread_id": sid, "price": p["limit"], "r": p["r"], "send": send}
 
     STOP_TOLERANCE = 2         # grid steps past natural a stop's close may fill at
@@ -956,9 +958,13 @@ class SpreadDesk:
         locked = self.t._send_lock.acquire(timeout=30)     # a click's Move close with a target can take a while
         try:
             if not locked:
-                r = {"ok": False, "error": "another order action was running; close it yourself"}
+                r = {"ok": False, "error": "another order action was running; nothing was sent"}
+            elif not stops.start_send(spread_id, claim):
+                # Removed, set again or switched to watch-only while this send waited for the lock:
+                # that consent is gone, nothing is sent. From here on a removal is refused (too late).
+                r = {"ok": False, "error": "the stop was removed or changed before sending; nothing was sent"}
             elif not market_open():
-                r = {"ok": False, "error": "outside regular hours; close it yourself"}
+                r = {"ok": False, "error": "outside regular hours; nothing was sent"}
             else:
                 sp = self.book.get(spread_id)
                 if not sp or sp["state"] not in ("OPEN", "CLOSING") or sp.get("hold"):
@@ -966,7 +972,7 @@ class SpreadDesk:
                 else:
                     px = self._stop_price(spread_id, sp["kind"].endswith("DEBIT"))
                     if px is None:
-                        r = {"ok": False, "error": "no valid quote to price the close; close it yourself"}
+                        r = {"ok": False, "error": "no valid quote to price the close; nothing was sent"}
                     else:
                         log.warning("AUTO STOP spread %s: close all near %s (repriced at send)", spread_id, px)
                         r = self._close_locked(sp, {"spread_id": spread_id, "expected_limit": str(px), "qty": "all",
@@ -978,11 +984,13 @@ class SpreadDesk:
                                           "thinkorswim, then Resolve")
                 r = {"ok": False, "status": "UNKNOWN", "error": "error after sending: the close MAY be live, check thinkorswim"}
             else:
-                r = {"ok": False, "error": f"not sent ({type(e).__name__}); close it yourself"}
+                r = {"ok": False, "error": f"not sent ({type(e).__name__})"}
         finally:
             if locked:
                 self.t._send_lock.release()
         # Three outcomes, never mixed up: a close that MAY be live must never read "close it yourself".
+        # The stored text says what happened only; the page adds advice from the spread's CURRENT state
+        # (a spread closed meanwhile must never be told to close again: that would open the opposite spread).
         if r["ok"]:
             outcome, text = "sent", f"close order {r['order_id']} for {r['qty']} at {r['limit']}"
         elif sent["v"] or r.get("status") == "UNKNOWN":
@@ -1016,7 +1024,7 @@ class SpreadDesk:
         if not sp:
             return {"ok": False, "error": "No such spread."}
         if not market_open():
-            return {"ok": False, "spread_id": sid, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "spread_id": sid, "error": regular_hours_text()}
         if not self.t._send_lock.acquire(blocking=False):
             return {"ok": False, "spread_id": sid, "error": "Another order action is in progress."}
         sent = {"v": False, "old": None}

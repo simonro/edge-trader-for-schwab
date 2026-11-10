@@ -129,6 +129,18 @@ def _symbol(o: dict) -> str | None:
     return (legs[0].get("instrument") or {}).get("symbol") if legs else None
 
 
+OPENING = frozenset({"BUY", "SELL_SHORT", "BUY_TO_OPEN", "SELL_TO_OPEN"})
+
+
+def _when(v) -> datetime:
+    """A ticket's or an order's time ("...+00:00" or Schwab's "...+0000") for sorting; unknown sorts first."""
+    try:
+        d = datetime.fromisoformat(str(v).replace("+0000", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
 def _replacement(tree: dict, orders: list[dict]) -> dict | None:
     """The order that replaced a REPLACED one (an edit in thinkorswim). Schwab gives no link
     field: the new order is entered the second the old one closes, same symbol and instruction.
@@ -153,12 +165,98 @@ def _replacement(tree: dict, orders: list[dict]) -> dict | None:
     return hits[0] if len(hits) == 1 else None
 
 
+# Today's regular session as Schwab reports it (the poller refreshes it every 30 min):
+# {"date": ET date, "session": {"open", "close"} or None on a market holiday}. Unknown until the
+# first read; then the plain weekday 9:30 to 16:00 ET rule applies alone.
+_SCHWAB_DAY: dict | None = None
+
+
+def set_market_hours(day: str, session: dict | None) -> None:
+    """Record Schwab's regular session for ET date `day` (None: the market is closed that day)."""
+    global _SCHWAB_DAY
+    _SCHWAB_DAY = {"date": day, "session": session}
+
+
+def _schwab_session(day: str) -> tuple[bool, tuple[datetime, datetime] | None]:
+    """(known, (open, close)) for ET date `day` from Schwab's hours; known False when Schwab's
+    hours for that day are not loaded or unreadable, (True, None) on a day Schwab says is closed."""
+    d = _SCHWAB_DAY
+    if not d or d.get("date") != day:
+        return False, None
+    s = d.get("session")
+    if not s:
+        return True, None
+    try:
+        o, c = datetime.fromisoformat(s["open"]), datetime.fromisoformat(s["close"])
+    except (KeyError, TypeError, ValueError):
+        return False, None
+    if o.tzinfo is None or c.tzinfo is None:
+        return False, None                    # a time without its offset is unreadable, not a session
+    return True, (o, c)
+
+
 def market_open(now: datetime | None = None) -> bool:
-    et = (now or datetime.now(timezone.utc)).astimezone(ET)
+    """Inside the regular session: weekdays 9:30 to 16:00 ET, narrowed by Schwab's own hours for
+    today when the poller has read them (market holidays, early closes like the day after
+    Thanksgiving). Never wider than 9:30 to 16:00."""
+    now = now or datetime.now(timezone.utc)
+    et = now.astimezone(ET)
     if et.weekday() >= 5:
         return False
     minutes = et.hour * 60 + et.minute
-    return 9 * 60 + 30 <= minutes < 16 * 60
+    if not 9 * 60 + 30 <= minutes < 16 * 60:
+        return False
+    known, sess = _schwab_session(et.date().isoformat())
+    if not known:
+        return True
+    return sess is not None and sess[0] <= now < sess[1]
+
+
+def _day_close(day: datetime) -> datetime:
+    """The regular close of ET day `day`: 16:00, or the earlier close Schwab reports for it."""
+    close = day.replace(hour=16, minute=0, second=0, microsecond=0)
+    known, sess = _schwab_session(day.date().isoformat())
+    if known and sess and sess[1].astimezone(ET) < close:
+        close = sess[1].astimezone(ET)
+    return close
+
+
+def _session_day_for(t: datetime) -> str:
+    """The ET date of the session that arming given at `t` is for: today until today's close (16:00, or
+    the earlier close Schwab reports), else the next weekday. Fixed at arming time, so a later hours
+    refresh for another day can never move it."""
+    t = t.astimezone(ET)
+    if t.weekday() < 5 and t < _day_close(t):
+        return t.date().isoformat()
+    d = t + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d.date().isoformat()
+
+
+def _session_close_after(t: datetime) -> datetime:
+    """The first regular close after ET time `t` (arming given after a close, or overnight, lasts to the
+    next session's close; an early close Schwab reports for that day counts)."""
+    return _close_of(_session_day_for(t))
+
+
+def _close_of(day: str) -> datetime:
+    """The regular close of ET date `day` (16:00, or the earlier close Schwab reports for it)."""
+    y, m, d = map(int, day.split("-"))
+    return _day_close(datetime(y, m, d, 12, tzinfo=ET))
+
+
+def regular_hours_text(now: datetime | None = None) -> str:
+    """The refusal text for an order outside the regular session, with today's real hours."""
+    et = (now or datetime.now(timezone.utc)).astimezone(ET)
+    known, sess = _schwab_session(et.date().isoformat())
+    if known and sess is None and et.weekday() < 5:
+        return "The market is closed today (Schwab's hours)."
+    if known and sess:
+        c = sess[1].astimezone(ET)
+        if (c.hour, c.minute) < (16, 0):
+            return f"Regular hours only (9:30 to {c.hour % 12 or 12}:{c.minute:02d} ET today, early close)."
+    return "Regular hours only (9:30 to 16:00 ET)."
 
 
 class _Throttled:
@@ -187,6 +285,18 @@ def _trail_txt(spec: dict) -> str:
     # Cents when the distance is whole cents (always for options), sub-penny stocks keep 4 decimals.
     dist = f"{off:g}%" if spec["link"] == "PERCENT" else f"${d:.2f}" if d == d.quantize(Decimal("0.01")) else f"${fmt(d)}"
     return f"trailing {dist} from {spec['basis'].lower()}"
+
+
+def _gtc(duration: str | None) -> bool:
+    return str(duration or "").upper() in ("GOOD_TILL_CANCEL", "GTC")
+
+
+def _exit_tif(pend: list, symbol: str, side: str) -> str:
+    """The duration a rebuilt exit keeps: GTC when any of the position's working stop/target was GTC
+    (a carried position must not lose its overnight protection to a DAY rebuild), else DAY."""
+    gtc = any(_gtc(p.duration) for p in pend
+              if p.symbol == symbol and p.live and p.exits(side) and p.role in ("STOP", "TARGET"))
+    return "GOOD_TILL_CANCEL" if gtc else "DAY"
 
 
 def _units(asset: str | None) -> tuple[str, str]:
@@ -342,17 +452,20 @@ class Trader:
 
     @property
     def armed(self) -> bool:
-        """Arming lasts for the session it was given in: it lapses at the 16:00 ET close
-        and on every restart (app startup calls arm(False))."""
+        """Arming lasts for the session it was given in: it lapses at the 16:00 ET close (the
+        earlier close Schwab reports on a half day) and on every restart (app startup calls arm(False))."""
         if self.store.get_setting("trading_armed", "0") != "1":
             return False
         at = self.store.get_setting("trading_armed_at")
         if not at:
             return False
         armed_at = datetime.fromisoformat(at).astimezone(ET)
-        close = armed_at.replace(hour=16, minute=0, second=0, microsecond=0)
-        if armed_at >= close:
-            close += timedelta(days=1)
+        # The session this arming is for, fixed when it was given (bound to that arming's time).
+        tag, _, day = (self.store.get_setting("trading_armed_for") or "").partition("|")
+        try:
+            close = _close_of(day) if day and tag == at else _session_close_after(armed_at)
+        except ValueError:
+            close = _session_close_after(armed_at)
         if datetime.now(ET) >= close:
             self.arm(False, reason="session close")
             return False
@@ -362,6 +475,8 @@ class Trader:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self.store.set_setting("trading_armed", "1" if on else "0")
         self.store.set_setting("trading_armed_at" if on else "trading_disarmed_at", now)
+        if on:
+            self.store.set_setting("trading_armed_for", f"{now}|{_session_day_for(datetime.fromisoformat(now))}")
         self.store.set_setting("trading_arm_log", (f"{now} {'ARM' if on else 'DISARM'} ({reason})\n"
                                                    + (self.store.get_setting("trading_arm_log", "") or ""))[:4000])
         log.warning("trading %s (%s)", "ARMED" if on else "disarmed", reason)
@@ -515,7 +630,7 @@ class Trader:
             out["schwab_preview"] = {"error": repr(e)[:300]}
         return out
 
-    def submit(self, req: dict) -> dict:
+    def submit(self, req: dict, orders: list[dict] | None = None, known_terminal: set[int] | None = None) -> dict:
         """Send exactly the plan the ticket displayed, or nothing.
 
         req carries the displayed plan's own inputs (symbol, side, stop, risk, r) and outputs
@@ -533,7 +648,7 @@ class Trader:
         if not self.armed:
             return {"ok": False, "error": "Trading is not armed. Use the ARM switch on the ticket."}
         if not market_open():
-            return {"ok": False, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "error": regular_hours_text()}
         pending = self.store.open_tickets()
         if pending:
             t = pending[0]
@@ -543,7 +658,7 @@ class Trader:
             return {"ok": False, "error": "Another submission is in progress."}
         state = {"sent": False}
         try:
-            return self._submit_locked(req, ticket_id, state)
+            return self._submit_locked(req, ticket_id, state, orders or [], known_terminal or set())
         except Exception as e:
             log.exception("submit failed")
             if not state["sent"]:
@@ -562,7 +677,8 @@ class Trader:
             log.exception("could not record ticket %s as %s", ticket_id, status)
             return False
 
-    def _submit_locked(self, req: dict, ticket_id: str, state: dict) -> dict:
+    def _submit_locked(self, req: dict, ticket_id: str, state: dict, orders: list[dict] | None = None,
+                       known_terminal: set[int] | None = None) -> dict:
         try:
             exp_limit = Decimal(str(req.get("expected_limit") or 0))
             exp_target = Decimal(str(req.get("expected_target") or 0))
@@ -584,6 +700,11 @@ class Trader:
         blocked = self._blocked(p.symbol, self._ensure()) or self._spread_gate([p.symbol])
         if blocked:
             return {"ok": False, "error": blocked["error"]}
+        # A held symbol with working exits: Schwab cancels them when this entry goes in, and the new
+        # bracket covers only its own shares, so the shares already held would lose their stop.
+        held_err = self._held_with_exits(p.symbol, orders or [], known_terminal or set())
+        if held_err:
+            return {"ok": False, "error": held_err, "plan": now.as_dict()}
         # Lock: a move against the entry up to 0.1R keeps the displayed plan. For a limit entry the
         # displayed limit caps the fill, so the risk cannot exceed what the ticket showed, and a
         # move in favour fills at a better price. A Mkt entry has no price cap: the lock only
@@ -923,6 +1044,23 @@ class Trader:
         r.raise_for_status()
         return ((r.json() or {}).get("securitiesAccount") or {}).get("positions") or []
 
+    def _held_with_exits(self, symbol: str, orders: list[dict], known_terminal: set[int]) -> str | None:
+        """Why a new ticket must not go in on `symbol`, or None: the account holds it AND it has working
+        orders (a fresh read merged over the poller's snapshot, which holds older GTC orders from its
+        59-day sweep). Schwab would cancel those orders when the entry enters."""
+        client = self._ensure()
+        held, _ = self._position(client, symbol)
+        if abs(held) < 1e-9:
+            return None
+        fresh = self._fresh_orders(client, orders)
+        working = [o for o in pending_orders(fresh, terminal_ids(fresh) | known_terminal)
+                   if o.symbol == symbol and o.live]
+        if not working:
+            return None
+        return (f"You already hold {abs(held):g} {symbol} with {len(working)} working order(s). A new ticket would make "
+                "Schwab cancel them and leave those shares without a stop. Use Add shares on the position (one stop "
+                "for the whole size), or cancel its orders first. Nothing was sent.")
+
     def _position(self, client, symbol: str, positions: list[dict] | None = None) -> tuple[float, str | None]:
         for p in self._positions(client) if positions is None else positions:
             ins = p.get("instrument") or {}
@@ -991,7 +1129,7 @@ class Trader:
         thinkorswim's Flatten works; the companion checks afterwards and cleans up anything left."""
         symbol = symbol.upper().strip()
         if not market_open():
-            return {"ok": False, "symbol": symbol, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "symbol": symbol, "error": regular_hours_text()}
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
@@ -1015,7 +1153,7 @@ class Trader:
         30 days, not just today: an unclear close before an overnight hold must still block."""
         start = datetime.now(timezone.utc) - timedelta(days=30)
         acts = [a for a in self.store.actions_since(start.isoformat())
-                if a["kind"] in ("close", "partial") and a["symbol"] == symbol]
+                if a["kind"] in ("close", "partial", "add") and a["symbol"] == symbol]
         if not acts:
             return None
         last = acts[-1]
@@ -1228,7 +1366,7 @@ class Trader:
         the same. Afterwards: verify the new stop is working and each OCO's target still is."""
         symbol = symbol.upper().strip()
         if not market_open():
-            return {"ok": False, "symbol": symbol, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "symbol": symbol, "error": regular_hours_text()}
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
@@ -1304,7 +1442,8 @@ class Trader:
             _, target = self._exit_plan(pend, symbol, side, 0)
             self.store.log_action("move_stop", symbol, None, "SENDING", f"trailing -> fixed {f(price)}")
             return self._create_stop(client, symbol, side, abs(qty), asset, price, [], set(),
-                                     target=Decimal(str(target)) if target is not None else None, rebuild=True)
+                                     target=Decimal(str(target)) if target is not None else None, rebuild=True,
+                                     duration=_exit_tif(pend, symbol, side))
         had_oco = any(p.oco_id is not None for p in stops)
         had_targets = any(p.symbol == symbol and p.role == "TARGET" and p.live and p.exits(side)
                           for p in pending_orders(fresh, terminal))
@@ -1404,12 +1543,14 @@ class Trader:
             return {"ok": ok, "state": state, "message": text}
 
         if not market_open():
-            self.store.set_auto_be(ticket_id, "PENDING", "market closed")
+            self.store.set_auto_be(ticket_id, "PENDING", "market closed", only_from="SENDING")
             return {"ok": False, "state": "PENDING"}
         if not self._send_lock.acquire(timeout=10):
-            self.store.set_auto_be(ticket_id, "PENDING", "another order action was running")
+            self.store.set_auto_be(ticket_id, "PENDING", "another order action was running", only_from="SENDING")
             return {"ok": False, "state": "PENDING"}
         try:
+            if (self.store.auto_be(ticket_id) or {}).get("state") == "SKIPPED":
+                return {"ok": False, "state": "ENDED"}      # ended while it waited (an add): nothing to do
             gate = self._spread_gate([symbol], symbol=symbol)
             if gate:
                 return done("SKIPPED", gate["error"])
@@ -1517,7 +1658,7 @@ class Trader:
         2026-10-25) and reported in the result."""
         symbol = symbol.upper().strip()
         if not market_open():
-            return {"ok": False, "symbol": symbol, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "symbol": symbol, "error": regular_hours_text()}
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
@@ -1578,7 +1719,7 @@ class Trader:
         # first and send nothing it would refuse (the working stop and target stay as they are).
         res = self._create_stop(client, symbol, side, abs(qty), asset, None, [], set(),
                                 target=Decimal(str(target)) if target is not None else None, rebuild=True, trail=spec,
-                                preview=asset == "OPTION")
+                                preview=asset == "OPTION", duration=_exit_tif(pend, symbol, side))
         if res.get("not_sent"):
             self.store.log_action("trail", symbol, None, "REJECTED", res["error"])
             return {"ok": False, "symbol": symbol, "error": res["error"]}
@@ -1606,28 +1747,115 @@ class Trader:
         return (f" The trail restarts about {fmt(start, tk)}, looser than the ~{fmt(prior, tk)} it had reached."
                 if looser else f" The trail restarts about {fmt(start, tk)}.")
 
+    def _trail_restart_check(self, symbol: str, side: str, asset: str, trail: dict | None, pend: list,
+                             info: dict | None, choice: dict | None) -> tuple[dict | None, Decimal | None]:
+        """Before an action that rebuilds the exits (Replace target, partial) of a position with a
+        trailing stop: a new trailing order starts again from the current price, which can give back
+        what the old trail had gained. Nothing is sent until the user picks, for THIS trailing order
+        (its id comes back with the choice): "restart" (rebuild the trail) or "fixed" (end the trail,
+        a fixed STOP at the level it had reached, at most the level the user approved). Always asked:
+        the app's level comes from its own polled marks, so Schwab's real level can be tighter than it
+        knows. `info` is the dashboard row's trail (order_id, level, estimated, best). Returns
+        (refusal, fixed stop)."""
+        from decimal import ROUND_CEILING
+        from .bracket import _to_tick, trail_level
+        if not trail:
+            if (choice or {}).get("choice"):     # chosen for a trail that is gone: never act on what replaced it
+                return ({"ok": False, "symbol": symbol,
+                         "error": "The trailing stop you chose for is gone (filled, cancelled or replaced). "
+                                  "Nothing sent. Check the position's exits, then try again."}, None)
+            return None, None
+        long = side == "LONG"
+        live = next((p for p in pend if p.symbol == symbol and p.live and p.role == "STOP"
+                     and p.order_type.startswith("TRAILING") and p.exits(side)), None)
+        oid = live.order_id if live else None
+        if not (info and oid is not None and str(info.get("order_id")) == str(oid)):
+            info = None                          # the row's trail is another order: its level does not count
+        q = self.quote(symbol, max_age=0)
+        tk = self._ticks(symbol, asset, q)
+        # The level it reached, rounded once and the safe way (a long's stop down, a short's up).
+        raw = None
+        if info and info.get("estimated") is False and info.get("level") is not None:
+            raw = Decimal(str(info["level"]))    # Schwab's own number
+        elif info and info.get("best") and trail.get("link") in ("VALUE", "PERCENT"):
+            best = Decimal(str(info["best"]))
+            off = best * trail["offset"] / 100 if trail["link"] == "PERCENT" else trail["offset"]
+            raw = best - off if long else best + off
+        reached = _to_tick(raw, ROUND_FLOOR if long else ROUND_CEILING, tk) if raw is not None and raw > 0 else None
+        c = choice or {}
+        changed = ""
+        if c.get("choice") in ("restart", "fixed"):
+            if oid is None or str(c.get("order")) != str(oid):
+                changed = "The trailing order changed since you chose. "
+            elif c["choice"] == "restart":
+                return None, None
+            else:
+                try:
+                    approved = Decimal(str(c.get("reached")))
+                    approved = approved if approved.is_finite() and approved > 0 else None
+                except Exception:
+                    approved = None
+                if reached is None or approved is None:
+                    return ({"ok": False, "symbol": symbol,
+                             "error": "No trail level known to fix the stop at. Nothing sent. Use Move stop with a price."},
+                            None)
+                if approved > reached if long else approved < reached:
+                    changed = "The trail level the app knows changed since you chose. "
+                else:
+                    bid, ask = Decimal(str(q.get("bid") or 0)), Decimal(str(q.get("ask") or 0))
+                    through = (long and (not bid or approved >= bid)) or (not long and (not ask or approved <= ask))
+                    if through:
+                        return ({"ok": False, "symbol": symbol,
+                                 "error": f"The trail level {fmt(approved, tk)} is at or through the market "
+                                          f"({fmt(bid, tk)} / {fmt(ask, tk)}): the trail may be firing. Nothing sent. "
+                                          "Check thinkorswim."}, None)
+                    return None, approved
+        ref = _basis_price(q, trail["basis"])
+        start = trail_level(Decimal(str(ref)), trail, side, tk) if ref else None
+        if reached is not None and start is not None:
+            looser = start < reached if long else start > reached
+            what = (f"The trailing stop has reached about {fmt(reached, tk)}. This sends a new OCO, which restarts "
+                    f"the trail about {fmt(start, tk)}" +
+                    (f" ({abs(reached - start):.2f} looser)." if looser else
+                     ". Schwab's real level can be tighter than the app knows (it checks prices every few seconds)."))
+        elif reached is not None:
+            what = (f"The trailing stop has reached about {fmt(reached, tk)}. This sends a new OCO, which restarts "
+                    "the trail from the current price.")
+        else:
+            what = ("This sends a new OCO, which restarts the trailing stop from the current price"
+                    + (f" (about {fmt(start, tk)})" if start is not None else "")
+                    + ". The level it had reached is not known, so it cannot be kept as a fixed stop.")
+        return ({"ok": False, "symbol": symbol, "needs_trail_choice": True, "trail_order": oid,
+                 "reached": fmt(reached, tk) if reached is not None else None,
+                 "start": fmt(start, tk) if start is not None else None,
+                 "error": changed + what + " Nothing sent yet."}, None)
+
     def set_target(self, symbol: str, price, r_mult, orders: list[dict], known_terminal: set[int],
-                   basis: dict | None, prior_trail_level=None) -> dict:
+                   basis: dict | None, prior_trail_level=None, trail_choice: dict | None = None,
+                   trail_info: dict | None = None) -> dict:
         """Put one target on the whole position, at a price or at R x the frozen risk (entry fill
         and original stop of the companion ticket). Sent as ONE new OCO with the current stop for
-        the full size; Schwab drops the old exits as it enters, so the stop is never removed first."""
+        the full size; Schwab drops the old exits as it enters, so the stop is never removed first.
+        With a trailing stop, the user chooses first: see _trail_restart_check."""
         symbol = symbol.upper().strip()
         if not market_open():
-            return {"ok": False, "symbol": symbol, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "symbol": symbol, "error": regular_hours_text()}
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
             gate = self._spread_gate([symbol], symbol=symbol)
             if gate:
                 return gate
-            return self._set_target_locked(symbol, price, r_mult, orders, known_terminal, basis, prior_trail_level)
+            return self._set_target_locked(symbol, price, r_mult, orders, known_terminal, basis, prior_trail_level,
+                                           trail_choice, trail_info)
         except Exception as e:
             log.exception("set target failed")
             return {"ok": False, "symbol": symbol, "error": f"Set target failed: {e}. Check thinkorswim."[:300]}
         finally:
             self._send_lock.release()
 
-    def _set_target_locked(self, symbol, price, r_mult, orders, known_terminal, basis, prior_trail_level=None) -> dict:
+    def _set_target_locked(self, symbol, price, r_mult, orders, known_terminal, basis, prior_trail_level=None,
+                           trail_choice=None, trail_info=None) -> dict:
         from decimal import ROUND_CEILING, ROUND_HALF_UP
         from .bracket import _to_tick
         from .orders import pending_orders
@@ -1678,10 +1906,17 @@ class Trader:
         stop, _ = self._exit_plan(pend, symbol, side, 0)
         trail = self._trail_of(pend, symbol, side)
         label = f"{r_mult:g}R = {f(target)}" if r_mult else f(target)
+        refusal, fixed = self._trail_restart_check(symbol, side, asset, trail, pend, trail_info, trail_choice)
+        if refusal:
+            return refusal
+        ended = ""
+        if fixed is not None:            # the user chose to end the trail at the level it had reached
+            trail, stop = None, fixed
+            ended = " The trail ended: the stop is fixed where it had reached."
         if trail:
             self.store.log_action("set_target", symbol, None, "SENDING", f"target {label} + {_trail_txt(trail)}")
             res = self._create_stop(client, symbol, side, abs(qty), asset, None, [], set(), target=target,
-                                    rebuild=True, trail=trail)
+                                    rebuild=True, trail=trail, duration=_exit_tif(pend, symbol, side))
             msg = (res["message"] if res.get("closed") else
                    (f"Target set at {label} with the trailing stop ({_trail_txt(trail)}) as one OCO."
                     if res.get("ok") else res.get("error") or res.get("message") or "Not confirmed: check thinkorswim.")
@@ -1694,7 +1929,7 @@ class Trader:
             instr = {("EQUITY", True): "SELL", ("EQUITY", False): "BUY_TO_COVER",
                      ("OPTION", True): "SELL_TO_CLOSE", ("OPTION", False): "BUY_TO_CLOSE"}.get((asset, side == "LONG"))
             self.store.log_action("set_target", symbol, None, "SENDING", f"target {label}, no stop")
-            r = self._place_exit(client, symbol, instr, asset, int(abs(qty)), target)
+            r = self._place_exit(client, symbol, instr, asset, int(abs(qty)), target, _exit_tif(pend, symbol, side))
             ok = r.status_code in (200, 201)
             msg = (f"Target set at {label} for {abs(qty):g} {unit_w}. WARNING: there is no stop: use Stop to B/E "
                    "or Move stop." if ok else f"Schwab refused the target (HTTP {r.status_code}): {r.text[:150]}")
@@ -1702,9 +1937,9 @@ class Trader:
             return {"ok": ok, "symbol": symbol, "message": msg, "error": None if ok else msg}
         self.store.log_action("set_target", symbol, None, "SENDING", f"target {label} + stop {stop}, {abs(qty):g} {us}")
         res = self._create_stop(client, symbol, side, abs(qty), asset, Decimal(str(stop)), [], set(),
-                                target=target, rebuild=True)
+                                target=target, rebuild=True, duration=_exit_tif(pend, symbol, side))
         msg = (res["message"] if res.get("closed") else
-               f"Target set at {label} with stop {stop} for {abs(qty):g} {unit_w} as one OCO." + res.get("note", "")
+               f"Target set at {label} with stop {stop} for {abs(qty):g} {unit_w} as one OCO." + ended + res.get("note", "")
                if res.get("ok") else res.get("error") or res.get("message") or "Not confirmed: check thinkorswim.")
         self.store.log_action("set_target", symbol, None, "DONE" if res.get("ok") else "CHECK", msg)
         return {"ok": bool(res.get("ok")), "symbol": symbol, "target": f(target), "message": msg,
@@ -1714,16 +1949,18 @@ class Trader:
 
     def take_partial(self, symbol: str, pct: float | None, shares: float | None,
                      orders: list[dict], known_terminal: set[int], mode: str = "mid",
-                     prior_trail_level=None, confirm_leg: bool = False) -> dict:
+                     prior_trail_level=None, confirm_leg: bool = False, trail_choice: dict | None = None,
+                     trail_info: dict | None = None) -> dict:
         """Sell (or cover) part of the position at market, then put the stop and target back on
-        the shares that are left, at the same prices, as one OCO.
+        the shares that are left, at the same prices, as one OCO. With a trailing stop, the user chooses
+        first how it comes back (_trail_restart_check).
 
         Schwab cancels the symbol's working orders when the partial enters (same as thinkorswim),
         so protection is rebuilt right after the fill: about a second without a stop on the
         remaining shares instead of a manual re-entry. 100% (or all shares) is a Close."""
         symbol = symbol.upper().strip()
         if not market_open():
-            return {"ok": False, "symbol": symbol, "error": "Regular hours only (9:30 to 16:00 ET)."}
+            return {"ok": False, "symbol": symbol, "error": regular_hours_text()}
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
@@ -1732,7 +1969,7 @@ class Trader:
                 return gate
             return self._partial_locked(symbol, pct, shares, orders, known_terminal,
                                         mode if mode in ("mid", "market", "ask", "bid") else "mid", prior_trail_level,
-                                        confirm_leg)
+                                        confirm_leg, trail_choice, trail_info)
         except Exception as e:
             log.exception("partial failed")
             return {"ok": False, "symbol": symbol,
@@ -1781,16 +2018,18 @@ class Trader:
         return [(float(e["quantity"]), float(e["price"])) for a in final.get("orderActivityCollection") or []
                 if a.get("executionType") == "FILL" for e in a.get("executionLegs") or []]
 
-    def _place_exit(self, client, symbol: str, instr: str, asset: str, n: int, price: Decimal | None):
+    def _place_exit(self, client, symbol: str, instr: str, asset: str, n: int, price: Decimal | None,
+                    duration: str = "DAY"):
         order = {"orderStrategyType": "SINGLE", "orderType": "LIMIT" if price else "MARKET",
-                 "session": "NORMAL", "duration": "DAY",
+                 "session": "NORMAL", "duration": duration,
                  "orderLegCollection": [{"instruction": instr, "quantity": n,
                                          "instrument": {"symbol": symbol, "assetType": asset}}]}
         if price:
             order["price"] = fmt(price, ticks_for(asset))
         return self._logged("place_order", lambda: client.place_order(self._hash, order))
 
-    def _send_partial(self, client, symbol: str, instr: str, asset: str, n: int, mode: str) -> dict:
+    def _send_partial(self, client, symbol: str, instr: str, asset: str, n: int, mode: str,
+                      kind: str = "partial") -> dict:
         """Mid / Ask / Bid: a limit at that price (the mid rounded one tick toward a fill), wait up
         to MID_WAIT_S, cancel what did not fill and send it at market (the shares left have no stop
         while it rests, so the wait stays short). Market: market at once.
@@ -1798,6 +2037,7 @@ class Trader:
         without a stop; it is kept short."""
         from .bracket import _to_tick, tick
         selling = instr.startswith("SELL")
+        what = "add" if kind == "add" else "partial"
         price = None
         where = mode
         tk = ticks_for(asset)
@@ -1813,23 +2053,23 @@ class Trader:
                 price = _to_tick(ask, "ROUND_CEILING", tk)      # literal ask (rests for a sell, takes for a cover)
         how = f"limit {fmt(price, tk)} at the {where}" if price else "market"
         uncertain_rest = False
-        self.store.log_action("partial", symbol, None, "SENDING", f"{instr} {n} {how}")
-        log.warning("PARTIAL %s %s %s %s", instr, n, symbol, how)
+        self.store.log_action(kind, symbol, None, "SENDING", f"{instr} {n} {how}")
+        log.warning("%s %s %s %s %s", kind.upper(), instr, n, symbol, how)
         try:
             r = self._place_exit(client, symbol, instr, asset, n, price)
         except Exception as e:
-            self.store.log_action("partial", symbol, None, "UNKNOWN", repr(e))
+            self.store.log_action(kind, symbol, None, "UNKNOWN", repr(e))
             return {"unresolved": True,
-                    "error": "No answer from Schwab on the partial. It MAY have been sent, and Schwab may "
+                    "error": f"No answer from Schwab on the {what}. It MAY have been sent, and Schwab may "
                              "have cancelled your stop/target: check thinkorswim now, then press Resolve."}
         if r.status_code == 429 or 400 <= r.status_code < 500:
-            self.store.log_action("partial", symbol, None, "REJECTED", f"HTTP {r.status_code} {r.text[:200]}")
-            return {"error": f"Schwab refused the partial (HTTP {r.status_code}): {r.text[:150]}. "
+            self.store.log_action(kind, symbol, None, "REJECTED", f"HTTP {r.status_code} {r.text[:200]}")
+            return {"error": f"Schwab refused the {what} (HTTP {r.status_code}): {r.text[:150]}. "
                              "Nothing was sent; your stop/target should still be working."}
         if r.status_code not in (200, 201):
-            self.store.log_action("partial", symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:200]}")
+            self.store.log_action(kind, symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:200]}")
             return {"unresolved": True,
-                    "error": f"Schwab answered HTTP {r.status_code} on the partial: it MAY have been sent. "
+                    "error": f"Schwab answered HTTP {r.status_code} on the {what}: it MAY have been sent. "
                              "Check thinkorswim now, then press Resolve."}
         tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
         oid = int(tail) if tail.isdigit() else None
@@ -1845,8 +2085,17 @@ class Trader:
             final = self._wait_fill(client, oid, 1.5)
             fills = self._fills(final)
             filled = sum(q for q, _ in fills)
-            rest = int(n - filled)
-            if final.get("status") in TERMINAL and rest > 0:
+            # Schwab can report filledQuantity before it lists every execution leg: size the rest
+            # from the larger of the two, never from the legs alone (that would oversize the market
+            # order). A gap leaves the outcome open (Resolve), since the fill price is incomplete.
+            reported = float(final.get("filledQuantity") or 0)
+            if reported > filled + 1e-9:
+                uncertain_rest = True
+            rest = int(n - max(filled, reported))
+            if final.get("status") == "REPLACED":
+                # Replaced elsewhere (thinkorswim): a successor may be working. Never send the rest.
+                uncertain_rest = True
+            elif final.get("status") in TERMINAL and rest > 0:
                 rest_ok = False
                 try:
                     r2 = self._place_exit(client, symbol, instr, asset, rest, None)
@@ -1857,7 +2106,9 @@ class Trader:
                     final2 = self._wait_fill(client, int(tail2), 2.5)
                     fills += self._fills(final2)
                     filled = sum(q for q, _ in fills)
-                    rest_ok = final2.get("status") in TERMINAL
+                    legs2 = sum(q for q, _ in self._fills(final2))
+                    rest_ok = (final2.get("status") in TERMINAL and final2.get("status") != "REPLACED"
+                               and float(final2.get("filledQuantity") or 0) <= legs2 + 1e-9)
                 elif r2 is not None and (r2.status_code == 429 or 400 <= r2.status_code < 500):
                     rest_ok = True        # refused: nothing more was sent
                 how += f", rest at market after {self.MID_WAIT_S:g} s"
@@ -1873,17 +2124,22 @@ class Trader:
             final = self._wait_fill(client, oid, 1.5)
             fills = self._fills(final) or fills
             filled = sum(q for q, _ in fills)
+        if float(final.get("filledQuantity") or 0) > sum(q for q, _ in self._fills(final)) + 1e-9:
+            uncertain_rest = True          # filled more than the listed legs: size and price not known yet
+        if final.get("status") == "REPLACED":
+            uncertain_rest = True          # replaced elsewhere (thinkorswim): a successor may be working
         if not oid or final.get("status") not in TERMINAL or uncertain_rest:
             avg = sum(q * p for q, p in fills) / filled if filled else None
-            self.store.log_action("partial", symbol, oid, "UNKNOWN", f"{instr} {filled:g}/{n} ({how}), not final")
+            self.store.log_action(kind, symbol, oid, "UNKNOWN", f"{instr} {filled:g}/{n} ({how}), not final")
             return {"filled": filled, "avg": avg, "how": how, "unresolved": True}
         avg = sum(q * p for q, p in fills) / filled if filled else None
-        self.store.log_action("partial", symbol, oid, final.get("status", "SENT"),
+        self.store.log_action(kind, symbol, oid, final.get("status", "SENT"),
                               f"{instr} {filled:g}/{n} ({how})" + (f" @ {avg:.4f}" if avg else ""))
         return {"filled": filled, "avg": avg, "how": how}
 
     def _partial_locked(self, symbol: str, pct, shares, orders: list[dict], known_terminal: set[int],
-                        mode: str = "mid", prior_trail_level=None, confirm_leg: bool = False) -> dict:
+                        mode: str = "mid", prior_trail_level=None, confirm_leg: bool = False,
+                        trail_choice: dict | None = None, trail_info: dict | None = None) -> dict:
         from .orders import pending_orders
         client = self._ensure()
         blocked = self._blocked(symbol, client)
@@ -1903,6 +2159,11 @@ class Trader:
             n = int(size * float(pct or 0))
         if n < 1:
             return {"ok": False, "symbol": symbol, "error": f"{pct or shares} of {size:g} {unit_w} is less than 1 {one}."}
+        if n >= size and (trail_choice or {}).get("choice"):
+            # The choice was made for a partial of a trailing position; it is now the whole position.
+            return {"ok": False, "symbol": symbol,
+                    "error": f"The position changed since you chose ({size:g} {unit_w} left): this would now close "
+                             "all of it. Nothing sent. Use Close if that is what you want."}
         if n >= size:
             return self._close_locked(symbol, orders, known_terminal, confirm_leg)
         instr = {("EQUITY", True): "SELL", ("EQUITY", False): "BUY_TO_COVER",
@@ -1923,6 +2184,12 @@ class Trader:
                              "Take this partial in thinkorswim."}
         stop, target = self._exit_plan(pend, symbol, side, n)
         trail = self._trail_of(pend, symbol, side)
+        refusal, fixed = self._trail_restart_check(symbol, side, asset, trail, pend, trail_info, trail_choice)
+        if refusal:
+            return refusal
+        if fixed is not None:            # the user chose to end the trail at the level it had reached
+            trail, stop = None, float(fixed)
+        tif = _exit_tif(pend, symbol, side)       # GTC exits come back GTC
         sent = self._send_partial(client, symbol, instr, asset, n, mode)
         if sent.get("error"):
             return {"ok": False, "symbol": symbol, "error": sent["error"], "unresolved_close": bool(sent.get("unresolved"))}
@@ -1968,7 +2235,7 @@ class Trader:
         if trail:
             res = self._create_stop(client, symbol, side, left, asset, None, [], set(),
                                     target=Decimal(str(target)) if target is not None else None, rebuild=True,
-                                    trail=trail)
+                                    trail=trail, duration=tif, exits_gone=True)
             msg = head + " " + (res.get("message") or res.get("error") or "") + self._restart_note(
                 symbol, side, trail, prior_trail_level)
             if not res.get("ok"):
@@ -1985,7 +2252,7 @@ class Trader:
             tk = ticks_for(asset)
             self.store.log_action("partial", symbol, None, "SENDING", f"target {fmt(Decimal(str(target)), tk)}, no stop")
             try:
-                r = self._place_exit(client, symbol, instr, asset, nleft, Decimal(str(target)))
+                r = self._place_exit(client, symbol, instr, asset, nleft, Decimal(str(target)), tif)
                 ok = r.status_code in (200, 201)
                 if ok:
                     tgt_txt = f" Target {fmt(Decimal(str(target)), tk)} put back on the {abs(left):g} {unit_w} left."
@@ -1999,13 +2266,15 @@ class Trader:
                 ok = False
                 tgt_txt = (f" No answer from Schwab on the target ({type(e).__name__}): it MAY be working. "
                            "Check thinkorswim.")
-            self.store.log_action("partial", symbol, None, "DONE" if ok else "CHECK", tgt_txt.strip())
+            self.store.log_action("partial", symbol, None,
+                                  "UNKNOWN" if sent.get("unresolved") else "DONE" if ok else "CHECK", tgt_txt.strip())
             return {"ok": False, "symbol": symbol,
                     "error": head + tgt_txt + f" {abs(left):g} {unit_w} left with NO STOP (there was none before). "
                                               "Use Stop to B/E or Move stop.",
                     "unresolved_close": bool(sent.get("unresolved"))}
         res = self._create_stop(client, symbol, side, left, asset, Decimal(str(stop)), [], set(),
-                                target=Decimal(str(target)) if target is not None else None, rebuild=True)
+                                target=Decimal(str(target)) if target is not None else None, rebuild=True, duration=tif,
+                                exits_gone=True)
         msg = head + " " + (res.get("message") or res.get("error") or "")
         if not res.get("ok"):
             msg += f" CHECK: the {abs(left):g} remaining {unit_w} may have no stop. Use Move stop or thinkorswim."
@@ -2013,10 +2282,238 @@ class Trader:
                 "message": msg, "error": None if res.get("ok") and filled >= n - 1e-9 else msg,
                 "unresolved_close": bool(sent.get("unresolved"))}
 
+    # ---- add shares ------------------------------------------------------------------------
+
+    def add_shares(self, symbol: str, shares, mode: str, stop_mode: str, orders: list[dict],
+                   known_terminal: set[int], opened: str | None) -> dict:
+        """Add shares to an open stock position, then put ONE exit OCO back on the whole new size.
+
+        Schwab cancels the symbol's working stop/target the moment the add enters, so the position
+        has no stop until the add fills and the exits are rebuilt (Simon's call, 2026-11-06: accepted;
+        the wait is short, as for a partial: a limit rests 3 s, then the rest goes at market).
+        stop_mode "price": the stop stays where it was (more $ at risk). "risk": the stop moves so
+        the $ at risk stays what it was at the current stop: it lands at the share-weighted average
+        of the old stop and the add's fill price. 1R is recalculated from the new average entry and
+        the new stop (saved per position, `r_resets`). An entry: needs Entries armed."""
+        symbol = symbol.upper().strip()
+        if not market_open():
+            return {"ok": False, "symbol": symbol, "error": regular_hours_text()}
+        if not self.armed:
+            return {"ok": False, "symbol": symbol, "error": "Adding shares is an entry: arm trading first."}
+        try:
+            n = int(str(shares).strip())
+        except (TypeError, ValueError):
+            n = 0
+        if n < 1:
+            return {"ok": False, "symbol": symbol, "error": "Type how many shares to add."}
+        if stop_mode not in ("price", "risk"):
+            return {"ok": False, "symbol": symbol, "error": "Pick Keep stop or Keep risk."}
+        if not self._send_lock.acquire(blocking=False):
+            return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
+        try:
+            gate = self._spread_gate([symbol], symbol=symbol)
+            if gate:
+                return gate
+            return self._add_locked(symbol, n, mode if mode in ("mid", "market", "ask", "bid") else "mid",
+                                    stop_mode, orders, known_terminal, opened)
+        except Exception as e:
+            log.exception("add shares failed")
+            return {"ok": False, "symbol": symbol,
+                    "error": f"Add failed: {e}. Check the position and its stop in thinkorswim."[:300]}
+        finally:
+            self._send_lock.release()
+
+    @staticmethod
+    def keep_risk_stop(side: str, old_qty: float, old_stop: float, add_qty: float, add_avg: float) -> Decimal:
+        """The stop that keeps the $ at risk of the position at its current stop after an add:
+        old_qty x (avg - stop) = new_qty x (new avg - new stop), which solves to the share-weighted
+        average of the old stop and the add's average fill. Rounded to the tick on the tighter side."""
+        raw = Decimal(str((old_qty * old_stop + add_qty * add_avg) / (old_qty + add_qty)))
+        return _to_tick(raw, ROUND_CEILING if side == "LONG" else ROUND_FLOOR, EQUITY)
+
+    def _add_locked(self, symbol: str, n: int, mode: str, stop_mode: str, orders: list[dict],
+                    known_terminal: set[int], opened: str | None) -> dict:
+        client = self._ensure()
+        blocked = self._blocked(symbol, client)
+        if blocked:
+            return blocked
+        positions = self._positions(client)
+        row = next((p for p in positions if (p.get("instrument") or {}).get("symbol") == symbol), None)
+        qty, asset = self._position(client, symbol, positions)
+        if abs(qty) < 1e-9:
+            return {"ok": False, "symbol": symbol, "error": f"No open {symbol} position to add to."}
+        if asset != "EQUITY":
+            return {"ok": False, "symbol": symbol, "error": "Add shares is for stock positions only."}
+        side = "LONG" if qty > 0 else "SHORT"
+        size = abs(qty)
+        try:
+            old_avg = float((row or {}).get("averagePrice"))
+        except (TypeError, ValueError):
+            old_avg = 0.0
+        if old_avg <= 0:
+            return {"ok": False, "symbol": symbol, "error": "Schwab did not report the position's average price. Nothing sent."}
+        fresh = self._fresh_orders(client, orders)
+        terminal = terminal_ids(fresh) | known_terminal
+        pend = pending_orders(fresh, terminal)
+        others = [p for p in pend if p.symbol == symbol and p.live and p.role not in ("STOP", "TARGET")]
+        if others:
+            return {"ok": False, "symbol": symbol,
+                    "error": f"{symbol} has other working orders ({len(others)}) that Schwab would cancel. "
+                             "Add in thinkorswim."}
+        stop, _ = self._exit_plan(pend, symbol, side, 0)
+        targets = sorted({p.price for p in pend if p.symbol == symbol and p.live and p.legs == 1
+                          and p.exits(side) and p.role == "TARGET" and p.price is not None},
+                         reverse=(side == "SHORT"))
+        trail = self._trail_of(pend, symbol, side)
+        if stop_mode == "risk" and (trail or stop is None):
+            return {"ok": False, "symbol": symbol,
+                    "error": ("Keep risk needs a fixed stop; this position has a trailing stop. "
+                              if trail else "Keep risk needs a stop; this position has none. ")
+                             + "Use Keep stop, or set a stop first. Nothing sent."}
+        if stop_mode == "risk" and (stop >= old_avg if side == "LONG" else stop <= old_avg):
+            return {"ok": False, "symbol": symbol,
+                    "error": f"The stop {stop:g} is at or past your average {old_avg:g}: there is no risk to keep. "
+                             "Use Keep stop. Nothing sent."}
+        instr = "BUY" if side == "LONG" else "SELL_SHORT"
+        sent = self._send_partial(client, symbol, instr, asset, n, mode, kind="add")
+        if sent.get("error"):
+            return {"ok": False, "symbol": symbol, "error": sent["error"], "unresolved_close": bool(sent.get("unresolved"))}
+        try:
+            return self._after_add(client, symbol, n, side, size, old_avg, asset, stop, targets, trail,
+                                   stop_mode, opened, sent, tif=_exit_tif(pend, symbol, side))
+        except Exception as e:
+            # The add went out and Schwab dropped the exits: whatever failed here, the position may
+            # be bigger with no stop. Block the symbol until Simon checks and presses Resolve.
+            log.exception("rebuilding exits after an add failed")
+            msg = (f"The add was sent, then rebuilding the exits failed ({type(e).__name__}: {e}). The position MAY "
+                   "have NO STOP: check thinkorswim now, then press Resolve.")[:400]
+            self.store.log_action("add", symbol, None, "UNKNOWN", msg)
+            return {"ok": False, "symbol": symbol, "error": msg, "unresolved_close": True}
+
+    def _after_add(self, client, symbol: str, n: int, side: str, size: float, old_avg: float, asset: str,
+                   stop, targets: list, trail, stop_mode: str, opened: str | None, sent: dict,
+                   tif: str = "DAY") -> dict:
+        """After the add: wait for Schwab's position, then one OCO for the whole new size and the new 1R."""
+        target = targets[-1] if targets else None          # the farthest target, for the whole new size
+        filled, add_avg, how = sent["filled"], sent["avg"], sent["how"]
+        added = filled > 1e-9 and bool(add_avg)
+        if not added:
+            # Nothing filled, but the add entered: Schwab dropped the exits. Put them back as they were.
+            filled, stop_mode = 0.0, "price"
+        expected = size + filled
+        new_avg = (old_avg * size + add_avg * filled) / expected if added else old_avg
+        head = (f"Added {filled:g} {symbol} @ {add_avg:.2f} ({how}). Now {side} {expected:g} @ avg {new_avg:.2f}."
+                if added else f"The add ({how}) did not fill; putting your exits back on {size:g} shares.")
+        # Schwab's position can lag the fill: wait for the new size before protecting it, and never
+        # protect more than is surely there.
+        now_qty, _ = self._position(client, symbol)
+        for _ in range(0 if sent.get("unresolved") else 6):
+            if abs(abs(now_qty) - expected) < 1e-9 or (abs(now_qty) > 1e-9 and (now_qty > 0) != (side == "LONG")):
+                break
+            if self.cooldown_left and self.cooldown_left() > 0:
+                break
+            time.sleep(0.4)
+            now_qty, _ = self._position(client, symbol)
+        # Still short of the new size: give Schwab a few more seconds before protecting a smaller size.
+        # (Before the direction check below, so a flip seen in these reads is caught too.)
+        for _ in range(0 if sent.get("unresolved") else 8):
+            if (abs(now_qty) >= expected - 1e-9 or (abs(now_qty) > 1e-9 and (now_qty > 0) != (side == "LONG"))
+                    or (self.cooldown_left and self.cooldown_left() > 0)):
+                break
+            time.sleep(0.6)
+            now_qty, _ = self._position(client, symbol)
+        if abs(now_qty) < 1e-9 or (now_qty > 0) != (side == "LONG"):
+            msg = head + (f" WARNING: Schwab now shows {'no position' if abs(now_qty) < 1e-9 else f'{abs(now_qty):g} the other way'}: "
+                          "no exits were sent. Check thinkorswim now.")
+            self.store.log_action("add", symbol, None, "UNKNOWN", msg)
+            return {"ok": False, "symbol": symbol, "error": msg, "unresolved_close": True}
+        protect = min(abs(now_qty), expected)
+        # Shares that may be held but are not covered: never a success, and the symbol stays blocked.
+        uncovered = expected - protect if protect < expected - 1e-9 else 0.0
+        if abs(abs(now_qty) - expected) > 1e-9:
+            head += (f" CHECK: Schwab shows {abs(now_qty):g} shares, expected {expected:g}; protecting {protect:g}.")
+        if uncovered:
+            head += (f" {uncovered:g} shares may have NO STOP: check thinkorswim, then press Resolve.")
+        if sent.get("unresolved"):
+            head += " The add is not confirmed final: check thinkorswim, then press Resolve."
+        new_stop = None if stop is None else Decimal(str(stop))
+        stop_note = ""
+        if stop_mode == "risk":
+            want = self.keep_risk_stop(side, size, float(stop), filled, add_avg)
+            try:
+                q = self.quote(symbol, max_age=0)
+                bid, ask = Decimal(str(q.get("bid") or 0)), Decimal(str(q.get("ask") or 0))
+            except Exception:
+                bid = ask = None
+            through = bid is not None and ((side == "LONG" and bid and want >= bid) or (side == "SHORT" and ask and want <= ask))
+            if bid is None:
+                stop_note = (f" No fresh quote to check the Keep risk stop {fmt(want, EQUITY)} against the market: the "
+                             f"stop stays at {fmt(new_stop, EQUITY)}, so the risk is now larger. Move it yourself if you want.")
+            elif through:
+                stop_note = (f" Keep risk would put the stop at {fmt(want, EQUITY)}, at or through the market "
+                             f"({fmt(bid, EQUITY)} / {fmt(ask, EQUITY)}): the stop stays at {fmt(new_stop, EQUITY)}, "
+                             "so the risk is now larger. Move it yourself if you want.")
+            else:
+                new_stop = want
+                stop_note = f" Stop moved to {fmt(want, EQUITY)} to keep the same $ risk."
+        ended = self.store.end_auto_be(symbol, "shares added: Auto B/E ends here") if added else []
+        tgt = Decimal(str(target)) if target is not None else None
+        if len(targets) > 1:
+            stop_note += f" Your {len(targets)} targets became one at {fmt(tgt, EQUITY)} for the whole position."
+        if trail:
+            res = self._create_stop(client, symbol, side, protect, asset, None, [], set(), target=tgt,
+                                    rebuild=True, trail=trail, duration=tif, exits_gone=True)
+        elif new_stop is not None:
+            res = self._create_stop(client, symbol, side, protect, asset, new_stop, [], set(), target=tgt, rebuild=True,
+                                    duration=tif, exits_gone=True)
+        elif tgt is not None:
+            r = self._place_exit(client, symbol, "SELL" if side == "LONG" else "BUY_TO_COVER", asset,
+                                 int(protect), tgt, tif)
+            ok = r.status_code in (200, 201)
+            res = {"ok": False, "message": (f"Target {fmt(tgt, EQUITY)} put back on {protect:g} shares. "
+                                            if ok else f"Schwab refused the target (HTTP {r.status_code}). ")
+                   + "There is NO STOP (there was none before): use Set stop."}
+        else:
+            res = {"ok": False, "message": "There was no stop or target to put back: the position has NO STOP."}
+        msg = head + stop_note + " " + (res.get("message") or res.get("error") or "")
+        if not res.get("ok") and (trail or new_stop is not None):
+            msg += f" CHECK: the {protect:g} shares may have no stop. Use Move stop or thinkorswim."
+        # 1R is recalculated on the new size: the new average entry and the stop now set (a trailing
+        # stop or no stop: no fixed stop, so no R). Auto B/E was consent for the ticket's own
+        # position: an add ends it.
+        # An add whose outcome is open stays UNKNOWN: that is what blocks the symbol until Resolve.
+        final = "UNKNOWN" if sent.get("unresolved") or uncovered else "DONE" if res.get("ok") else "CHECK"
+        if not added:
+            self.store.log_action("add", symbol, None, final, msg[:900])
+            return {"ok": False, "symbol": symbol, "filled": 0, "message": msg, "error": msg,
+                    "unresolved_close": bool(sent.get("unresolved"))}
+        # R needs a fixed stop that Schwab confirmed, on the risk side of the new average.
+        r_stop = float(new_stop) if (new_stop is not None and not trail and res.get("ok")) else None
+        if r_stop is not None and (r_stop >= new_avg if side == "LONG" else r_stop <= new_avg):
+            r_stop = None
+            r_txt = " The stop is at or past the new average: no risk, so R is not set."
+        elif r_stop is not None:
+            rps = abs(new_avg - r_stop)
+            r_txt = f" 1R is now {rps:.2f}/sh = ${rps * protect:,.0f}."
+        else:
+            r_txt = " No confirmed fixed stop: R is not set."
+        if opened:
+            self.store.save_r_reset(symbol, side, opened, new_avg, r_stop)
+            msg += r_txt
+        else:
+            msg += " R was NOT recalculated (the position's open time is not known yet): Live R may be off."
+        if ended:
+            msg += " Auto B/E ended (the position changed)."
+        self.store.log_action("add", symbol, None, final, msg[:900])
+        good = bool(res.get("ok")) and filled >= n - 1e-9 and not uncovered
+        return {"ok": good, "symbol": symbol, "filled": filled, "avg": add_avg,
+                "message": msg, "error": None if good else msg,
+                "unresolved_close": bool(sent.get("unresolved") or uncovered)}
+
     def _create_stop(self, client, symbol: str, side: str, qty: float, asset: str | None,
                      price: Decimal | None, fresh: list[dict], terminal: set[int],
                      target: Decimal | None = None, rebuild: bool = False, trail: dict | None = None,
-                     preview: bool = False) -> dict:
+                     preview: bool = False, duration: str = "DAY", exits_gone: bool = False) -> dict:
         """Create a stop for the whole position. Schwab cancels an instrument's working orders
         when a new order is entered, so an existing single target is re-sent together with the
         new stop as one OCO (the target survives and gets linked).
@@ -2038,7 +2535,10 @@ class Trader:
         from .bracket import stop_leg
         tk = ticks_for(asset)              # formatting only: the prices are already on their grid
         unit_w, us = _units(asset)
-        stop = stop_leg(trail or price, leg, ticks=tk)
+        if not rebuild and any(_gtc(p.duration) for p in pending_orders(fresh, terminal)
+                               if p.symbol == symbol and p.live and p.exits(side) and p.role in ("STOP", "TARGET")):
+            duration = "GOOD_TILL_CANCEL"     # the kept target was GTC: the new pair keeps it overnight
+        stop = stop_leg(trail or price, leg, duration=duration, ticks=tk)
         stop_txt = _trail_txt(trail) if trail else f"stop {fmt(price, tk)}"
         targets = []
         if not rebuild:
@@ -2059,7 +2559,7 @@ class Trader:
         if target is not None:
             order = {"orderStrategyType": "OCO", "childOrderStrategies": [
                 {"orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
-                 "duration": "DAY", "price": fmt(target, tk), "orderLegCollection": leg},
+                 "duration": duration, "price": fmt(target, tk), "orderLegCollection": leg},
                 stop]}
             what = f"{stop_txt} + target {fmt(target, tk)} as one OCO"
             targets = targets or [True]
@@ -2082,11 +2582,22 @@ class Trader:
             self.store.log_action("create_stop", symbol, None, "UNKNOWN", repr(e))
             return {"ok": False, "symbol": symbol,
                     "error": "No answer from Schwab: the stop MAY have been placed. Check thinkorswim."}
+        if r.status_code >= 500:
+            # A server error is not a refusal: the order MAY be live.
+            self.store.log_action("create_stop", symbol, None, "UNKNOWN", f"HTTP {r.status_code} {r.text[:200]}")
+            return {"ok": False, "symbol": symbol,
+                    "error": f"Schwab answered HTTP {r.status_code}: the {what} MAY have been placed. Check thinkorswim "
+                             "before setting it again."}
         if r.status_code not in (200, 201):
             self.store.log_action("create_stop", symbol, None, "REJECTED", f"HTTP {r.status_code} {r.text[:200]}")
+            if exits_gone:        # after a partial or an add: Schwab already dropped the old exits
+                kept = "The position has NO STOP now: use Move stop or thinkorswim."
+            elif rebuild:         # nothing entered, so nothing was cancelled
+                kept = "Nothing was entered: your current stop and target should still be working."
+            else:
+                kept = "Your target is still working." if targets else "The position has no stop."
             return {"ok": False, "symbol": symbol,
-                    "error": f"Schwab refused the stop (HTTP {r.status_code}): {r.text[:150]}. "
-                             + ("Your target is still working." if targets else "The position has no stop.")}
+                    "error": f"Schwab refused the stop (HTTP {r.status_code}): {r.text[:150]}. " + kept}
         tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
         new_id = int(tail) if tail.isdigit() else None
         # Auto B/E follows a stop the companion rebuilt itself (never a trailing one). Linked as
@@ -2305,20 +2816,96 @@ class Trader:
                                          detail="matched to Schwab order by the poller")
                 claimed.add(oid)
 
+    def _outside_entries(self, orders_today: list[dict], tickets: list[dict], start: datetime) -> list[dict]:
+        """Opening orders entered today that no companion ticket owns, as ticket-shaped rows: the
+        companion's own Add shares orders ("ADD"), thinkorswim ("TOS") and anything else ("SCHWAB").
+        Single-leg only (a spread entered elsewhere is not listed). A ticket's own tree, and an entry
+        edited in thinkorswim that replaced a ticket's, stay the ticket's."""
+        by_id = {o["orderId"]: o for o in orders_today if o.get("orderId") is not None}
+        owned: set = set()
+
+        def claim(o):
+            if o.get("orderId") is not None:
+                owned.add(o["orderId"])
+            for c in o.get("childOrderStrategies") or []:
+                claim(c)
+        for t in tickets:
+            tree = by_id.get(t["order_id"]) if t.get("order_id") else None
+            for _ in range(10):
+                if not tree:
+                    break
+                claim(tree)
+                tree = _replacement(tree, orders_today) if tree.get("status") == "REPLACED" else None
+        try:
+            with self.store._lock:
+                adds = {int(r[0]) for r in self.store._con.execute(
+                    "select order_id from actions where kind = 'add' and order_id is not null and created >= ?",
+                    (start.isoformat(),))}
+        except Exception:
+            adds = set()
+        out, done = [], set()
+
+        def walk(o):
+            yield o
+            for c in o.get("childOrderStrategies") or []:
+                yield from walk(c)
+        for top in orders_today:
+            for o in walk(top):
+                oid = o.get("orderId")
+                legs = o.get("orderLegCollection") or []
+                if oid is None or oid in owned or oid in done or len(legs) != 1:
+                    continue
+                leg = legs[0]
+                ins = str(leg.get("instruction") or "")
+                if ins not in OPENING:
+                    continue
+                entered = _when(o.get("enteredTime"))
+                if entered < start or o.get("status") in ("REJECTED", "CANCELED", "EXPIRED", "REPLACED") \
+                        and not float(o.get("filledQuantity") or 0) > 0:
+                    continue
+                inst = leg.get("instrument") or {}
+                sym = inst.get("symbol")
+                if not sym:
+                    continue
+                done.add(oid)
+                tag = str(o.get("tag") or "")
+                fills = [(float(e.get("quantity") or 0), float(e.get("price") or 0))
+                         for a in o.get("orderActivityCollection") or [] if a.get("executionType") == "FILL"
+                         for e in a.get("executionLegs") or []]
+                q = sum(f[0] for f in fills)
+                avg = round(sum(f[0] * f[1] for f in fills) / q, 4) if q else None
+                price = o.get("price") if o.get("price") is not None else o.get("stopPrice")
+                out.append({
+                    "ticket_id": f"o{oid}", "created": o.get("enteredTime"), "symbol": sym,
+                    "side": "SHORT" if ins in ("SELL_SHORT", "SELL_TO_OPEN") else "LONG",
+                    "qty": float(leg.get("quantity") or 0),
+                    "limit_price": f"{avg:g}" if avg is not None else (f"{float(price):g}" if price is not None else "MKT"),
+                    "status": "ACCEPTED", "order_id": oid, "tree": o, "request": None,
+                    "asset_type": inst.get("assetType") or "EQUITY",
+                    "source": "ADD" if oid in adds else "TOS" if tag.startswith("API_TOS") else "SCHWAB"})
+        return out
+
     def brackets(self, orders_today: list[dict], pend: list[PendingOrder],
                  positions: dict[str, float], orders_fresh: bool) -> list[dict]:
-        """Today's tickets. The latest ticket per symbol shows live protection, measured on the
-        whole position with every live stop and target (so ToS edits and replacements count)."""
+        """Today's entries: every companion ticket, plus every other opening order of the day (the
+        companion's Add shares, thinkorswim, Schwab's site or app), newest first. The latest filled
+        entry per symbol shows live protection, measured on the whole position with every live stop
+        and target (so ToS edits and replacements count)."""
         by_id = {o["orderId"]: o for o in orders_today}
         start = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         out, seen = [], set()
         from .view import pretty_symbol
-        for t in self.store.tickets_since(start.isoformat()):   # newest first
+        tickets = self.store.tickets_since(start.isoformat())
+        rows = [dict(t, source="EDGE") for t in tickets] + self._outside_entries(orders_today, tickets, start)
+        rows.sort(key=lambda r: _when(r.get("created")), reverse=True)
+        for t in rows:                                       # newest first
             row = dict(t)
-            legs = (t.get("request") or {}).get("orderLegCollection") or [{}]
-            row["asset_type"] = (legs[0].get("instrument") or {}).get("assetType") or "EQUITY"
+            if not row.get("asset_type"):
+                legs = (t.get("request") or {}).get("orderLegCollection") or [{}]
+                row["asset_type"] = (legs[0].get("instrument") or {}).get("assetType") or "EQUITY"
             row["display"] = pretty_symbol(t["symbol"], row["asset_type"])
-            tree = by_id.get(t["order_id"]) if t["order_id"] else None
+            tree = (t.get("tree") or by_id.get(t["order_id"])) if t["order_id"] else None
+            row.pop("tree", None)
             # Only a filled ticket claims the symbol, so a newer rejected or unfilled ticket
             # never hides the protection status of a position an earlier ticket opened.
             filled_now = bool(tree) and float(tree.get("filledQuantity") or 0) > 0
@@ -2441,4 +3028,19 @@ class Trader:
 
     def status(self) -> dict:
         return {"armed": self.armed, "market_open": market_open(),
-                "blocked": bool(self.store.open_tickets()), "risk_choices": RISK_CHOICES}
+                "blocked": bool(self.store.open_tickets()), "risk_choices": RISK_CHOICES,
+                "unresolved": self.unresolved_symbols()}
+
+    def unresolved_symbols(self) -> list[str]:
+        """Symbols whose latest close / partial / add (30 days) has no final outcome: what
+        _unresolved_close blocks, for the page's attention bar. Read only, no Schwab call; a
+        non-final Schwab status counts until an action re-checks it."""
+        try:
+            start = datetime.now(timezone.utc) - timedelta(days=30)
+            last = {}
+            for a in self.store.actions_since(start.isoformat()):
+                if a["kind"] in ("close", "partial", "add"):
+                    last[a["symbol"]] = a["status"]
+            return sorted(s for s, st in last.items() if st not in TERMINAL and st not in self.SETTLED)
+        except Exception:
+            return []

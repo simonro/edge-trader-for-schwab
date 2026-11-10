@@ -230,9 +230,35 @@ class SpreadBook:
     @staticmethod
     def view(sp: dict) -> dict:
         """What the dashboard shows of a spread."""
-        return {k: sp.get(k) for k in ("spread_id", "underlying", "kind", "qty", "state", "detail", "legs",
-                                       "expiration", "entry_order_id", "close_order_id", "target_order_id",
-                                       "created", "ticket", "hold")}
+        v = {k: sp.get(k) for k in ("spread_id", "underlying", "kind", "qty", "state", "detail", "legs",
+                                    "expiration", "entry_order_id", "close_order_id", "target_order_id",
+                                    "created", "ticket", "hold")}
+        v["order_ids"] = sorted({int(o) for o in [sp.get("entry_order_id"), sp.get("close_order_id"),
+                                                  sp.get("target_order_id")] + [f["order_id"] for f in sp.get("fills") or []]
+                                 if o})
+        return v
+
+    def attach_fill_ids(self, views: list[dict]) -> list[dict]:
+        """Each shown spread's own fills as Edge fill ids, oldest first: every leg fill of the orders it
+        sent (entry, closes, target), read by order id from all stored history (no date window, so a
+        spread held for months keeps its first fill). The journal keys the spread's entry on them, so
+        the first one (the first entry fill) stays the same from the open spread to the closed row."""
+        from ..pnl import fills_from_transaction
+        want = sorted({o for v in views for o in v.get("order_ids") or []})
+        by_order: dict[int, list] = {}
+        if want:
+            with self.store._lock:
+                rows = self.store._con.execute(
+                    f"select payload from transactions where order_id in ({','.join('?' * len(want))})", want).fetchall()
+            for (payload,) in rows:
+                t = json.loads(payload)
+                if t.get("orderId") is not None:
+                    by_order.setdefault(int(t["orderId"]), []).extend(fills_from_transaction(t))
+        for v in views:
+            fills = [f for o in v.get("order_ids") or [] for f in by_order.get(o, [])]
+            fills.sort(key=lambda f: (f.time, f.id))
+            v["fill_ids"] = list(dict.fromkeys(f.id for f in fills))
+        return views
 
     def watch_stops(self, views: list[dict], quotes: dict, market_open: bool) -> list[dict]:
         """Each shown spread with its watch-only stop status (`stop`, or None), after one look at the
@@ -488,7 +514,7 @@ class SpreadBook:
             px, done = (target or {}).get("price"), max(fc.values())
             return "OPEN", (f"{held_units:g} spread(s) open, target working"
                             + (f" at {float(px):.2f}" if px is not None else "")
-                            + (f" ({done:g} closed by it)" if done > 1e-9 else ""))
+                            + (f" ({done:g} already closed)" if done > 1e-9 else ""))
         return "OPEN", f"{held_units:g} spread(s) open"
 
 

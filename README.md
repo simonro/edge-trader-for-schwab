@@ -78,7 +78,7 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   open or sell to open. Stop and targets are option prices; contracts are sized from your risk (one
   contract = 100 shares of premium). The same one-click bracket goes to Schwab, with limit entries
   only (mid, ask or bid) and a warning on wide markets and on every sell to open.
-- **Vertical spreads (new in 1.3.0):** switch the ticket to Spread, pick the underlying, debit or
+- **Vertical spreads:** switch the ticket to Spread, pick the underlying, debit or
   credit, expiry, calls or puts, click the near strike and pick the width. The ticket says the trade in
   plain words (bull put, bear call, bull call or bear put: where you keep the credit, breakeven, where you
   lose the most, the short leg's delta) and sizes by quantity or by risk (one spread's max loss = 1R).
@@ -86,13 +86,29 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   preview accepts it. Each spread then gets its own workbench: live P&L and R against the max loss,
   close all or part of it, a GTC profit target (25, 50 or 75% of the max gain, or your price) and an
   app-watched stop (see Good to know).
+- **Cockpit layout (new in 1.4.0):** a Layout switch in the header (Classic stays the default). The
+  selected trade gets a price ladder at true price spacing: last price, entry, stop, target and 1R
+  levels, with your exits as cards beside it. Drag a stop or target line to a new price: the drag only
+  fills the price box, and nothing is sent until you click the button. Spreads get their own ladder
+  (net price from 0 to the width, max gain and max loss in dollars and R). An attention bar lists what
+  needs you: no stop, a stop that covers only part of the position, an order with an unclear outcome,
+  a spread that needs a check.
+- **Add shares (new in 1.4.0):** add to a stock position from its workbench at the mid, market, ask or
+  bid. **Keep stop** leaves the stop where it is (more dollars at risk); **Keep risk** moves the stop so
+  the dollars at risk stay the same. Then ONE stop and target go back on the whole new size, and 1R is
+  recalculated from the new average entry.
+- **Today's tickets:** every entry of the day in one list, marked by where it came from: the New trade
+  ticket, an Add shares (ADD), thinkorswim (TOS) or anywhere else (OTHER), with its protection and P&L.
 - **Workbench for the selected trade:** an R ruler (original stop, current stop, entry, 1R, targets,
   price), stop to break-even, move stop, Schwab-held trailing stop (R, dollars or percent), replace
   target, partials at the mid, market, ask or bid (the stop and target are rebuilt on the rest), cancel
-  orders and close.
+  orders and close. On a trailing stop, a partial or a new target asks first: restart the trail from the
+  current price, or keep the stop fixed at the level the trail reached.
 - **Floating windows:** small always-on-top Entry and Manage windows to keep next to your charts.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
-  optional spoken alert 10 minutes before the close if day trades are still open.
+  optional spoken alert 10 minutes before the close if day trades are still open. Orders follow the
+  same hours: on a market holiday, or after an early close (like the day after Thanksgiving), every
+  order is refused, and arming lapses at that session's close.
 - **Safety rails:** no order is ever retried automatically; an order with an unclear outcome blocks
   further orders for that symbol until Schwab confirms it or you press Resolve; the app never opens
   Schwab's streamer, so it never disconnects another app that uses it.
@@ -114,6 +130,11 @@ risk before you send.
 credit, breakeven, the most you can lose, the short leg's delta), both legs, and the max loss as 1R.
 
 ![The spread ticket with a bull put spread planned](docs/screenshot-spread-ticket.png)
+
+**Cockpit layout.** The price ladder beside the selected trade's controls, with the attention bar on
+top. Drag a line to set the price; the button sends.
+
+![The Cockpit layout with the price ladder](docs/screenshot-cockpit.png)
 
 **Manage window.** The same controls in a small always-on-top window.
 
@@ -221,6 +242,9 @@ folder across, run `setup.bat` once, then `launch.bat`.
   works alongside thinkorswim and other tools. It keeps its own requests well under Schwab's limits.
 - **Schwab cancels a symbol's working orders when a new order for it is entered.** Edge Trader is built
   around that: partials, target changes and trails send one new bracket for the remaining shares.
+  It also means an **Add shares** order drops your stop and target while it fills: the position has no
+  stop at Schwab until the add fills and the new stop goes on (usually about a second: a limit add rests
+  at most 3 seconds, then the rest goes at market).
 - **Planned risk is not maximum loss:** a stop becomes a market order when it triggers and can fill
   past its price on a gap or a halt.
 - **Recording mode:** `.venv\Scripts\python.exe -m companion --private` hides positions carried from

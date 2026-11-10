@@ -326,17 +326,9 @@ class Poller:
 
     def _regular_session(self) -> bool:
         """Inside today's regular session: Schwab's own hours when known (holidays, early closes),
-        else the plain 9:30 to 16:00 weekday rule."""
+        else the plain 9:30 to 16:00 weekday rule. Same answer the trader's order checks get."""
         from .trading import market_open
-        if not market_open():
-            return False
-        if "today" not in (self.hours or {}):
-            return True
-        s = self.hours["today"]
-        if not s:
-            return False                     # Schwab says the market is closed today
-        now = datetime.now(timezone.utc)
-        return datetime.fromisoformat(s["open"]) <= now < datetime.fromisoformat(s["close"])
+        return market_open()
 
     def _fetch_hours(self, name: str, now: datetime) -> bool:
         """Today's regular session and the next one that has not ended (up to a week ahead, so a
@@ -348,11 +340,24 @@ class Poller:
             data = self._call(name, lambda d=d: self.client.market_hours(["equity"], date=d.isoformat()))
             if not isinstance(data, dict):
                 return False
-            eq = next(iter((data.get("equity") or {}).values()), {})
+            eq = next(iter((data.get("equity") or {}).values()), None)
+            if not isinstance(eq, dict) or not isinstance(eq.get("isOpen"), bool):
+                return False                 # an answer without isOpen is not a holiday: keep what we had
             reg = (eq.get("sessionHours") or {}).get("regularMarket") or []
-            sess = {"date": d.isoformat(), "open": reg[0]["start"], "close": reg[-1]["end"]}                 if eq.get("isOpen") and reg else None
+            if eq["isOpen"] and not (reg and reg[0].get("start") and reg[-1].get("end")):
+                return False                 # open, but no session times: unreadable, not closed
+            if eq["isOpen"]:
+                try:
+                    o, c = datetime.fromisoformat(reg[0]["start"]), datetime.fromisoformat(reg[-1]["end"])
+                except (TypeError, ValueError):
+                    return False
+                if o.tzinfo is None or c.tzinfo is None:
+                    return False             # a time without its offset is unreadable
+            sess = {"date": d.isoformat(), "open": reg[0]["start"], "close": reg[-1]["end"]} if eq["isOpen"] else None
             if i == 0:
                 out["today"] = sess
+                from .trading import set_market_hours
+                set_market_hours(today.isoformat(), sess)   # the order checks get today even if the next-day read fails
             if sess and datetime.fromisoformat(sess["close"]) > now:
                 out["next"] = sess
                 break
@@ -402,6 +407,8 @@ class Poller:
                 midnight = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
                 st["spreads_closed"] = [self.trader.spreads.view(sp) for sp in self.trader.spreads.closed_since(
                     midnight.astimezone(timezone.utc).isoformat())]
+                # The journal keys a spread's entry on its own fills (open workbench and Closed today row).
+                self.trader.spreads.attach_fill_ids(st["spreads"] + st["spreads_closed"])
             st["trading"] = self.trader.status()
             st["brackets"] = self.trader.brackets(
                 today, pending_orders(self._merged_orders(), self.terminal), positions,
@@ -515,10 +522,18 @@ class Poller:
                 return False
             return abs((a - o).total_seconds()) <= 5
 
+        resets = self.trader.store.r_resets()
         for p in st.get("positions") or []:
             top = basis.get(p["symbol"])
             b = next((c for c in ([top, *top["alts"]] if top else [])
                       if c["side"] == p["side"] and owns(c, p)), None)
+            # Add Shares recalculated 1R for this position (same symbol, side and open time).
+            rs = resets.get((p["symbol"], p["side"], p.get("opened"))) if p.get("opened") else None
+            if rs:
+                rps = abs(rs["entry"] - rs["stop"]) if rs["stop"] is not None else 0
+                b = ({"side": p["side"], "entry": rs["entry"], "stop": rs["stop"], "rps": rps, "added": True,
+                      "ticket_id": (b or {}).get("ticket_id"), "first_fill": (b or {}).get("first_fill") or p["opened"]}
+                     if rps > 0 else None)
             if b and p.get("last"):
                 direction = 1 if p["side"] == "LONG" else -1
                 b = {k: v for k, v in b.items() if k != "alts"}

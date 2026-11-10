@@ -801,6 +801,49 @@ def test_a_restart_turns_an_interrupted_send_into_unclear(desk):
     from companion.spreads.spread_stop import StopWatch
     sid = open_spread(desk)
     fired_stop(desk, sid)
-    assert desk.book.stops.claim_send(sid)
+    claim = desk.book.stops.claim_send(sid)
+    assert claim and desk.book.stops.start_send(sid, claim)
     res = StopWatch(desk.t.store).get(sid)["sent_result"]
     assert res.startswith("unclear") and "stopped while sending" in res
+
+
+def test_a_restart_before_a_queued_send_started_says_nothing_was_sent(desk):
+    from companion.spreads.spread_stop import StopWatch
+    sid = open_spread(desk)
+    fired_stop(desk, sid)
+    assert desk.book.stops.claim_send(sid)            # fired, still waiting for the order lock
+    res = StopWatch(desk.t.store).get(sid)["sent_result"]
+    assert res.startswith("refused") and "before sending" in res
+
+
+def test_a_stop_cannot_be_removed_or_changed_once_its_close_is_sending(desk):
+    sid = open_spread(desk)
+    fired_stop(desk, sid)
+    claim = desk.book.stops.claim_send(sid)
+    assert desk.book.stops.start_send(sid, claim)
+    assert not desk.book.stops.clear(sid) and not desk.book.stops.set(sid, 1.30, 0.1, send=False)
+    assert desk.book.stops.get(sid)["sent_result"] == "sending"
+
+
+def test_a_stop_removed_or_changed_while_its_send_waits_for_the_lock_sends_nothing(desk):
+    for change in ("clear", "watch_only"):
+        sid = open_spread(desk)
+        fired_stop(desk, sid)
+        placed = len(desk.t._client.placed)
+        real = desk.t._send_lock
+
+        class Lock:                      # the click lands while the fired send waits for the order lock
+            def acquire(self, timeout=-1):
+                if change == "clear":
+                    desk.book.stops.clear(sid)
+                else:
+                    desk.book.stops.set(sid, 1.40, 0.05, send=False)
+                return real.acquire(timeout=timeout)
+
+            def release(self):
+                real.release()
+        desk.t._send_lock = Lock()
+        r = desk.auto_stop(sid)
+        desk.t._send_lock = real
+        assert not r["ok"] and "removed or changed" in r["error"], r
+        assert len(desk.t._client.placed) == placed

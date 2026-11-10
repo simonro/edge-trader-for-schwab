@@ -83,6 +83,7 @@
   .health.stale { background: var(--amber-bg); color: var(--amber); border-color: transparent; }
   .health.down { background: var(--red); color: #fff; border-color: transparent; animation: pulse 1.2s infinite; }
   @keyframes pulse { 50% { opacity: .55; } }
+  button.pill { background: none; font-family: var(--sans); cursor: pointer; } button.pill:hover { border-color: var(--line-hi); color: var(--text); }
   .pill { font-size: 11.5px; padding: 3px 9px; border-radius: 12px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
   .pill.warn { color: var(--amber); border-color: rgba(214,165,43,.5); background: var(--amber-bg); }
   .pill.bad { color: var(--red); border-color: rgba(229,83,75,.5); background: var(--red-bg); }
@@ -114,7 +115,7 @@
 
   /* Left: day trades (scrolls) */
   #daylist { flex: 1; min-height: 120px; }
-  #workspace { display: flex; flex-direction: column; }
+  #workcol > #workspace { display: flex; flex-direction: column; flex: 1; min-height: 0; }
   #workspace .work { flex: 1; }
   .li { padding: 9px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
   .li:hover { background: #151b23; }
@@ -285,7 +286,7 @@
   body.view-manage #arm-chip { display: none; }
   body.view-entry .stats, body.view-manage .stats, body.view-entry .bottom, body.view-manage .bottom { display: none; }
   body.view-entry main, body.view-manage main { grid-template-columns: 1fr !important; padding: 8px; }
-  body.view-entry main > section:not(#ticket), body.view-manage main > section:not(#workspace) { display: none; }
+  body.view-entry main > section:not(#ticket), body.view-manage main > section:not(#workcol) { display: none; }
   body.view-entry #ticket .ph { display: none; }
   body.view-entry #ticket .tk { max-width: none; padding: 10px; }
   body.view-manage #workspace .lock small, body.view-manage .log, body.view-manage .hk, body.view-manage .hk-edit,
@@ -308,6 +309,7 @@
   @media (max-width: 1150px) { main { grid-template-columns: 1fr; } .bottom { grid-template-columns: 1fr; } #daylist { flex: none; max-height: 300px; } .stats { grid-template-columns: 1fr 1fr; }
     header { flex-wrap: wrap; height: auto; padding: 6px 12px; row-gap: 6px; } .metrics { grid-template-columns: 1fr 1fr; } }
 </style>
+<link rel="stylesheet" href="/cockpit.css">
 </head>
 <body>
 <header>
@@ -318,8 +320,9 @@
   <span class="sp"></span>
   <span class="clock" id="clock"></span>
   <span class="pill" id="mkt-state"></span>
-  <span class="pill" id="auth">auth</span>
+  <button type="button" class="pill" id="auth" title="Schwab sign-in time left. Click to sign in again (opens a window; about once a week)">auth</button>
   <button type="button" class="btn sm ghost voice" id="voice" title="Spoken fills (open, add, partial, closed with P&amp;L) and an alert 10 minutes before the close if day trades are still open. Click to switch on/off; Shift+click to test."></button>
+  <button type="button" class="btn sm ghost only-main" id="layout-btn" title="Switch between the Classic and Cockpit layouts">Layout</button>
   <button type="button" class="armchip" id="arm-chip" title="Entries need arming; position actions do not">Entries disarmed</button>
   <span class="only-main"><button type="button" class="btn sm ghost" data-open="entry" title="Small always-on-top window with the New trade ticket">Entry ⧉</button>
     <button type="button" class="btn sm ghost" data-open="manage" title="Small always-on-top window to manage the selected position">Manage ⧉</button></span>
@@ -330,6 +333,7 @@
 <div class="banner close-alert" id="close-alert"></div>
 <div class="banner" id="banner"></div>
 <div class="banner conn" id="conn-banner"></div>
+<div class="attn" id="attn"></div>
 <div class="stats">
   <div class="stat"><div class="k" id="k-real-l">Realized today · net</div><div class="v" id="k-real">-</div><div class="s" id="k-real-s"></div></div>
   <div class="stat"><div class="k">Open P&amp;L · day trades</div><div class="v" id="k-open">-</div><div class="s" id="k-open-s"></div></div>
@@ -344,7 +348,8 @@
     <div class="scroll" id="daylist"></div>
   </section>
 
-  <section class="panel" id="workspace"></section>
+  <!-- The workbench is redrawn every second; the journal panel under it is not (journal.js). -->
+  <section class="panel" id="workcol"><div id="workspace"></div><div id="jr-pos"></div></section>
 
   <section class="panel" id="ticket">
     <div class="ph">New trade <button type="button" class="armchip" id="t-arm" style="margin-left:auto">Entries disarmed</button>
@@ -399,11 +404,12 @@
 </main>
 
 <div class="bottom">
+  <div class="dock-tabs" id="dock-tabs"></div>
   <section class="panel"><div class="ph">Closed today <span class="mut" id="closed-n"></span><small id="age-tx"></small></div>
     <div id="futures"></div><div class="scroll box" id="closed"></div></section>
   <section class="panel"><div class="ph">Pending orders <span class="mut" id="orders-n"></span><small><span id="age-orders"></span> <span id="cancel-all-slot"></span></small></div>
     <div class="scroll box" id="orders"></div></section>
-  <section class="panel"><div class="ph">Today's tickets <span class="mut" id="tickets-n"></span><small>entries sent from New trade</small></div>
+  <section class="panel"><div class="ph">Today's tickets <span class="mut" id="tickets-n"></span><small>every entry today: New trade, adds, thinkorswim</small></div>
     <div class="scroll box" id="t-brackets"></div></section>
   <section class="panel"><div class="ph">Carried positions <span class="mut" id="carried-n"></span><small>since entry · click to manage</small></div>
     <div class="scroll box" id="carried"></div></section>
@@ -468,6 +474,9 @@ let SEL = null, SEL_CLEARED = false, UI_SEQ = null, LOCKED = false;
 const POS_MSG = {};   // symbol -> {cls, text} from the last action on it
 const MS_INPUT = {};  // symbol -> typed new stop price (survives the 2 s re-render)
 const PT_INPUT = {};  // symbol -> typed partial share count
+const AD_INPUT = {};  // symbol -> typed Add shares count
+let ADD_MODE = "mid", ADD_STOP = "price";   // Add shares: entry price mode; keep the stop price or the $ risk
+try { ADD_MODE = localStorage.getItem("addMode") || "mid"; ADD_STOP = localStorage.getItem("addStop") || "price"; } catch (e) {}
 const TG_INPUT = {};  // symbol -> typed target price
 let PART_MODE = "mid";
 try { PART_MODE = localStorage.getItem("partMode") || "mid"; } catch (e) {}
@@ -488,7 +497,7 @@ function selected(st) {
     SEL = null;
   }
   const newest = newestPosition(rows);
-  const typing = document.activeElement?.closest?.("#workspace input");
+  const typing = document.activeElement?.closest?.("#workspace input, #jr-pos .jr-keep");
   if (newest && newest.symbol + newest.opened !== NEWEST_SEEN && !typing) {
     const first = NEWEST_SEEN === null;
     NEWEST_SEEN = newest.symbol + newest.opened;
@@ -585,8 +594,40 @@ function loadPrefs(rev) {
 document.addEventListener("input", e => {
   if (e.target.classList?.contains("tg-input")) TG_INPUT[e.target.dataset.symbol] = e.target.value.trim();
   else if (e.target.classList?.contains("pt-input")) PT_INPUT[e.target.dataset.symbol] = e.target.value.trim();
+  else if (e.target.classList?.contains("ad-input")) { AD_INPUT[e.target.dataset.symbol] = e.target.value.trim(); paintAddEst(e.target.dataset.symbol); }
   else if (e.target.classList?.contains("ms-input")) MS_INPUT[e.target.dataset.symbol] = e.target.value.trim();
 });
+document.addEventListener("click", e => {
+  const a = e.target.closest("[data-amode], [data-astop]"); if (!a) return;
+  if (a.dataset.amode) ADD_MODE = a.dataset.amode; else ADD_STOP = a.dataset.astop;
+  try { localStorage.setItem("addMode", ADD_MODE); localStorage.setItem("addStop", ADD_STOP); } catch (err) {}
+  if (lastState) render(lastState);
+});
+// Add shares estimate, from the last price: new average, the stop it will use and the $ at risk.
+function addEst(p, n) {
+  if (!p || !(n > 0) || p.last == null || p.avg_price == null) return null;
+  const q0 = Math.abs(p.qty), d = p.side === "LONG" ? 1 : -1, px0 = Number(p.last);
+  const avg = (p.avg_price * q0 + px0 * n) / (q0 + n);
+  const stop0 = p.trail ? null : (p.stop_best ?? p.stop_price);   // the server keeps the most protective stop
+  if (stop0 == null) return {avg, stop: null, risk: null, was: null};
+  const was = (p.avg_price - stop0) * d * q0;
+  const stop = ADD_STOP === "risk" ? (q0 * stop0 + n * px0) / (q0 + n) : stop0;
+  return {avg, stop, risk: (avg - stop) * d * (q0 + n), was};
+}
+function addEstText(p, sym) {
+  const n = parseInt(AD_INPUT[sym]);
+  if (!(n > 0)) return ADD_STOP === "risk" ? "Keep risk: the stop moves up so the $ at risk stays the same." : "Keep stop: the stop stays where it is; the $ at risk grows.";
+  const e = addEst(p, n);
+  if (!e) return "";
+  if (e.stop == null) return `About ${qty(Math.abs(p.qty) + n)} sh @ ${px(e.avg)}. ${p.trail ? "Trailing stop kept on the full size." : "No stop: the add has none either."}${ADD_STOP === "risk" ? " Keep risk needs a fixed stop." : ""}`;
+  if (ADD_STOP === "risk" && e.was <= 0) return `Your stop ${px(p.stop_best ?? p.stop_price)} is at or past your average: there is no risk to keep. Use Keep stop.`;
+  return `About ${qty(Math.abs(p.qty) + n)} sh @ ${px(e.avg)} · stop ${px(e.stop)} · risk ${money(-e.risk, false)} (now ${money(-e.was, false)}) · at ~${px(p.last)}`;
+}
+function paintAddEst(sym) {
+  const el = document.querySelector(`[data-addest="${CSS.escape(sym)}"]`);
+  const p = (lastState?.positions || []).find(x => x.symbol === sym);
+  if (el && p) el.textContent = addEstText(p, sym);
+}
 document.addEventListener("click", e => {
   const m = e.target.closest("[data-pmode]"); if (!m) return;
   PART_MODE = m.dataset.pmode;
@@ -778,8 +819,6 @@ function renderWorkspace(p, st) {
   const r = p.r, sym = p.symbol;
   const nOrders = (st.orders || []).filter(o => o.symbol === sym).length;
   const nT = (p.targets_all || []).length;
-  const log = (st.action_log || {})[sym] || [];
-  const m = POS_MSG[sym];
   const open = !!lastState?.trading?.market_open;
   const noR = !r;
   const tr = p.trail;
@@ -805,24 +844,50 @@ function renderWorkspace(p, st) {
     ${ruler(p)}
     <div class="acts">
       ${stopRow(p, sym, noR)}
-      <div class="arow"><div class="al">Target<small>${tgtNote}</small></div>
+      ${targetRow(p, sym, noR, tgtNote)}
+      ${partialRow(p, sym)}
+      ${addRow(p, sym, open)}
+    </div>
+    ${resultBox(p, sym)}
+    ${hotkeyHelp()}
+  </div>`;
+}
+// Rows shared by the Classic workbench and the Cockpit layout (cockpit.js): same buttons, same keys.
+function targetRow(p, sym, noR, tgtNote) {
+  const nT = (p.targets_all || []).length;
+  return `<div class="arow"><div class="al">Target<small>${tgtNote}</small></div>
         <div class="ctl">${[1, 1.5, 2, 3].map(v => actionBtn(`tr${v}:${sym}`, `${v}R`, "target", {symbol: sym, r: v}, "", noR, "act", kbd(`tr${v}`))).join("")}<span class="gap"></span>
           <input class="in ms-input tg-input" data-symbol="${esc(sym)}" inputmode="decimal" placeholder="price" value="${esc(TG_INPUT[sym] || "")}">
           ${actionBtn(`tg:${sym}`, nT ? "Replace target" : "Set target", "target", {symbol: sym, custom: 1}, "", false, "act", kbd("@target"))}
           ${noR ? `<span class="why">R needs a companion entry: type a price</span>` : ""}</div>
-        ${(p.stop_price == null && !p.trail) !== !nT ? `<div class="warnline mut" style="color:var(--muted)">${!nT ? "No target yet: Set target pairs it with the stop as one OCO." : "No stop yet: Set stop pairs it with the target as one OCO."}</div>` : ""}</div>
-      <div class="arow"><div class="al">Partial<small>${PART_MODE === "market" ? "at market" : `limit at ${PART_MODE}, then market after 3 s`}</small></div>
+        ${(p.stop_price == null && !p.trail) !== !nT ? `<div class="warnline mut" style="color:var(--muted)">${!nT ? "No target yet: Set target pairs it with the stop as one OCO." : "No stop yet: Set stop pairs it with the target as one OCO."}</div>` : ""}</div>`;
+}
+function partialRow(p, sym) {
+  return `<div class="arow"><div class="al">Partial<small>${PART_MODE === "market" ? "at market" : `limit at ${PART_MODE}, then market after 3 s`}</small></div>
         <div class="ctl"><div class="seg">${[["mid", "Mid"], ["market", "Mkt"], ["ask", "Ask"], ["bid", "Bid"]].map(([v, t]) =>
             `<button type="button" data-pmode="${v}" class="${PART_MODE === v ? "on" : ""}">${t}</button>`).join("")}</div>
           ${[25, 50, 75].map(v => actionBtn(`pt${v}:${sym}`, `${v}%`, "partial", {symbol: sym, pct: v / 100}, "", false, "act", kbd(`pt${v}`))).join("")}<span class="gap"></span>
           <input class="in ms-input pt-input" data-symbol="${esc(sym)}" inputmode="numeric" placeholder="${p.asset_type === "OPTION" ? "contracts" : "shares"}" value="${esc(PT_INPUT[sym] || "")}" style="width:${p.asset_type === "OPTION" ? 104 : 84}px">
-          ${actionBtn(`ptc:${sym}`, "Send", "partial", {symbol: sym, custom: 1}, "", false, "act", kbd("@shares"))}</div></div>
-    </div>
-    <div class="result ${m ? m.cls : ""}">${m ? `<b>Last result:</b> ${esc(m.text)}` : "No action on this position yet."}
+          ${actionBtn(`ptc:${sym}`, "Send", "partial", {symbol: sym, custom: 1}, "", false, "act", kbd("@shares"))}</div></div>`;
+}
+function addRow(p, sym, open) {
+  if (p.asset_type !== "EQUITY") return "";
+  return `<div class="arow"><div class="al">Add shares<small>${ADD_MODE === "market" ? "at market" : `limit at ${ADD_MODE}, then market after 3 s`}</small></div>
+        <div class="ctl"><div class="seg">${[["mid", "Mid"], ["market", "Mkt"], ["ask", "Ask"], ["bid", "Bid"]].map(([v, t]) =>
+            `<button type="button" data-amode="${v}" class="${ADD_MODE === v ? "on" : ""}">${t}</button>`).join("")}</div>
+          <input class="in ms-input ad-input" data-symbol="${esc(sym)}" inputmode="numeric" placeholder="shares" value="${esc(AD_INPUT[sym] || "")}" style="width:84px">
+          <div class="seg" role="radiogroup" aria-label="Stop after adding">${[["price", "Keep stop"], ["risk", "Keep risk"]].map(([v, t]) =>
+            `<button type="button" role="radio" aria-checked="${ADD_STOP === v}" data-astop="${v}" class="${ADD_STOP === v ? "on" : ""}">${t}</button>`).join("")}</div>
+          <span class="gap"></span>
+          ${actionBtn(`add:${sym}`, `Add${AD_INPUT[sym] > 0 ? " " + AD_INPUT[sym] : ""}`, "add", {symbol: sym}, "", !lastState?.trading?.armed || !open, "act")}</div>
+        <div class="warnline mut" style="color:var(--muted)" data-addest="${esc(sym)}">${esc(addEstText(p, sym))}</div>
+        <div class="warnline mut" style="color:var(--muted)">${!lastState?.trading?.armed ? "An add is an entry: arm entries first. " : ""}Schwab drops your stop/target while the add fills, then one OCO goes back on the full size; 1R is recalculated.</div></div>`;
+}
+function resultBox(p, sym) {
+  const m = POS_MSG[sym], log = (lastState?.action_log || {})[sym] || [];
+  return `<div class="result ${m ? m.cls : ""}">${m ? `<b>Last result:</b> ${esc(m.text)}` : "No action on this position yet."}
       ${m && m.resolve ? ` <button type="button" class="btn sm" data-resolve-close="${esc(sym)}">Resolve: I checked thinkorswim</button>` : ""}</div>
-    <div class="log">${log.length ? log.slice(-10).reverse().map(e => `<div><b>${tET(e.t)}</b><span class="lg-${e.kind}">${esc(e.text)}</span></div>`).join("") : `<div>Nothing logged today.</div>`}</div>
-    ${hotkeyHelp()}
-  </div>`;
+    <div class="log">${log.length ? log.slice(-10).reverse().map(e => `<div><b>${tET(e.t)}</b><span class="lg-${e.kind}">${esc(e.text)}</span></div>`).join("") : `<div>Nothing logged today.</div>`}</div>`;
 }
 
 // Hotkeys act on the selected position by clicking its button, so a key does exactly what the
@@ -841,7 +906,7 @@ const HK_DEFAULT = Object.fromEntries(HK_ACTIONS.map(([a, , k]) => [a, k]));
 let HK = {...HK_DEFAULT};
 try { Object.assign(HK, JSON.parse(localStorage.getItem("hotkeys") || "{}")); } catch (e) {}
 let HK_EDIT = false, HK_CAPTURE = null;
-const HOTKEY_INPUTS = {"@stop": "ms-input:not(.tg-input):not(.pt-input)", "@target": "tg-input", "@shares": "pt-input"};
+const HOTKEY_INPUTS = {"@stop": "ms-input:not(.tg-input):not(.pt-input):not(.ad-input)", "@target": "tg-input", "@shares": "pt-input"};
 const HOTKEY_ENTER = {"tg-input": "tg", "pt-input": "ptc", "ms-input": "ms"};
 function hkName(k) {
   if (!k) return "none";
@@ -890,6 +955,7 @@ document.addEventListener("keydown", e => {
   if (t.classList?.contains("ms-input")) {
     if (e.key === "Escape") { t.blur(); return; }
     if (e.key !== "Enter") return;
+    if (t.classList.contains("ad-input")) { e.preventDefault(); t.blur(); return; }   // an add (an entry) is never sent by Enter
     const kind = ["tg-input", "pt-input"].find(c => t.classList.contains(c)) || "ms-input";
     e.preventDefault(); t.blur();
     document.querySelector(`button.cx[data-key="${HOTKEY_ENTER[kind]}:${CSS.escape(t.dataset.symbol)}"]`)?.click();
@@ -972,7 +1038,7 @@ document.addEventListener("click", async e => {
   if (CONFIRM.busy.has(key)) return;
   CONFIRM.busy.add(key);
   b.disabled = true; b.textContent = "Working...";
-  if (["symcancel", "close", "be", "move", "partial", "target", "trail"].includes(act)) {
+  if (["symcancel", "close", "be", "move", "partial", "target", "trail", "add"].includes(act)) {
     const sym = b.dataset.symbol;
     if (act === "move" && b.dataset.stop) {
       const fresh = (lastState?.positions || []).find(x => x.symbol === sym)?.trail?.level;
@@ -992,18 +1058,24 @@ document.addEventListener("click", async e => {
       POS_MSG[sym] = {cls: "bad", text: "Type how many to send first."};
       CONFIRM.busy.delete(key); if (lastState) render(lastState); return;
     }
+    if (act === "add" && !(parseInt(AD_INPUT[sym]) > 0)) {
+      POS_MSG[sym] = {cls: "bad", text: "Type how many shares to add first."};
+      CONFIRM.busy.delete(key); if (lastState) render(lastState); return;
+    }
     const ptLabel = b.dataset.custom ? `${PT_INPUT[sym]}` : `${Math.round(parseFloat(b.dataset.pct) * 100)}%`;
     POS_MSG[sym] = {cls: "warn", text: {close: "Closing at market...", symcancel: "Cancelling orders...",
                     be: "Moving stop to break-even...", move: `Moving stop to ${MS_INPUT[sym]}...`,
                     partial: `Sending partial ${ptLabel} (${PART_MODE})...`,
+                    add: `Adding ${AD_INPUT[sym]} (${ADD_MODE}, ${ADD_STOP === "risk" ? "keep risk" : "keep stop"})...`,
                     target: `Replacing target with ${b.dataset.custom ? TG_INPUT[sym] : b.dataset.r + "R"}...`,
                     trail: `Starting trailing stop ${unitTxt({unit: b.dataset.unit, value: b.dataset.value})}...`}[act]};
     if (SEL === sym && lastState) render(lastState);
     const url = {close: "/api/position/close", symcancel: "/api/position/cancel_orders",
                  be: "/api/position/move_stop", move: "/api/position/move_stop",
-                 partial: "/api/position/partial", target: "/api/position/set_target", trail: "/api/position/trail"}[act];
+                 partial: "/api/position/partial", add: "/api/position/add", target: "/api/position/set_target", trail: "/api/position/trail"}[act];
     const payload = act === "trail" ? {symbol: sym, unit: b.dataset.unit, value: parseFloat(b.dataset.value), basis: b.dataset.basis}
       : act === "target" ? (b.dataset.custom ? {symbol: sym, price: TG_INPUT[sym]} : {symbol: sym, r: parseFloat(b.dataset.r)})
+      : act === "add" ? {symbol: sym, shares: parseInt(AD_INPUT[sym]), mode: ADD_MODE, stop_mode: ADD_STOP}
       : act === "be" ? {symbol: sym, be: true}
       : act === "move" ? {symbol: sym, stop: MS_INPUT[sym]}
       : act === "partial" ? (b.dataset.custom ? {symbol: sym, shares: parseInt(PT_INPUT[sym]), mode: PART_MODE}
@@ -1012,10 +1084,26 @@ document.addEventListener("click", async e => {
     try {
       let r = await post(url, payload);
       // The server refuses a close/partial that may split a spread or uncover a short until confirmed.
-      if (r.needs_confirm && confirm(`${r.error}\n\nSend the ${act} for ${sym} anyway?`))
-        r = await post(url, {...payload, confirm_leg: true});
+      let sentPayload = payload;
+      if (r.needs_confirm && confirm(`${r.error}\n\nSend the ${act} for ${sym} anyway?`)) {
+        sentPayload = {...payload, confirm_leg: true};
+        r = await post(url, sentPayload);
+      }
+      // This rebuilds a trailing stop, which restarts from the current price: nothing was sent;
+      // the user keeps the stop fixed where it reached, restarts the trail, or sends nothing.
+      // The choice goes back with the trailing order and level it was made for.
+      if (r.needs_trail_choice) {
+        const restartTxt = r.start ? `at about ${r.start}` : "from the current price";
+        const choice = r.reached && confirm(`${r.error}\n\nOK: keep the stop FIXED at ${r.reached} (the trail ends).\nCancel: other choices.`)
+          ? "fixed"
+          : confirm(`${r.reached ? "" : r.error + "\n\n"}Restart the trailing stop ${restartTxt}?\n\nOK: restart the trail.\nCancel: send nothing.`)
+            ? "restart" : null;
+        r = choice ? await post(url, {...sentPayload, trail_choice: choice, trail_order: r.trail_order, trail_reached: r.reached})
+                   : {ok: false, error: `Nothing sent: the ${act} was not sent and the trail keeps working.`};
+      }
       if (act === "move" && r.ok) MS_INPUT[sym] = "";
       if (act === "partial" && r.ok) PT_INPUT[sym] = "";
+      if (act === "add" && r.ok) AD_INPUT[sym] = "";
       if (act === "target" && r.ok) TG_INPUT[sym] = "";
       if (act === "trail" && r.ok) TRAIL_OPEN[sym] = false;
       POS_MSG[sym] = {cls: r.ok ? "ok" : "bad", text: r.ok ? (r.message || "Done.") : (r.error || r.message || "Failed."),
@@ -1079,7 +1167,7 @@ function renderClosed(rows) {
     h += `<tr><td class="xc">${tog}</td><td class="mut num">${tET(t.closed)}</td><td><b>${esc(t.display)}</b> <span class="tag ${t.side.toLowerCase()}">${t.side}</span></td>
       <td class="n">${qty(t.max_qty || t.exit_qty)}</td><td class="n mut">${px(t.avg_entry)} / ${px(t.avg_exit)}</td>
       <td class="n mut">${dur(t.hold_seconds)}</td>
-      <td class="n ${cls(t.net)}"><b>${t.net == null ? "unknown" : money(t.net)}</b></td><td>${flag}</td></tr>`;
+      <td class="n ${cls(t.net)}"><b>${t.net == null ? "unknown" : money(t.net)}</b></td><td>${flag}${window.journalCell ? journalCell(t) : ""}</td></tr>`;
     if (open) for (const e of ex) {
       const buy = e.qty > 0, eff = e.effect === "OPENING" ? "open" : e.effect === "CLOSING" ? "close" : "";
       h += `<tr class="exec"><td></td><td class="mut num">${tETs(e.time)}</td>
@@ -1162,13 +1250,15 @@ function render(st) {
   $("daylist").innerHTML = renderDayList(st);
   // Do not redraw the workbench while a price box has focus (it would eat the typing).
   const ae = document.activeElement?.classList;
-  if (!ae?.contains("ms-input") && !ae?.contains("trail-val")) $("workspace").innerHTML = renderWorkspace(p, st);
+  // Cockpit (cockpit.js) holds it while a ladder line is being dragged.
+  if (!ae?.contains("ms-input") && !ae?.contains("trail-val") && !window.HOLD_WORKSPACE) $("workspace").innerHTML = renderWorkspace(p, st);
   $("orders").innerHTML = renderOrders(st.orders || []);
   const nEntries = (st.orders || []).filter(o => o.cancellable).length;
   $("cancel-all-slot").innerHTML = nEntries > 1 ? cancelBtn("all", `Cancel all entries (${nEntries})`, {all: 1}) : "";
   $("carried").innerHTML = renderCarried(st);
   $("futures").innerHTML = renderFutures(st);
-  $("closed").innerHTML = renderClosed(st.closed || []);
+  // Held while you type in a trade's journal entry (it would eat the typing).
+  if (!document.activeElement?.closest?.("#closed .jr-keep")) $("closed").innerHTML = renderClosed(st.closed || []);
   $("age-account").innerHTML = ageLabel(st.freshness.account);
   $("age-orders").innerHTML = ageLabel(st.freshness.orders_today);
   $("age-tx").innerHTML = ageLabel(st.freshness.transactions);
@@ -1567,7 +1657,7 @@ function renderTrading(st) {
   }
   renderRiskButtons(RISK_CHOICES || t.risk_choices || [250, 375, 500, 750]);
   const rows = st.brackets || [];
-  if (!rows.length) { $("tickets-n").textContent = ""; $("t-brackets").innerHTML = `<div class="empty">No tickets sent today.</div>`; renderTicket(); return; }
+  if (!rows.length) { $("tickets-n").textContent = ""; $("t-brackets").innerHTML = `<div class="empty">No entries today.</div>`; renderTicket(); return; }
   let h = "";
   $("tickets-n").textContent = rows.length || "";
   for (const b of rows) {
@@ -1589,7 +1679,8 @@ function renderTrading(st) {
       : pl.state === "CLOSED" ? `<span class="mut">closed</span> ${$v(pl.realized)}`
       : pl.state === "PARTIAL" ? `<span class="mut">partial · realized</span> ${$v(pl.realized)} <span class="mut">· open</span> ${$v(pl.open)}`
       : `<span class="mut">open</span> ${$v(pl.open)}`;
-    h += `<div class="tkt"><span class="mut num">${tET(b.created)}</span> <span class="tag ${b.side.toLowerCase()}">${b.side}</span>
+    const src = b.source && b.source !== "EDGE" ? `<span class="tag" title="${b.source === "ADD" ? "Add shares from the workbench" : b.source === "TOS" ? "Entered in thinkorswim" : "Entered outside Edge Trader"}">${b.source === "SCHWAB" ? "OTHER" : esc(b.source)}</span> ` : "";
+    h += `<div class="tkt"><span class="mut num">${tET(b.created)}</span> ${src}<span class="tag ${b.side.toLowerCase()}">${b.side}</span>
       <b>${esc(b.display || b.symbol)}</b> ${qty(b.qty)}${b.asset_type === "OPTION" ? " ct" : ""} <span class="mut">@ ${esc(b.limit_price)} ·</span> ${res}
       <span class="tkt-p">${prot}</span></div>`;
   }
@@ -1688,11 +1779,19 @@ $("t-t1r").addEventListener("click", e => { const b = e.target.closest("button")
 $("t-go").addEventListener("click", submitTicket);
 async function toggleArm() {
   // Arming is confirmed so a stray click can never arm it; disarming is instant.
-  if (!T.armed && !confirm("Arm entries until the 16:00 close?\nOne click on Place trade will then send a real order.")) return;
+  if (!T.armed && !confirm("Arm entries until the close?\nOne click on Place trade will then send a real order.")) return;
   await post("/api/ticket/arm", {armed: !T.armed});
   tick();
 }
 $("t-arm").addEventListener("click", toggleArm);
+// Login pill: open the Schwab sign-in window (companion.login --reauth) on a confirmed click.
+$("auth").addEventListener("click", async () => {
+  if (!confirm("Sign in to Schwab again?\nA window opens with the browser sign-in: approve, then paste the address there.\nNo order is touched.")) return;
+  try {
+    const r = await post("/api/auth/login", {});
+    alert(r.ok ? r.message : (r.error || "Could not open the sign-in."));
+  } catch (e) { alert("Edge Trader did not answer. Run login.bat instead."); }
+});
 $("arm-chip").addEventListener("click", toggleArm);
 $("t-brackets").addEventListener("click", async e => {
   const b = e.target.closest("[data-resolve]"); if (!b) return;
@@ -1954,5 +2053,6 @@ setInterval(updateClock, 1000);
 setInterval(tick, 1000);
 tick();
 </script>
+<script src="/cockpit.js"></script>
 </body>
 </html>

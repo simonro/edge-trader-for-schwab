@@ -88,3 +88,23 @@ def test_live_r_comes_from_the_ticket_that_opened_the_position(tmp_path, monkeyp
     p._add_r_and_log(st, [], [])
     r = st["positions"][0]["r"]
     assert r["ticket_id"] == "a" and r["live_r"] == 1.5 and "alts" not in r
+
+
+def test_add_shares_recalculates_r_for_that_position_only(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch)
+    opener = {"ticket_id": "a", "side": "LONG", "entry": 100.0, "stop": 98.0, "rps": 2.0,
+              "first_fill": "2099-01-01T14:00:00+0000"}
+    p.trader.r_basis = lambda orders: {"XYZ": {**opener, "alts": []}}
+    p.trader.store.save_r_reset("XYZ", "LONG", "2099-01-01T14:00:00+00:00", 101.0, 99.5)
+    st = {"positions": [{"symbol": "XYZ", "side": "LONG", "qty": 300, "last": 103.0,
+                         "opened": "2099-01-01T14:00:00+00:00"}]}
+    p._add_r_and_log(st, [], [])
+    r = st["positions"][0]["r"]
+    assert r["entry"] == 101.0 and r["stop"] == 99.5 and r["rps"] == 1.5 and r["ticket_id"] == "a"
+    assert abs(r["live_r"] - 2 / 1.5) < 1e-9
+    st["positions"][0]["opened"] = "2099-01-01T15:00:00+00:00"      # a new trade: the reset does not apply
+    p._add_r_and_log(st, [], [])
+    assert st["positions"][0]["r"] is None
+    p.trader.store.save_r_reset("XYZ", "LONG", "2099-01-01T15:00:00+00:00", 101.0, None)   # trailing stop: no R
+    p._add_r_and_log(st, [], [])
+    assert st["positions"][0]["r"] is None

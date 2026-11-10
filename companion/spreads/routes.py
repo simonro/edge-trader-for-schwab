@@ -141,7 +141,9 @@ def register(app, trader, poller, guard, demo: bool = False) -> list[str]:
         if not trader.spreads.get(sid):
             return {"ok": False, "error": "No such spread."}
         if act == "clear":
-            trader.spreads.stops.clear(sid)
+            if not trader.spreads.stops.clear(sid):
+                return {"ok": False, "error": "The stop's close is being sent right now: too late to remove it. "
+                                              "Check thinkorswim."}
         elif act == "dismiss":
             trader.spreads.stops.dismiss(sid)
         else:

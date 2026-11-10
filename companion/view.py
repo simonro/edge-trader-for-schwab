@@ -81,6 +81,15 @@ def private_view(snap: dict) -> dict:
            "brackets": [b for b in snap.get("brackets") or [] if b.get("symbol") not in hidden],
            "action_log": {s: v for s, v in (snap.get("action_log") or {}).items() if s not in hidden},
            "balances": {}}
+    if snap.get("trading"):    # unclear closes: only the shown positions by name, the rest as a count
+        tr = snap["trading"]
+        shown = {p["symbol"] for p in out["positions"]}
+        unres = tr.get("unresolved") or []
+        out["trading"] = {**tr, "unresolved": [s for s in unres if s in shown],
+                          "unresolved_hidden": sum(1 for s in unres if s not in shown)}
+    if "spreads" in snap:      # a carried spread is hidden with its legs (strikes, size, stop would show)
+        out["spreads"] = [s for s in snap.get("spreads") or []
+                          if not any((l.get("symbol") or "") in hidden for l in s.get("legs") or [])]
     summary = snap.get("summary")
     if summary and summary.get("open_pnl"):
         o = summary["open_pnl"]
@@ -152,6 +161,7 @@ def _position_rows(account: dict, pend: list[PendingOrder], quotes: dict, book: 
             "open_pnl_pct": (open_pnl / (avg * size * mult) * 100) if avg else None,
             "day_pnl": _f(p.get("currentDayProfitLoss")), "held": _held(p, side, qty),
             "stop_price": ((min if side == "LONG" else max)(stop_prices) if stop_prices else None),
+            "stop_best": ((max if side == "LONG" else min)(stop_prices) if stop_prices else None),
             "target_price": ((max if side == "LONG" else min)(o.price for o in targets) if targets else None),
             "stop_qty": covered, "protection": protection, "pnl_at_stop": at_stop,
             "trail": trail,     # Schwab-held trailing stop; the poller adds its estimated level
@@ -165,6 +175,7 @@ def _position_rows(account: dict, pend: list[PendingOrder], quotes: dict, book: 
             # Partial exits of the current round trip so far: net $ (None when a basis is unknown).
             "realized_qty": open_trade.exit_qty if open_trade else 0.0,
             "realized": open_trade.net if open_trade and open_trade.exit_qty else None,
+            "fill_ids": list(open_trade.fills) if open_trade else [],
         })
     # Stable order: intraday, mixed, carried, then by symbol (rows must not jump as P&L moves).
     order = {"INTRADAY": 0, "MIXED": 1, "CARRIED": 2}
@@ -185,6 +196,7 @@ def _trade_row(t, fills_by_id: dict[str, Fill]) -> dict:
         "fees": t.fees, "net": t.net,
         "unresolved_qty": t.unresolved_qty, "multiplier": t.multiplier,
         "hold_seconds": (t.closed - t.opened).total_seconds() if t.closed and t.opened else None,
+        "fill_ids": list(t.fills),     # Schwab fills of this round trip (journal entries anchor to them)
         "executions": [{"time": f.time.isoformat(), "qty": f.qty, "price": f.price, "fees": f.fees,
                         "effect": f.effect, "order_id": f.order_id} for f in execs],
     }

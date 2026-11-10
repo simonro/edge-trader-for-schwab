@@ -118,6 +118,12 @@ def demo_state(now: datetime | None = None) -> dict:
          "ticket_id": "demo-4", "order_id": 8990, "detail": None},
     ]
     positions[1].update(realized_qty=30.0, realized=44.4)          # AMD: a partial is out
+    # Invented Schwab fill ids ("<activityId>:<item>"), so the journal panels can be tried.
+    # PLTR has none yet: it shows "waiting for Schwab's fill".
+    for p, ids in zip(positions, (["91001:0"], ["91011:0", "91012:0"], ["91051:0"], [], ["81041:0"])):
+        p["fill_ids"] = ids
+    for i, c in enumerate(closed):
+        c["fill_ids"] = [f"{70010 + 10 * i}:0", f"{70011 + 10 * i}:0"]
     for b in brackets:
         if b["entry_status"] == "FILLED":
             b.update(filled=float(b["qty"]), first_fill=b["created"])

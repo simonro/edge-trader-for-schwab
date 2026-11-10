@@ -52,6 +52,7 @@ create table if not exists auto_be_orders (
     ticket_id text, order_id integer, created text, primary key (ticket_id, order_id));
 create table if not exists companion_stops (symbol text, stop text, order_id integer, created text);
 create table if not exists ticket_r_stop (ticket_id text primary key, stop text, created text);
+create table if not exists r_resets (symbol text, side text, opened text, entry real, stop real, created text);
 create index if not exists ix_tx_time on transactions(time);
 create index if not exists ix_quotes on quotes(symbol, seen_at);
 """
@@ -277,6 +278,29 @@ class Store:
         with self._lock, self._con:
             self._con.execute("insert or ignore into ticket_r_stop values (?,?,?)", (ticket_id, str(stop), now_iso()))
             return self._con.execute("select stop from ticket_r_stop where ticket_id=?", (ticket_id,)).fetchone()[0]
+
+    def save_r_reset(self, symbol: str, side: str, opened: str, entry: float, stop: float | None) -> None:
+        """1R recalculated after Add Shares: the position (symbol, side, opened) gets a new average
+        entry and stop (stop None: no fixed stop, so no R). The newest reset for the position wins."""
+        with self._lock, self._con:
+            self._con.execute("insert into r_resets values (?,?,?,?,?,?)",
+                              (symbol, side, opened, float(entry), None if stop is None else float(stop), now_iso()))
+
+    def r_resets(self) -> dict[tuple[str, str, str], dict]:
+        """Newest reset per (symbol, side, opened)."""
+        with self._lock:
+            rows = self._con.execute("select symbol, side, opened, entry, stop from r_resets order by created").fetchall()
+        return {(r[0], r[1], r[2]): {"entry": r[3], "stop": r[4]} for r in rows}
+
+    def end_auto_be(self, symbol: str, detail: str) -> list[str]:
+        """Auto B/E tickets on the symbol that have not moved yet (PENDING, or SENDING: claimed and
+        waiting for the order lock) end as SKIPPED."""
+        with self._lock, self._con:
+            ids = [r[0] for r in self._con.execute(
+                "select ticket_id from auto_be where symbol=? and state in ('PENDING', 'SENDING')", (symbol,))]
+            self._con.executemany("update auto_be set state='SKIPPED', detail=?, updated=? where ticket_id=? "
+                                  "and state in ('PENDING', 'SENDING')", [(detail, now_iso(), t) for t in ids])
+        return ids
 
     def auto_be_orders(self, ticket_id: str) -> list[int]:
         with self._lock:

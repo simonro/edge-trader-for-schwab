@@ -22,7 +22,19 @@ from . import schwab
 def main() -> None:
     ap = argparse.ArgumentParser(description="Schwab sign-in for Edge Trader")
     ap.add_argument("--reauth", action="store_true", help="force a new sign-in even if the token is still valid")
+    ap.add_argument("--pause", action="store_true", help="wait for Enter before closing (the dashboard's Login button)")
     args = ap.parse_args()
+    try:
+        _run(args)
+    finally:
+        if args.pause:
+            try:
+                input("\n  Press Enter to close this window.")
+            except EOFError:
+                pass
+
+
+def _run(args) -> None:
 
     key = os.environ.get("SCHWAB_APP_KEY")
     secret = os.environ.get("SCHWAB_APP_SECRET")

@@ -23,11 +23,22 @@
   const css = document.createElement("style");
   css.textContent = `
     #ticket.spread-mode .tk > :not(#t-asset):not(#t-spread) { display: none !important; }
-    #t-spread { display: none; flex-direction: column; gap: 10px; }
+    #t-spread { display: none; flex-direction: column; gap: 8px; }
+    #sp-chain { max-height: 212px; }
+    .sp-act { display: grid; grid-template-columns: auto 1fr; gap: 8px; }
+    .sp-row3 { display: grid; grid-template-columns: 1.1fr 1fr 1fr; gap: 8px; }
+    .sp-row3 .seg button { padding: 0 4px; }
+    .sp-explbl { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .sp-explbl .tk-name { min-height: 0; margin: 0; text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 12px;
+                          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #sp-prevmsg:empty, #sp-msg:empty { display: none; }
+    .sp-act #sp-prev { height: 46px; padding: 0 14px; }
     #ticket.spread-mode #t-spread { display: flex; }
     #sp-chain tr.far td { background: rgba(229,83,75,.12); color: #fff; }
     #sp-chain tr.near td { background: var(--blue-bg); color: #fff; }
-    #sp-width .btn { height: 28px; padding: 0 10px; font-size: 12px; flex: none; }
+    #sp-width { flex-wrap: wrap; gap: 4px; min-width: 0; }
+    #sp-width .btn { height: 28px; padding: 0 6px; font-size: 12px; flex: none; }
+    #sp-width .btn small { margin-left: 2px; }
     #sp-go { height: 46px; font-size: 15px; width: 100%; }
     #sp-why { font-size: 12.5px; line-height: 1.45; }
     #sp-why .hd { font-size: 14px; font-weight: 700; margin-bottom: 3px; }
@@ -45,7 +56,25 @@
     .sp-bar .end { position: absolute; top: 12px; font-size: 11px; color: var(--muted); white-space: nowrap; }
     .sp-work .why { font-size: 12px; color: var(--muted); }
     .sp-work .seg { width: auto; }
-    .sp-work .arow > .why, .sp-work .arow > .warnline { grid-column: 1 / -1; }`;
+    .sp-work .arow > .why, .sp-work .arow > .warnline { grid-column: 1 / -1; }
+    @media (min-width: 1600px) {
+      main:has(#ticket.spread-mode) { grid-template-columns: 340px minmax(0, 1fr) 440px; }
+      .layout-cockpit main:has(#ticket.spread-mode) { grid-template-columns: 300px minmax(0, 1fr) 460px; } }
+    @media (min-width: 1300px) and (max-width: 1599px) {
+      main:has(#ticket.spread-mode) { grid-template-columns: 300px minmax(0, 1fr) 390px; }
+      .layout-cockpit main:has(#ticket.spread-mode) { grid-template-columns: 270px minmax(0, 1fr) 410px; } }
+    #sp-exp { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; }
+    #sp-exp .btn { height: 26px; padding: 0 4px; font-size: 11.5px; min-width: 0; justify-content: center; white-space: nowrap; overflow: hidden; }
+    #sp-exp > span { grid-column: 1 / -1; }
+    #sp-how { font-size: 12.5px; margin-top: -4px; }
+    .sp-q { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px;
+            margin-left: 4px; border: 1px solid var(--muted); border-radius: 50%; font-size: 10px; cursor: help; vertical-align: 1px; }
+    .sp-q .sp-tip { display: none; position: absolute; right: -110px; top: 20px; z-index: 60; width: 300px; padding: 8px 10px;
+            background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 18px rgba(0,0,0,.45);
+            color: var(--text); font-size: 12px; font-weight: 400; line-height: 1.45; letter-spacing: 0; text-transform: none; }
+    .sp-q:hover .sp-tip, .sp-q:focus .sp-tip { display: block; }
+    .sp-q .sp-tip b { color: var(--text); }
+    .sp-q .sp-tip div + div { margin-top: 4px; }`;
   document.head.appendChild(css);
 
   const asset = $("t-asset");
@@ -56,29 +85,32 @@
   const box = document.createElement("div");
   box.id = "t-spread";
   box.innerHTML = `
-    <div class="row2">
+    <div class="sp-row3">
       <div class="fld"><span class="lbl">Underlying</span><input class="in" id="sp-und" autocomplete="off" spellcheck="false" placeholder="SPX, META..."></div>
-      <div class="fld"><span class="lbl">Spread</span><div class="seg full" id="sp-kind"><button type="button" data-v="DEBIT">Debit (buy)</button><button type="button" data-v="CREDIT" class="on">Credit (sell)</button></div></div>
+      <div class="fld"><span class="lbl">Spread</span><div class="seg full" id="sp-kind"><button type="button" data-v="DEBIT" title="Debit: you buy the spread">Debit</button><button type="button" data-v="CREDIT" class="on" title="Credit: you sell the spread">Credit</button></div></div>
+      <div class="fld"><span class="lbl">Type</span><div class="seg full" id="sp-pc"><button type="button" data-v="CALL">Calls</button><button type="button" data-v="PUT" class="on">Puts</button></div></div>
     </div>
-    <div class="tk-name" id="sp-name"></div>
-    <div class="fld"><span class="lbl">Expiry</span><div class="expchips" id="sp-exp"><span class="mut" style="font-size:12px">Type the underlying.</span></div></div>
-    <div class="seg full" id="sp-pc"><button type="button" data-v="CALL">Calls</button><button type="button" data-v="PUT" class="on">Puts</button></div>
+    <div class="fld"><span class="lbl sp-explbl">Expiry<span class="tk-name" id="sp-name"></span></span><div class="expchips" id="sp-exp"><span class="mut" style="font-size:12px">Type the underlying.</span></div></div>
     <div class="hint" id="sp-how"></div>
     <div class="chain" id="sp-chain"><div class="empty">Pick an expiry.</div></div>
+    <div class="row2">
     <div class="fld"><span class="lbl">Width (the other strike)</span><div class="chips" id="sp-width"><span class="mut" style="font-size:12px">Pick a strike first.</span></div></div>
-    <div class="fld"><span class="lbl">Net price</span><div class="seg full" id="sp-entry"><button type="button" data-v="mid" class="on" title="Halfway between each leg's bid and ask: a better price, but it may not fill">Mid</button><button type="button" data-v="natural" title="The market's price right now on both legs (sell at the bid, buy at the ask): priced to fill at once">Natural</button><button type="button" data-v="limit" title="Your own net price: fills at that price or better">Lmt</button></div></div>
-    <div class="hint" id="sp-pricehelp"></div>
+    <div class="fld"><span class="lbl">Net price<span class="sp-q" tabindex="0" aria-label="What Mid, Natural and Lmt mean">?<span class="sp-tip">${
+      ["mid", "natural", "limit"].map(k => `<div>${esc(PRICE_HELP[k]).replace(/^(\w+):/, "<b>$1:</b>")}</div>`).join("")}</span></span></span><div class="seg full" id="sp-entry"><button type="button" data-v="mid" class="on" title="Halfway between each leg's bid and ask: a better price, but it may not fill">Mid</button><button type="button" data-v="natural" title="The market's price right now on both legs (sell at the bid, buy at the ask): priced to fill at once">Natural</button><button type="button" data-v="limit" title="Your own net price: fills at that price or better">Lmt</button></div></div>
+    </div>
     <div class="fld" id="sp-lmtfld" style="display:none"><span class="lbl">Limit (net per spread)</span><input class="in" id="sp-lmt" inputmode="decimal" autocomplete="off" placeholder="net price"></div>
-    <div class="fld"><span class="lbl">Size by</span><div class="seg full" id="sp-size"><button type="button" data-v="qty" class="on">Quantity</button><button type="button" data-v="risk">Risk $</button></div></div>
-    <div class="fld" id="sp-qtyfld"><span class="lbl">Spreads</span><input class="in" id="sp-qty" inputmode="numeric" autocomplete="off" value="1"></div>
+    <div class="row2">
+      <div class="fld"><span class="lbl">Size by</span><div class="seg full" id="sp-size"><button type="button" data-v="qty" class="on">Quantity</button><button type="button" data-v="risk">Risk $</button></div></div>
+      <div class="fld" id="sp-qtyfld"><span class="lbl">Spreads</span><input class="in" id="sp-qty" inputmode="numeric" autocomplete="off" value="1"></div>
+    </div>
     <div class="fld" id="sp-riskfld" style="display:none"><span class="lbl">Risk $ (the max loss of all the spreads together)</span>
       <div class="chips"><span class="chips" id="sp-risk" style="flex:1"></span><input class="in" id="sp-riskc" inputmode="decimal" placeholder="other $" style="width:90px"></div></div>
     <div class="planbox" id="sp-why" style="display:none"></div>
     <div class="planbox" id="sp-calc"><span class="mut">Pick the underlying, expiry and strikes.</span></div>
-    <div class="chips"><button type="button" class="btn sm spx" id="sp-prev">Check with Schwab</button><span class="tk-msg" id="sp-prevmsg"></span></div>
-    <button id="sp-go" class="btn buy spx" type="button" disabled>Send spread</button>
+    <div class="sp-act"><button type="button" class="btn spx" id="sp-prev">Check with Schwab</button><button id="sp-go" class="btn buy spx" type="button" disabled>Send spread</button></div>
+    <div class="tk-msg" id="sp-prevmsg"></div>
     <div class="tk-msg" id="sp-msg"></div>
-    <div class="hint">DAY limit, up to 20 spreads. No stop at Schwab (its API refuses stops on spreads): the most it can lose is the max loss.</div>`;
+    <div class="hint">DAY limit, up to 20. No stop at Schwab: the most it can lose is the max loss.</div>`;
   asset.insertAdjacentElement("afterend", box);
 
 
@@ -99,10 +131,10 @@
   const seg = (id, v) => [...$(id).children].forEach(x => x.classList.toggle("on", x.dataset.v === v));
   function renderHow() {
     const sell = S.kind === "CREDIT", st = STRAT[`${S.pc}|${S.kind}`];
-    $("sp-how").innerHTML = `<b class="${st.cls === "bull" ? "pos" : "neg"}">${st.name}: ${st.bias}</b> (wins ${st.how}). ` + esc(sell
+    $("sp-how").innerHTML = `<b class="${st.cls === "bull" ? "pos" : "neg"}">${st.name}: ${st.bias}</b>`;
+    $("sp-how").title = `Wins ${st.how}. ` + (sell
       ? "Click the strike you SELL (nearer the money), then the width: the strike you buy is further out."
       : "Click the strike you BUY (nearer the money), then the width: the strike you sell is further out.");
-    $("sp-pricehelp").textContent = PRICE_HELP[S.entry] || "";
   }
   function rows() { return ((S.chain && S.chain.rows) || []).filter(r => r.standard !== false); }
   function outward(near) {        // strikes further out of the money than the near one, nearest first
@@ -131,7 +163,7 @@
   function renderWidths() {
     const el = $("sp-width");
     if (!S.near) { el.innerHTML = `<span class="mut" style="font-size:12px">Pick a strike first.</span>`; return; }
-    const out = outward(S.near).slice(0, 6);
+    const out = outward(S.near).slice(0, 4);
     if (!out.length) { el.innerHTML = `<span class="mut" style="font-size:12px">No strike further out in this list.</span>`; return; }
     el.innerHTML = out.map(r => `<button type="button" class="btn${S.far && S.far.symbol === r.symbol ? " on" : ""}" data-sym="${esc(r.symbol)}">${fmtK(Math.abs(r.strike - S.near.strike))} <small class="mut">${fmtK(r.strike)}</small></button>`).join("");
   }
@@ -140,9 +172,10 @@
     if (!S.und) { el.innerHTML = `<span class="mut" style="font-size:12px">Type the underlying.</span>`; return; }
     if (S.exps.error) { el.innerHTML = `<span class="neg" style="font-size:12px">${esc(S.exps.error)}</span>`; return; }
     if (!S.exps.length) { el.innerHTML = `<span class="mut" style="font-size:12px">Loading expiries...</span>`; return; }
-    const lab = e => { const d = new Date(e.date + "T12:00:00");
-      return e.dte === 0 ? "0DTE" : `${d.toLocaleDateString("en-US", {weekday: "short"})} ${d.getDate()} ${MONTHS[d.getMonth()]}`; };
-    el.innerHTML = S.exps.slice(0, 8).map(e => `<button type="button" class="btn${e.date === S.exp ? " on" : ""}" data-exp="${e.date}" title="${e.date}">${lab(e)}<small>${e.dte}d</small></button>`).join("");
+    const day = e => new Date(e.date + "T12:00:00");
+    const lab = e => e.dte === 0 ? "0DTE" : `${day(e).getDate()} ${MONTHS[day(e).getMonth()]}`;
+    el.innerHTML = S.exps.slice(0, 10).map(e => `<button type="button" class="btn${e.date === S.exp ? " on" : ""}" data-exp="${e.date}"
+      title="${day(e).toLocaleDateString("en-US", {weekday: "long"})} ${e.date}">${lab(e)}${e.dte ? `<small>${e.dte}d</small>` : ""}</button>`).join("");
   }
   function showName() {
     const c = S.chain;
@@ -265,26 +298,22 @@
     if (!st || !p.ok) return "";
     const [n, f] = p.legs, kn = fmtK(n.strike), kf = fmtK(f.strike), call = p.put_call === "CALL";
     const sym = esc(p.underlying), d = new Date(p.expiration + "T12:00:00");
-    const exp = `${d.getDate()} ${MONTHS[d.getMonth()]}`, q = p.qty, sp = q === 1 ? "spread" : `${q} spreads`;
+    const exp = `${d.getDate()} ${MONTHS[d.getMonth()]}`;
     const above = call ? "below" : "above", beyond = call ? "above" : "below";
-    const lines = [`<div class="hd ${st.cls}">${st.name} · ${st.bias}</div>`];
-    if (p.kind === "CREDIT") {
-      lines.push(`<div>You collect <b>${money(Number(p.max_gain), false)}</b> now (${p.limit} × 100${q > 1 ? ` × ${q}` : ""}). You keep it all if ${sym} is <b>${above} ${kn}</b> at the close on ${exp}.</div>`);
-      lines.push(`<div>Breakeven <b>${p.breakeven}</b>. At or ${beyond} ${kf} you lose the most: <b class="neg">${money(Number(p.max_loss), false)}</b>.</div>`);
-    } else {
-      lines.push(`<div>You pay <b>${money(Number(p.max_loss), false)}</b> now (${p.limit} × 100${q > 1 ? ` × ${q}` : ""}): that is the most you can lose, if ${sym} is ${call ? "below" : "above"} ${kn} on ${exp}.</div>`);
-      lines.push(`<div>Breakeven <b>${p.breakeven}</b>. At or ${call ? "above" : "below"} ${kf} you make the most: <b class="pos">${money(Number(p.max_gain), false)}</b>.</div>`);
-    }
+    const lines = [];
+    if (p.kind === "CREDIT")
+      lines.push(`<div>Collect <b>${money(Number(p.max_gain), false)}</b>, kept if ${sym} is <b>${above} ${kn}</b> on ${exp}. Max loss <b class="neg">${money(Number(p.max_loss), false)}</b> at or ${beyond} ${kf}.</div>`);
+    else
+      lines.push(`<div>Pay <b>${money(Number(p.max_loss), false)}</b> (the max loss). Max gain <b class="pos">${money(Number(p.max_gain), false)}</b> at or ${call ? "above" : "below"} ${kf} on ${exp}.</div>`);
+    const facts = [`Breakeven <b>${p.breakeven}</b>`];
     if (und) {
-      const be = Number(p.breakeven), pct = (und - be) / und * 100, bull = st.bias === "BULLISH";
-      const room = bull ? pct : -pct;
-      lines.push(`<div>${sym} is <b>${px(und)}</b>: ${room >= 0 ? `${Math.abs(pct).toFixed(1)}% ${bull ? "above" : "below"} breakeven (it can move ${Math.abs(pct).toFixed(1)}% against you and still not lose)`
-        : `it needs a ${Math.abs(pct).toFixed(1)}% move ${bull ? "up" : "down"} to reach breakeven`}.</div>`);
+      const be = Number(p.breakeven), pct = (und - be) / und * 100, bull = st.bias === "BULLISH", room = bull ? pct : -pct;
+      facts.push(`${sym} ${px(und)}: ${room >= 0 ? `${Math.abs(pct).toFixed(1)}% cushion` : `needs ${Math.abs(pct).toFixed(1)}% ${bull ? "up" : "down"}`}`);
     }
     const short = rows().find(r => r.symbol === (p.kind === "CREDIT" ? n.symbol : f.symbol));
     if (short && short.delta != null)
-      lines.push(`<div class="mut">Short ${kind1(p, short)} delta ${Math.abs(short.delta).toFixed(2)}: roughly a ${Math.round(Math.abs(short.delta) * 100)}% chance it finishes in the money, ${p.kind === "CREDIT" ? "where you start giving back the credit (a loss only past breakeven)" : "your full gain"} (the market's rough estimate).</div>`);
-    lines.push(`<div class="mut">Wrong direction? ${st.bias === "BULLISH" ? "Bearish is Credit + Calls, or Debit + Puts." : "Bullish is Credit + Puts, or Debit + Calls."}</div>`);
+      facts.push(`<span class="mut" title="The market's rough odds that the short ${kind1(p, short)} finishes in the money">short Δ ${Math.abs(short.delta).toFixed(2)} (~${Math.round(Math.abs(short.delta) * 100)}% ITM)</span>`);
+    lines.push(`<div>${facts.join(" · ")}</div>`);
     return lines.join("");
   }
   const kind1 = (p, r) => `${fmtK(r.strike)}${p.put_call === "CALL" ? "C" : "P"}`;
@@ -300,10 +329,7 @@
       calc.innerHTML = (p.legs || []).map(l => `<div class="pr"><span>${legTxt(l, p.qty)}</span></div>`).join("")
         + (p.mid != null ? `<div class="pr"><span class="mut">Net mid / natural</span><span class="num">${p.mid} / ${p.natural}</span></div>` : "")
         + (p.ok ? `<div class="pr tot"><span>Limit (${kt})</span><span class="num">${p.limit}</span></div>
-          <div class="pr"><span class="mut">Width · breakeven</span><span class="num">${p.width} · ${p.breakeven}</span></div>
-          <div class="pr"><span>Max loss (1R)${p.qty > 1 ? ` <span class="mut">${p.qty} × ${money(Number(p.max_loss_each), false)}</span>` : ""}</span><span class="num neg">${money(-Number(p.max_loss))}</span></div>
-          <div class="pr"><span class="mut">Max gain</span><span class="num pos">${money(Number(p.max_gain))}</span></div>
-          <div class="pr"><span class="mut">Expires</span><span class="num">${esc(p.expiration)} · ${p.dte}d</span></div>` : "")
+          <div class="pr"><span>Max loss (1R)${p.qty > 1 ? ` <span class="mut">${p.qty} × ${money(Number(p.max_loss_each), false)}</span>` : ""} <span class="mut">· gain</span></span><span class="num"><span class="neg">${money(-Number(p.max_loss))}</span> <span class="mut">/</span> <span class="pos">${money(Number(p.max_gain))}</span></span></div>` : "")
         + (p.errors || []).map(e => `<div class="err">${esc(e)}</div>`).join("")
         + (p.warnings || []).map(w => `<div class="amb" style="font-size:12px">${esc(w)}</div>`).join("");
     }
@@ -311,9 +337,10 @@
     const spent = S.sentKey && S.sentKey === S.intentKey;
     go.disabled = !ready || S.busy || !T.armed || !live || spent;
     go.className = "btn spx " + (S.kind === "CREDIT" ? "sell" : "buy");
-    go.textContent = S.busy ? "Working..." : !T.armed ? "Entries disarmed" : spent ? "Sent (change the ticket for a new one)"
-      : ready ? `${S.kind === "CREDIT" ? "Sell" : "Buy"} ${p.qty} ${p.put_call.toLowerCase()} ${KIND_TXT[p.kind]} spread${p.qty === 1 ? "" : "s"} @ ${p.limit} · max loss ${money(Number(p.max_loss), false)}`
+    go.textContent = S.busy ? "Working..." : !T.armed ? "Entries disarmed" : spent ? "Sent"
+      : ready ? `${S.kind === "CREDIT" ? "Sell" : "Buy"} ${p.qty} ${p.put_call === "CALL" ? "Call" : "Put"} ${p.kind === "CREDIT" ? "Credit" : "Debit"} Spread${p.qty === 1 ? "" : "s"}`
       : "Send spread";
+    go.title = spent ? "Sent: change the ticket for a new one" : ready ? `${p.qty} at ${p.limit} net, max loss ${money(Number(p.max_loss), false)}` : "";
     $("sp-prev").disabled = !ready || S.busy || !live;
   }
   $("sp-prev").addEventListener("click", async () => {
@@ -467,7 +494,7 @@
       : s.status === "suspended" ? `<span class="amb"><b>Not watching right now</b>: ${esc(s.detail)}.</span> `
       : s.status === "paused" ? `<span class="mut">Paused: ${esc(s.detail)}.</span> `
       : s.status === "fired" ? `<span class="neg"><b>${s.send ? "Stop hit" : "Would have stopped out"}</b> at mid ${Number(s.fired_mid).toFixed(2)}.</span> `
-      : s.status === "sent" ? `<span class="${outcomeOf(s) === "sent" ? "amb" : "neg"}"><b>Stop used</b> (${outcomeOf(s)}): ${esc(String(s.sent_result || "").replace(/^\w+: /, ""))}.</span> ` : "";
+      : s.status === "sent" ? `<span class="${outcomeOf(s) === "sent" ? "amb" : "neg"}"><b>Stop used</b> (${outcomeOf(s)}): ${esc(sentText(s))}.</span> ` : "";
     return `<div class="arow"><div class="al">Stop<small>${(s ? s.send : W.ssend) ? "app-watched, sends" : "app watch only"}</small></div><div class="ctl">
         ${sp.state === "OPEN" ? `<div class="seg">${["0.5", "0.75"].map(v =>
           `<button type="button" data-spsr="${v}" class="${!W.sprice && W.sr === v ? "on" : ""}">-${v}R</button>`).join("")}</div>
@@ -484,9 +511,20 @@
     sent: ["Stop sent", "Watch it fill below.", "stop sent"],
     unclear: ["Stop sent, outcome UNCLEAR", "The close MAY be live: check thinkorswim, do NOT close again, then Resolve.", "stop outcome unclear, check thinkorswim"],
     closed: ["Stop hit, already closed", "Nothing was left to close.", "spread already closed"],
-    refused: ["Stop hit, NOT sent", "Close it yourself.", "stop not sent, close it"],
+    refused: ["Stop hit, NOT sent", null, null],      // advice from the spread's state now: refusedAdvice
   };
-  const outcomeOf = s => s.sent_result === "sending" ? "sending" : (String(s.sent_result || "").split(":")[0] in OUTCOME
+  // A refused (or watch-only) stop's advice depends on the spread NOW, never on when it fired: a spread
+  // already closed (by a click, a target or a close that was working) must never read "close it yourself",
+  // since a second close would open the opposite spread. [banner tail, spoken].
+  function refusedAdvice(sp) {
+    if (sp.state === "OPEN") return ["Nothing was sent: close it yourself if you still want out.", "stop not sent, close it"];
+    if (sp.state === "CLOSING") return ["A close is already working: do NOT close again.", "stop not sent, a close is working"];
+    if (sp.state === "CLOSED") return ["The spread is closed now: nothing to do. Do NOT close again (a second close would open the opposite spread).", "stop not sent, spread already closed"];
+    return ["Check thinkorswim first: do NOT close again until it shows the spread still held, then Resolve.", "stop not sent, check thinkorswim"];
+  }
+  // Older stored outcomes carried the advice in their text: drop it, the page decides now.
+  const sentText = s => String(s.sent_result || "").replace(/^\w+: /, "").replace(/;\s*close it yourself\.?/gi, "");
+  const outcomeOf = s => (s.sent_result === "sending" || s.sent_result === "queued") ? "sending" : (String(s.sent_result || "").split(":")[0] in OUTCOME
     ? String(s.sent_result).split(":")[0] : "refused");
   let WHY_OPEN = true;
   try { WHY_OPEN = localStorage.getItem("sp-why") !== "0"; } catch (e) {}
@@ -520,20 +558,20 @@
     const px2 = Number(s.price).toFixed(2), box = `margin-bottom:10px;padding:8px 10px;border:1px solid var(--red);background:var(--red-bg);color:var(--red);border-radius:6px;font-size:13px`;
     return s.send
       ? `<div style="${box}"><b>No stop order is at Schwab.</b> Edge Trader will SEND a close of everything held when the mid reaches ${px2}, only while the app is running and connected. If the app or the PC is off, nothing protects this spread. Use at your own risk.</div>`
-      : `<div style="${box}"><b>Stop ${px2} is an ALERT only.</b> No order is at Schwab and none will be sent: when it hits, the app only warns you. Close it yourself.</div>`;
+      : `<div style="${box}"><b>Stop ${px2} is an ALERT only.</b> No order is at Schwab and none will be sent: when it hits, the app only warns you.${sp.state === "OPEN" ? " Close it yourself." : ""}</div>`;
   }
   function stopBanner(sp) {
     const s = sp.stop;
     if (s && s.status === "sent") {
       const o = outcomeOf(s), box = `margin-bottom:10px;padding:8px 10px;border:1px solid var(--red);background:var(--red-bg);color:var(--red);border-radius:6px;font-size:13px`;
       if (o === "sending") return `<div style="${box}"><b>Stop hit:</b> sending the close...</div>`;
-      const [head, tail] = OUTCOME[o];
-      return `<div style="${box}"><b>${head}:</b> ${esc(String(s.sent_result || "").replace(/^\w+: /, ""))}. ${tail}</div>`;
+      const head = OUTCOME[o][0], tail = o === "refused" ? refusedAdvice(sp)[0] : OUTCOME[o][1];
+      return `<div style="${box}"><b>${head}:</b> ${esc(sentText(s))}. ${tail}</div>`;
     }
     if (!s || s.status !== "fired") return "";
     return `<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--red);background:var(--red-bg);color:var(--red);border-radius:6px;font-size:13px">
       <b>Would stop out now:</b> the mid reached ${Number(s.fired_mid).toFixed(2)} (stop ${Number(s.price).toFixed(2)}) at ${tET(s.fired_at)}.
-      ${s.send ? "Sending the close..." : "Watch-only: nothing was sent. Close it yourself if you want out."}
+      ${s.send ? "Sending the close..." : "Watch-only: nothing was sent. " + refusedAdvice(sp)[0].replace(/^Nothing was sent: c/, "C")}
       <button type="button" class="btn sm spx" data-spw="stopdismiss">Dismiss</button></div>`;
   }
 
@@ -620,7 +658,7 @@
     const resolve = CAN_RESOLVE.has(sp.state)
       ? `<button type="button" class="btn spx" data-spw="resolve">Resolve: I checked thinkorswim</button>` : "";
     return `<div class="lock">${esc(pt.root)} ${esc(pt.date)} ${esc(pt.strikes)} · ${esc(kindTxt(sp))}<small>companion spread</small></div>
-    <div class="work sp-work">
+    <div class="work sp-work" data-spid="${esc(sp.spread_id)}">
       ${stopBanner(sp)}${stopModeBanner(sp)}
       <div class="ident">
         <div><span class="sym">${esc(pt.root)} ${esc(pt.date)} ${esc(pt.strikes)}</span><span class="tags">
@@ -822,6 +860,9 @@
         opened: new Date(n.opened) <= new Date(f.opened) ? n.opened : f.opened,
         closed: new Date(n.closed) >= new Date(f.closed) ? n.closed : f.closed,
         hold_seconds: Math.max(n.hold_seconds || 0, f.hold_seconds || 0), status: legs.some(t => t.status === "ESTIMATED") ? "ESTIMATED" : n.status,
+        // The journal entry is the spread's own (its fills, first entry fill first), the one its workbench wrote.
+        fill_ids: Array.isArray(sp.fill_ids) && sp.fill_ids.length ? sp.fill_ids
+          : [...new Set([...(n.fill_ids || []), ...(f.fill_ids || [])])],
         executions: [...(n.executions || []), ...(f.executions || [])].sort((a, b) => (a.time || "").localeCompare(b.time || ""))});
     }
     if (!merged.length) return rows;
@@ -834,14 +875,58 @@
     for (const x of spreads) {
       const s = x.stop;
       if (!s || !["fired", "sent"].includes(s.status) || !s.fired_at) continue;
-      if ((s.status === "fired" && s.send) || s.sent_result === "sending") continue;     // spoken once it sent or failed
+      if ((s.status === "fired" && s.send) || s.sent_result === "sending" || s.sent_result === "queued") continue;     // spoken once it sent or failed
       const k = x.spread_id + "|" + s.fired_at + "|" + s.status;
       if (SPOKEN.has(k) || !VOICE_ON || VIEW) continue;           // only the main page speaks
       // Chrome only lets a page speak after a click on it: until then, try again on the next refresh.
       if (navigator.userActivation && !navigator.userActivation.hasBeenActive) continue;
-      const text = s.status === "fired" ? `${parts(x).root} spread would stop out` : `${parts(x).root} spread ${OUTCOME[outcomeOf(s)][2]}`;
+      const text = s.status === "fired" ? `${parts(x).root} spread would stop out` : `${parts(x).root} spread ${outcomeOf(s) === "refused" ? refusedAdvice(x)[1] : OUTCOME[outcomeOf(s)][2]}`;
       try { if (speak(text, true) !== false) SPOKEN.add(k); } catch (e) { /* no voice */ }
     }
+  }
+
+  // Cockpit's spread ladder (cockpit.js) reads this workbench through a narrow view, and can only fill
+  // its Stop or Target price box (the row then re-plans). The row's own button is what sends.
+  const BENCH = {
+    view(sp, st) {
+      const mine = W.sid === sp.spread_id && SPSEL === sp.spread_id;
+      const cp = mine && W.plan && W.plan.key === closeKey() ? W.plan : null, work = (cp && cp.working) || [];
+      return {t: terms(sp, st), value: valueOf(sp, st), held: held(sp, st), busy: BUSY.has(sp.spread_id),
+              sprice: mine ? W.sprice : "", tprice: mine ? W.tprice : "", ssend: mine ? !!W.ssend : !!(sp.stop && sp.stop.send),
+              splan: mine && W.splan && W.splan.key === stopKey() ? W.splan : null,
+              tplan: mine && W.tplan && W.tplan.key === targetKey() ? W.tplan : null, planned: !!cp,
+              target: work.find(w => w.role === "target") || null, close: work.find(w => w.role === "close") || null};
+    },
+    setPrice(sid, kind, v) {
+      if (sid !== SPSEL || sid !== W.sid || BUSY.has(sid)) return false;
+      if (kind === "stop") { W.sprice = v; W.splan = null; stopPlan(); }
+      else if (kind === "target") { W.tprice = v; W.tplan = null; targetPlan(); }
+      else return false;
+      if (lastState) render(lastState);
+      return true;
+    }};
+
+  // Today's tickets lists the page's stock and option tickets; a spread ticket is its own record, so its
+  // rows are added here: sent today (ET), with the spread's state and its P&L (closed: the merged row).
+  function addSpreadTickets(st, closedRows) {
+    const today = etDate(new Date());
+    const all = [...(st.spreads || []), ...(st.spreads_closed || [])]
+      .filter((x, i, a) => x.created && etDate(new Date(x.created)) === today && a.findIndex(y => y.spread_id === x.spread_id) === i)
+      .sort((a, b) => new Date(b.created) - new Date(a.created));
+    if (!all.length) return;
+    const $v = v => v == null ? `<span class="amb">unknown</span>` : `<b class="num ${cls(v)}">${money(v)}</b>`;
+    const h = all.map(sp => {
+      const pt = parts(sp), row = closedRows.find(r => r.symbol === sp.spread_id), t = sp.ticket || {};
+      const res = sp.state === "CLOSED" ? `<span class="mut">closed</span> ${$v(row ? row.net : null)}`
+        : ["OPEN", "CLOSING", "PARTIAL"].includes(sp.state) ? `<span class="mut">open</span> ${$v(pnlOf(sp, st))}`
+        : `<span class="mut">${esc(sp.state.replaceAll("_", " ").toLowerCase())}</span>`;
+      return `<div class="tkt"><span class="mut num">${tET(sp.created)}</span> <span class="tag ${sp.kind.endsWith("CREDIT") ? "short" : "long"}">${esc(kindTxt(sp).toUpperCase())}</span>
+        <b>${esc(pt.root)} ${esc(pt.date)} ${esc(pt.strikes)}</b> ${sp.qty} <span class="mut">@ ${t.entry_limit != null ? esc(String(t.entry_limit)) : "?"} ·</span> ${res}
+        <span class="tkt-p"><span class="tag ${TAGS[sp.state] || ""}">${esc(sp.state.replaceAll("_", " "))}</span></span></div>`;
+    }).join("");
+    const box = $("t-brackets"), n = box.querySelectorAll(".tkt").length;
+    box.innerHTML = h + (n ? box.innerHTML : "");
+    $("tickets-n").textContent = n + all.length;
   }
 
   const pageRender = render;
@@ -850,7 +935,9 @@
     if (SPSEL && !spreads.some(x => x.spread_id === SPSEL)) SPSEL = null;        // closed or resolved
     const legs = new Set(spreads.flatMap(x => x.legs.map(l => l.symbol)));
     if (SPSEL && SEL && SEL !== LAST_SEL) SPSEL = null;   // a click, a key or Carried picked a position
-    pageRender({...st, positions: (st.positions || []).filter(p => !legs.has(p.symbol)), closed: mergeClosed(st)});
+    const closedRows = mergeClosed(st);
+    pageRender({...st, positions: (st.positions || []).filter(p => !legs.has(p.symbol)), closed: closedRows});
+    try { addSpreadTickets(st, closedRows); } catch (e) { console.error("spread tickets", e); }
     if (SPSEL && SEL && SEL !== LAST_SEL) SPSEL = null;   // the page jumped to a new trade: follow it
     LAST_SEL = SEL;
     try {
@@ -864,7 +951,10 @@
       }
       const sp = spreads.find(x => x.spread_id === SPSEL);
       const typing = document.activeElement?.closest?.("#workspace input:not([type=checkbox])");
-      if (sp && !typing) $("workspace").innerHTML = workbench(sp, st);
+      if (sp && !typing && !window.HOLD_WORKSPACE) {         // held while a Cockpit ladder line is dragged
+        const h = workbench(sp, st);
+        $("workspace").innerHTML = window.COCKPIT_SPREAD ? window.COCKPIT_SPREAD(sp, st, h, BENCH) : h;
+      }
       if (S.on) renderPlan();
       announceStops(spreads);
     } catch (e) { console.error("spreads", e); }

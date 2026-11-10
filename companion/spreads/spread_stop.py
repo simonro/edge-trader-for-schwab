@@ -55,8 +55,11 @@ class StopWatch:
             # The app stopped mid-send: the close MAY be live. Fired with Send on but never sent: it never will be.
             store._con.execute("update spread_stops set sent_result = 'unclear: the app stopped while sending the close; "
                                "do NOT close again before checking thinkorswim' where sent_result = 'sending'")
+            # Queued (fired, waiting for the order lock) but never started: nothing was sent.
+            store._con.execute("update spread_stops set sent_result = 'refused: the app restarted before sending; "
+                               "nothing was sent' where sent_result = 'queued'")
             store._con.execute("update spread_stops set sent_at = ?, sent_result = 'refused: the app restarted before "
-                               "sending; close it yourself' where send = 1 and fired_at is not null and sent_at is null",
+                               "sending; nothing was sent' where send = 1 and fired_at is not null and sent_at is null",
                                (now_iso(),))
         # spread -> (count, last quote time, first quote time, the stop's set_at): a moved stop starts over
         self._obs: dict[str, tuple[int, float, float, str]] = {}
@@ -76,10 +79,15 @@ class StopWatch:
         out["send"] = bool(out["send"])
         return out
 
-    def set(self, sid: str, price: float, r: float | None, send: bool = False) -> None:
+    SENDING = "select 1 from spread_stops where spread_id = ? and sent_result = 'sending'"
+
+    def set(self, sid: str, price: float, r: float | None, send: bool = False) -> bool:
         """Watch this stop (replaces any earlier one, its would-fire and any earlier send). `send`: the user's
-        consent to ONE close when it fires."""
+        consent to ONE close when it fires. False (nothing changed) while this stop's close is being sent:
+        the claim and this check share the store lock, so a change either lands before the claim or is refused."""
         with self.store._lock, self.store._con:
+            if self.store._con.execute(self.SENDING, (sid,)).fetchone():
+                return False
             self.store._con.execute(
                 "insert into spread_stops (spread_id, price, r, set_at, send) values (?,?,?,?,?) on conflict "
                 "(spread_id) do update set price = excluded.price, r = excluded.r, set_at = excluded.set_at, "
@@ -88,15 +96,24 @@ class StopWatch:
         self._obs.pop(sid, None)
         self._event(sid, "set", None, f"stop {price:.2f}" + (f" ({r:g}R)" if r is not None else "")
                     + (", send when hit" if send else ", watch only"))
+        return True
 
     def claim_send(self, sid: str) -> str | None:
         """Claim this stop's ONE send, atomically (a fired stop with Send on that never sent): the claim
-        time, or None."""
+        time, or None. The claim is 'queued' (still removable) until `start_send` makes it 'sending'."""
         at = now_iso()
         with self.store._lock, self.store._con:
-            n = self.store._con.execute("update spread_stops set sent_at = ?, sent_result = 'sending' where spread_id = ? "
+            n = self.store._con.execute("update spread_stops set sent_at = ?, sent_result = 'queued' where spread_id = ? "
                                         "and send = 1 and fired_at is not null and sent_at is null", (at, sid)).rowcount
         return at if n == 1 else None
+
+    def start_send(self, sid: str, claim: str) -> bool:
+        """Queued -> sending, atomically, under the order lock: False when the stop was removed, set again or
+        switched to watch-only meanwhile (that consent is gone). After this, removing it is refused."""
+        with self.store._lock, self.store._con:
+            n = self.store._con.execute("update spread_stops set sent_result = 'sending' where spread_id = ? and "
+                                        "sent_at = ? and sent_result = 'queued' and send = 1", (sid, claim)).rowcount
+        return n == 1
 
     def record_send(self, sid: str, outcome: str, text: str, claim: str | None = None) -> None:
         """outcome: sent | unclear (the close MAY be live) | closed (nothing left) | refused (nothing sent).
@@ -110,14 +127,18 @@ class StopWatch:
         """The fire could not even start its send (the hook failed): used, and said so."""
         with self.store._lock, self.store._con:
             self.store._con.execute("update spread_stops set sent_at = ?, sent_result = ? where spread_id = ? and "
-                                    "sent_at is null", (now_iso(), f"refused: {why}; close it yourself"[:300], sid))
+                                    "sent_at is null", (now_iso(), f"refused: {why}; nothing was sent"[:300], sid))
         self._event(sid, "send_refused", None, why)
 
-    def clear(self, sid: str) -> None:
+    def clear(self, sid: str) -> bool:
+        """Remove the stop. False (kept) while its close is being sent: too late to take it back."""
         with self.store._lock, self.store._con:
+            if self.store._con.execute(self.SENDING, (sid,)).fetchone():
+                return False
             self.store._con.execute("delete from spread_stops where spread_id = ?", (sid,))
         self._obs.pop(sid, None)
         self._event(sid, "cleared")
+        return True
 
     def dismiss(self, sid: str) -> None:
         """The user saw the would-fire: keep watching the same stop. A stop that sent (or tried to) stays used."""

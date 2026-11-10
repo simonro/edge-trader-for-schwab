@@ -107,6 +107,45 @@ def index():
     return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-store"})
 
 
+LOGIN_PROC = None
+
+
+@app.post("/api/auth/login")
+def auth_login(request: Request):
+    """Open the Schwab sign-in (companion.login --reauth) in its own console window, on Simon's click.
+    A fixed command, nothing from the request is passed on. The new tokens go to the shared tokens.db,
+    which the running poller and the Scanner both read. Never opens a streamer."""
+    global LOGIN_PROC
+    _guard(request)
+    if DEMO:
+        return {"ok": False, "error": "Demo mode: no Schwab sign-in."}
+    if LOGIN_PROC is not None and LOGIN_PROC.poll() is None:
+        return {"ok": False, "error": "The sign-in window is already open."}
+    import subprocess
+    import sys
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe" and exe.with_name("python.exe").exists():
+        exe = exe.with_name("python.exe")          # the windowless server needs a console for the prompt
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    try:
+        LOGIN_PROC = subprocess.Popen([str(exe), "-m", "companion.login", "--reauth", "--pause"],
+                                      cwd=str(Path(__file__).resolve().parent.parent), creationflags=flags)
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not open the sign-in window: {exc}"}
+    return {"ok": True, "message": "Sign-in window opened. Approve in the browser, then paste the address there."}
+
+
+@app.get("/cockpit.js", include_in_schema=False)
+def cockpit_js():
+    """The Cockpit layout (a switch in the header; Classic stays the default)."""
+    return FileResponse(STATIC / "cockpit.js", media_type="text/javascript", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/cockpit.css", include_in_schema=False)
+def cockpit_css():
+    return FileResponse(STATIC / "cockpit.css", media_type="text/css", headers={"Cache-Control": "no-store"})
+
+
 ICON = Path(__file__).resolve().parent.parent / "assets" / "companion.ico"
 
 
@@ -167,6 +206,14 @@ async def ui_prefs_set(request: Request):
         if len(vals) != 4 or any(not (0 < v <= 100000) for v in vals):
             raise HTTPException(400, "four risk amounts above $0")
         prefs["riskChoices"] = vals
+    if "nostopOk" in body:
+        # Cockpit: positions Simon holds without a stop on purpose ("SYM|SIDE|QTY" -> when). A new
+        # size or side is a new key, so the alarm comes back by itself.
+        v = body["nostopOk"]
+        if not isinstance(v, dict) or len(v) > 200 or not all(
+                isinstance(k, str) and len(k) <= 80 and isinstance(t, str) and len(t) <= 40 for k, t in v.items()):
+            raise HTTPException(400, "nostopOk must be a small map of strings")
+        prefs["nostopOk"] = v
     cur = ui_prefs_get()
     cur.update(prefs)
     trader.store.set_setting("ui_prefs", json.dumps(cur))
@@ -252,7 +299,7 @@ async def ticket_preview(request: Request):
 @app.post("/api/ticket/submit")
 async def ticket_submit(request: Request):
     _guard(request)
-    return await run_in_threadpool(trader.submit, await request.json())
+    return await run_in_threadpool(trader.submit, await request.json(), poller._merged_orders(), set(poller.terminal))
 
 
 @app.post("/api/ticket/cancel")
@@ -318,7 +365,20 @@ async def position_partial(request: Request):
     prior = ((pos or {}).get("trail") or {}).get("level")
     return await run_in_threadpool(trader.take_partial, sym, body.get("pct"), body.get("shares"),
                                    poller._merged_orders(), set(poller.terminal), body.get("mode") or "mid", prior,
-                                   body.get("confirm_leg") is True)
+                                   body.get("confirm_leg") is True, _trail_choice(body), (pos or {}).get("trail"))
+
+
+@app.post("/api/position/add")
+async def position_add(request: Request):
+    """Add shares to an open stock position ({"shares": n, "mode": mid|market|ask|bid,
+    "stop_mode": price|risk}), then one exit OCO for the whole new size. An entry: needs arming."""
+    _guard(request)
+    body = await request.json()
+    sym = str(body.get("symbol") or "").upper().strip()
+    pos = next((p for p in (poller.snapshot().get("positions") or []) if p["symbol"] == sym), None)
+    return await run_in_threadpool(trader.add_shares, sym, body.get("shares"), body.get("mode") or "mid",
+                                   body.get("stop_mode") or "price", poller._merged_orders(), set(poller.terminal),
+                                   (pos or {}).get("opened"))
 
 
 @app.post("/api/position/set_target")
@@ -333,7 +393,17 @@ async def position_set_target(request: Request):
     pos = next((p for p in (poller.snapshot().get("positions") or []) if p["symbol"] == sym), None)
     return await run_in_threadpool(trader.set_target, sym, body.get("price"), float(r) if r else None,
                                    poller._merged_orders(), set(poller.terminal), pos and pos.get("r"),
-                                   ((pos or {}).get("trail") or {}).get("level"))
+                                   ((pos or {}).get("trail") or {}).get("level"), _trail_choice(body),
+                                   (pos or {}).get("trail"))
+
+
+def _trail_choice(body: dict) -> dict | None:
+    """A rebuild of a trailing stop asks first: "restart" or "fixed", for the trailing order and the
+    level the user was shown (sent back as trail_order / trail_reached)."""
+    c = body.get("trail_choice")
+    if c not in ("restart", "fixed"):
+        return None
+    return {"choice": c, "order": body.get("trail_order"), "reached": body.get("trail_reached")}
 
 
 @app.post("/api/position/trail")
@@ -349,13 +419,19 @@ async def position_trail(request: Request):
                                    pos and pos.get("r"), ((pos or {}).get("trail") or {}).get("level"))
 
 
-# Optional features (companion/spreads; a build may leave a feature out) add their own endpoints and
-# name the page scripts the dashboard loads for them.
+# Optional features (companion/journal, companion/spreads; a build may leave a feature out) add their own
+# endpoints and name the page scripts the dashboard loads for them. The journal goes first: its
+# /features/journal.js route must come before the spreads' /features/{name}.js.
+try:
+    from .journal import routes as _journal_routes
+except ImportError:
+    _journal_routes = None
 try:
     from .spreads import routes as _feature_routes
 except ImportError:
     _feature_routes = None
-FEATURES = _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
+FEATURES = (_journal_routes.register(app, poller.store, _guard, demo=DEMO) if _journal_routes else []) + (
+    _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else [])
 
 
 @app.post("/api/position/resolve_close")
