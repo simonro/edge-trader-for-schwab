@@ -5,5 +5,5 @@ python-dotenv>=1.0
 requests>=2.31
 certifi>=2026.10.19  # patched CA trust bundle
 pywebview>=6.2     # floating Entry / Manage windows (companion/floating.py)
-pytest>=8          # tests
+pytest>=9.2.0          # tests
 httpx>=0.27        # tests (FastAPI TestClient)
