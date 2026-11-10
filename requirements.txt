@@ -1,7 +1,7 @@
 schwabdev==4.0.0   # Schwab OAuth + Trader API client by Tyler Bowers, https://github.com/tylerebowers/Schwabdev (MIT)
 fastapi>=0.115
 uvicorn>=0.32
-python-dotenv>=1.0
+python-dotenv>=1.2.4
 requests>=2.31
 certifi>=2026.10.19  # patched CA trust bundle
 pywebview>=6.2     # floating Entry / Manage windows (companion/floating.py)
