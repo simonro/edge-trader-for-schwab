@@ -22,7 +22,7 @@ target, take partials, cancel or close. It runs on your own computer, next to th
 **What this is not:** not financial advice, not a signal service, not affiliated with or endorsed by
 Charles Schwab. Every screenshot below is invented demo data, not anyone's real account.
 
-![The dashboard: day trades on the left, the selected trade with its R ruler and actions in the middle, the New trade ticket on the right](docs/screenshot-dashboard.png)
+![The dashboard: open trades on the left, the selected trade with its price ladder and actions in the middle, the New trade ticket on the right](docs/screenshot-dashboard.png)
 
 [![Watch on YouTube: This Free Tool Is a Game Changer for thinkorswim Day Traders](docs/video-thumbnail.jpg)](https://youtu.be/41VQNmCN2r4)
 
@@ -86,9 +86,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   preview accepts it. Each spread then gets its own workbench: live P&L and R against the max loss,
   close all or part of it, a GTC profit target (25, 50 or 75% of the max gain, or your price) and an
   app-watched stop (see Good to know).
-- **Cockpit layout (new in 1.4.0):** a Layout switch in the header (Classic stays the default). The
-  selected trade gets a price ladder at true price spacing: last price, entry, stop, target and 1R
-  levels, with your exits as cards beside it. Drag a stop or target line to a new price: the drag only
+- **Cockpit layout (new in 1.4.0):** the page's layout from 1.4.0 on (it replaces the old Classic
+  layout). The selected trade gets a price ladder at true price spacing: last price, entry, stop,
+  target and 1R levels, with your exits as cards beside it. Drag a stop or target line to a new price: the drag only
   fills the price box, and nothing is sent until you click the button. Spreads get their own ladder
   (net price from 0 to the width, max gain and max loss in dollars and R). An attention bar lists what
   needs you: no stop, a stop that covers only part of the position, an order with an unclear outcome,
@@ -99,8 +99,8 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   recalculated from the new average entry.
 - **Today's tickets:** every entry of the day in one list, marked by where it came from: the New trade
   ticket, an Add shares (ADD), thinkorswim (TOS) or anywhere else (OTHER), with its protection and P&L.
-- **Workbench for the selected trade:** an R ruler (original stop, current stop, entry, 1R, targets,
-  price), stop to break-even, move stop, Schwab-held trailing stop (R, dollars or percent), replace
+- **Workbench for the selected trade:** the price ladder (original stop, current stop, entry, 1R,
+  targets, price), stop to break-even, move stop, Schwab-held trailing stop (R, dollars or percent), replace
   target, partials at the mid, market, ask or bid (the stop and target are rebuilt on the rest), cancel
   orders and close. On a trailing stop, a partial or a new target asks first: restart the trail from the
   current price, or keep the stop fixed at the level the trail reached.
@@ -115,9 +115,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 
 ## Screenshots
 
-**The selected trade.** The R ruler shows where price sits between your original stop, the current
-stop and the target. Trail options open in place, with where the trail would start and a warning when
-it would be looser than your stop.
+**The selected trade.** The price ladder shows where price sits between your original stop, the
+current stop and the target; drag a line to set a price, and the button sends. Trail options open in
+place, with where the trail would start and a warning when it would be looser than your stop.
 
 ![The workbench with the trailing stop options open](docs/screenshot-workbench.png)
 
@@ -130,11 +130,6 @@ risk before you send.
 credit, breakeven, the most you can lose, the short leg's delta), both legs, and the max loss as 1R.
 
 ![The spread ticket with a bull put spread planned](docs/screenshot-spread-ticket.png)
-
-**Cockpit layout.** The price ladder beside the selected trade's controls, with the attention bar on
-top. Drag a line to set the price; the button sends.
-
-![The Cockpit layout with the price ladder](docs/screenshot-cockpit.png)
 
 **Manage window.** The same controls in a small always-on-top window.
 

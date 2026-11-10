@@ -1,6 +1,5 @@
 /* Cockpit layout (body.layout-cockpit). Classic is untouched: every rule below is scoped. */
 .attn, .dock-tabs { display: none; }
-#layout-btn.on { color: #8db5ff; border-color: rgba(76,141,255,.55); }
 
 /* ---- KPI strip: one compact line instead of five tall tiles ---- */
 .layout-cockpit .stats { display: flex; gap: 0; align-items: stretch; background: var(--panel2); }
@@ -33,6 +32,10 @@
 /* ---- grid: open trades | workbench | ticket ---- */
 .layout-cockpit main { grid-template-columns: 300px minmax(0, 1fr) 420px; }
 @media (max-width: 1599px) { .layout-cockpit main { grid-template-columns: 270px minmax(0, 1fr) 380px; } }
+@media (max-width: 1299px) { .layout-cockpit main { grid-template-columns: 270px minmax(0, 1fr); }
+  .layout-cockpit main > #ticket { grid-column: 1 / -1; } .layout-cockpit main > #ticket .tk { max-width: 760px; } }
+@media (max-width: 1150px) { .layout-cockpit main { grid-template-columns: 1fr; } }
+@media (max-width: 1500px) { .layout-cockpit header { flex-wrap: wrap; height: auto; padding: 6px 12px; row-gap: 6px; } }
 
 /* ---- dock: four tables become tabs ---- */
 .layout-cockpit .bottom { display: block; margin: 10px 14px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); overflow: hidden; }

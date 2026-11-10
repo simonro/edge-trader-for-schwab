@@ -45,16 +45,6 @@ def main():
         page.wait_for_selector("#sp-why div", timeout=10000)
         page.wait_for_timeout(1500)
         page.locator("#ticket").screenshot(path=str(OUT / "screenshot-spread-ticket.png"))
-        # The Cockpit layout: the price ladder beside the selected trade's controls
-        c = browser.new_page(viewport={"width": 1680, "height": 1080}, device_scale_factor=2)
-        c.add_init_script("try { localStorage.setItem('layout', 'cockpit'); localStorage.setItem('voiceAlert', 'off'); } catch (e) {}")
-        c.goto(BASE, wait_until="networkidle")
-        c.wait_for_selector(".li[data-sel='NVDA']", timeout=20000)
-        c.wait_for_timeout(2000)
-        c.click(".li[data-sel='NVDA']")
-        c.wait_for_timeout(2000)
-        c.screenshot(path=str(OUT / "screenshot-cockpit.png"))
-        c.close()
         # The floating Manage window view
         m = browser.new_page(viewport={"width": 560, "height": 620}, device_scale_factor=2)
         m.goto(BASE + "/?view=manage", wait_until="networkidle")

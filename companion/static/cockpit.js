@@ -1,25 +1,15 @@
-// Cockpit layout for Edge Trader (a switch in the header; Classic stays the default).
+// Cockpit layout for Edge Trader: the main page's only layout since 1.4.0 (the floating Entry and
+// Manage windows keep their compact view).
 // It changes how the page looks, never what an order does: every order button here is the page's
 // own actionBtn (same data-key, same click handler, same server path and checks). Dragging a
 // ladder line only fills the same price box the Classic Move stop / Set target uses; nothing is
 // sent until Send is clicked.
 (() => {
   const ls = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } };
-  let ON = !VIEW && ls("layout") === "cockpit";
+  const ON = !VIEW;
   window.COCKPIT_ON = () => ON;
 
-  function applyLayout() {
-    document.body.classList.toggle("layout-cockpit", ON);
-    $("layout-btn").textContent = ON ? "Layout: Cockpit" : "Layout: Classic";
-    $("layout-btn").classList.toggle("on", ON);
-  }
-  $("layout-btn").addEventListener("click", () => {
-    ON = !ON; ls("layout", ON ? "cockpit" : "classic");
-    LD = null; window.HOLD_WORKSPACE = false;
-    applyLayout();
-    if (lastState) render(lastState);
-  });
-  applyLayout();
+  document.body.classList.toggle("layout-cockpit", ON);
 
   // ---- no stop by choice (server prefs, shared by every window) -----------------------------
   // Key "SYM|SIDE|QTY|OPENED": a new size, side or position is a new key, so the alarm comes back
