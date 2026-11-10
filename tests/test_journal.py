@@ -51,7 +51,7 @@ class FakeJournal:
         if path == "/api/accounts":
             return 200, [{"id": 1, "name": "Main"}, {"id": 4, "name": "Futures"}]
         if path == "/api/library":
-            return 200, {"strategies": [{"name": "Leader Long"}], "sources": [{"name": "Scanner"}],
+            return 200, {"strategies": [{"name": "Breakout Long"}], "sources": [{"name": "Scanner"}],
                          "tags": {"mistake": [{"name": "moved stop"}]}}
         if path == "/api/sync/edge-trader":
             if body["dry_run"]:
@@ -106,8 +106,8 @@ def test_test_reads_version_and_accounts(j):
 
 def test_entries_notes_and_day_note(j):
     ids = day_trade(j.store)
-    e = j.save_entry("TSLA", ids, {"strategy": "Leader Long", "emotional_state": "calm"}, {"mistake": ["moved stop"]})
-    assert e["id"] == "t7001" and e["fields"]["strategy"] == "Leader Long"
+    e = j.save_entry("TSLA", ids, {"strategy": "Breakout Long", "emotional_state": "calm"}, {"mistake": ["moved stop"]})
+    assert e["id"] == "t7001" and e["fields"]["strategy"] == "Breakout Long"
     e = j.save_entry("TSLA", ids, {"strategy": ""}, None)
     assert "strategy" not in e["fields"] and e["tags"] == {"mistake": ["moved stop"]}
     e = j.add_note("TSLA", ids, "held VWAP")
@@ -134,7 +134,7 @@ def test_payload_carries_fills_facts_events_notes(j):
         order(303, "TSLA", "SELL", "LIMIT", e1, status="CANCELED", price=386.0, closed=iso(T0 + timedelta(minutes=5))),
         order(304, "TSLA", "BUY", "LIMIT", iso(T0), status="FILLED", price=380.0),       # the entry: not an exit
     ])
-    j.save_entry("TSLA", ids, {"strategy": "Leader Long"}, None)
+    j.save_entry("TSLA", ids, {"strategy": "Breakout Long"}, None)
     j.add_note("TSLA", ids, "moved to B/E")
     j.save_day_note(datetime.now().date().isoformat(), "good day")
     payload, meta = j.build_payload()
@@ -143,7 +143,7 @@ def test_payload_carries_fills_facts_events_notes(j):
     (ann,) = payload["annotations"]
     assert ann["id"] == "t7001" and ann["fill_keys"] == ["7001", "7002"]
     f = ann["fields"]
-    assert (f["stop_loss"], f["target_price"], f["risk_per_trade"], f["strategy"]) == (378.5, 386.0, 150.0, "Leader Long")
+    assert (f["stop_loss"], f["target_price"], f["risk_per_trade"], f["strategy"]) == (378.5, 386.0, 150.0, "Breakout Long")
     assert f["risk_reward"] == 4.0 and f["r_multiple"] == round(200.0 / 150.0, 2)
     kinds = [(e["id"], e["kind"]) for e in payload["events"]]
     assert ("o301:set", "stop_set") in kinds and ("o302:set", "breakeven") in kinds
@@ -200,7 +200,7 @@ def test_demo_mode_never_syncs(tmp_path):
 
 def test_an_edit_made_after_the_preview_goes_out_next_time(j):
     ids = day_trade(j.store)
-    j.save_entry("TSLA", ids, {"strategy": "Leader Long"}, None)
+    j.save_entry("TSLA", ids, {"strategy": "Breakout Long"}, None)
     j.preview()
     import time as _t
     _t.sleep(1.1)
@@ -240,8 +240,8 @@ def test_entry_oco_children_count_even_when_the_entry_filled_late(j):
 
 def test_an_entry_is_found_by_any_of_its_fills(j):
     ids = day_trade(j.store)
-    j.save_entry("TSLA", ["7002:0"], {"strategy": "Leader Long"}, None)   # saved from a view that saw 7002 first
-    assert j.get_entry(ids)["fields"]["strategy"] == "Leader Long"
+    j.save_entry("TSLA", ["7002:0"], {"strategy": "Breakout Long"}, None)   # saved from a view that saw 7002 first
+    assert j.get_entry(ids)["fields"]["strategy"] == "Breakout Long"
     payload, _ = j.build_payload()
     assert [a["id"] for a in payload["annotations"]] == ["t7002"]
 
@@ -570,7 +570,7 @@ def test_an_excluded_trade_sends_no_entry_events_or_notes(j):
     a = txn(iso(T0), "COHR", 10, 100.0, 9101, aid=88001)
     b = txn(iso(T0 + timedelta(minutes=5)), "COHR", -10, 101.0, 9102, aid=88002)
     j.store.save_transactions([a, b])
-    j.save_entry("COHR", ["88001:0", "88002:0"], {"strategy": "Leader Long"}, None)
+    j.save_entry("COHR", ["88001:0", "88002:0"], {"strategy": "Breakout Long"}, None)
     j.add_note("COHR", ["88001:0", "88002:0"], "private thought")
     payload, _ = j.build_payload()
     assert payload["transactions"] == []
