@@ -51,6 +51,9 @@ name are refused). It needs no account and sends no telemetry.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
+- **Your trading journal**, only if you set it up and only when you press Apply: the Journal sync sends your
+  fills and your notes to the [Trading Journal AI](https://github.com/simonro/Trading-Journal-AI) address you
+  enter. It must be on this computer unless you tick "Allow a journal on another computer".
 
 ### API keys
 
@@ -97,6 +100,11 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   bid. **Keep stop** leaves the stop where it is (more dollars at risk); **Keep risk** moves the stop so
   the dollars at risk stay the same. Then ONE stop and target go back on the whole new size, and 1R is
   recalculated from the new average entry.
+- **Journal sync (new in 1.5.0):** send your trades to [Trading Journal AI](https://github.com/simonro/Trading-Journal-AI),
+  a free, open-source journal that also runs on your computer. Each trade gets its notes (strategy, source,
+  emotion, mistakes, entry and exit reasons, timed notes), its stop, target and close timeline, and its risk
+  and R; a day note goes with them. A spread syncs as one trade with its own timeline. Sync shows a preview
+  first; nothing is sent until you press Apply, and the journal backs itself up before it applies.
 - **Today's tickets:** every entry of the day in one list, marked by where it came from: the New trade
   ticket, an Add shares (ADD), thinkorswim (TOS) or anywhere else (OTHER), with its protection and P&L.
 - **Workbench for the selected trade:** the price ladder (original stop, current stop, entry, 1R,
