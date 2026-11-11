@@ -506,6 +506,20 @@
     runPreview();          // the old preview no longer matches what Apply would send
   }
 
+  // An option trade reads by direction, the way the journal shows it: a sold put or a put credit spread
+  // is Bullish, a bought put or a sold call Bearish. The journal stores the opening side (SHORT for a
+  // sold put); its trade name ends in _PUT_n or _CALL_n, and a vertical's strikes have a dash.
+  function sideTag(t) {
+    const side = String(t.side || "").toUpperCase();
+    const m = /_(?:([\d.]+)-[\d.]+|[\d.]+)_(PUT|CALL)_\d+$/.exec(String(t.trade_group || ""));
+    if (String(t.instrument_type || "").toUpperCase() !== "OPTION" || !m || !["LONG", "SHORT"].includes(side))
+      return `<span class="tag ${pick(side.toLowerCase(), ["long", "short"])}">${esc(t.side || "")}</span>`;
+    const opt = m[2], bull = (opt === "CALL") === (side === "LONG");
+    const what = m[1] ? `${opt === "PUT" ? "Put" : "Call"} ${side === "SHORT" ? "credit" : "debit"} spread`
+      : `${side === "SHORT" ? "Sold" : "Bought"} ${opt.toLowerCase()}`;
+    return `<span class="tag ${bull ? "long" : "short"}" title="${esc(what)}">${bull ? "BULLISH" : "BEARISH"}</span>`;
+  }
+
   function previewHtml(p) {
     const f = p.fills || {}, m = p.meta || {}, ev = p.events || {}, n = k => int(f[k]);
     const names = localNames();
@@ -518,7 +532,7 @@
     h += `<div class="jr-h">Journal trades<small>${trades.length ? plural(trades.length, "trade") + " new or rebuilt" : "none new or changed"}</small></div>`;
     if (trades.length) h += `<div class="jr-tbl"><table><tr><th>Date</th><th>Symbol</th><th>Type</th><th>Side</th><th>Account</th><th></th><th class="n">Net</th></tr>
       ${trades.map(t => `<tr><td class="num mut">${esc(t.date)}</td><td><b>${esc(t.ticker)}</b></td><td class="mut">${esc((t.instrument_type || "").toLowerCase())}</td>
-        <td><span class="tag ${pick(String(t.side || "").toLowerCase(), ["long", "short"])}">${esc(t.side || "")}</span></td><td>${acctCell(t)}</td>
+        <td>${sideTag(t)}</td><td>${acctCell(t)}</td>
         <td><span class="tag ${t.status === "new" ? "target" : "stop"}">${esc(t.status)}</span></td><td class="n ${cls(t.net_pnl)}">${money(t.net_pnl)}</td></tr>`).join("")}</table></div>`;
     const anns = p.annotations || [];
     const busyAnn = a => a.status !== "ok" || (a.fields || []).some(x => x.status !== "same") || (a.tags?.add || []).length || (a.tags?.remove || []).length;
