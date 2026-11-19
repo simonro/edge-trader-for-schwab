@@ -61,6 +61,9 @@
 .cw-head .h .k { font: 600 10.5px var(--sans); text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
 .cw-head .h .v { font: 700 28px var(--mono); line-height: 1.1; }
 .cw-head .h .v.small { font: 600 16px var(--sans); line-height: 1.75; }
+.cw-head .h.parts { justify-content: center; gap: 4px; }
+.cw-head .h.parts .k { font-size: 11px; white-space: nowrap; }
+.cw-head .h.parts b { font: 700 14px var(--mono); letter-spacing: 0; margin-left: 4px; }
 .cw-head .exits { display: flex; flex-direction: column; gap: 6px; }
 .cw-head .exits .btn { height: 30px; }
 .cw-body { display: grid; grid-template-columns: minmax(380px, 440px) minmax(420px, 1fr); gap: 14px; flex: 1; min-height: 0; }

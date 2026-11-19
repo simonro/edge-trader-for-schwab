@@ -402,6 +402,18 @@
   }, true);
 
   // ---- the cockpit workbench -----------------------------------------------------------------
+  // After partials: what the exits already banked, and the whole round trip (banked + open). Realized is
+  // net of fees from your own fills; unknown when a basis is missing. Total R is against 1R on the shares
+  // the trade has held (still held + already sold), so a partial never inflates it.
+  function partsHtml(p, r) {
+    if (!(p.realized_qty > 0)) return "";
+    const known = p.realized != null && p.open_pnl != null, total = known ? p.realized + p.open_pnl : null;
+    const size = Math.abs(p.qty) + p.realized_qty, risk = r ? r.rps * size * (p.multiplier || 1) : null;
+    const tR = total != null && risk ? total / risk : null;
+    return `<div class="h parts" title="Realized: the partial exits of this round trip, net of fees. Total: realized plus open P&L${r ? `; R against 1R on ${qty(size)} ${p.asset_type === "OPTION" ? "contracts" : "shares"}` : ""}.">
+      <span class="k">Realized <b class="num ${cls(p.realized)}">${p.realized == null ? "unknown" : money(p.realized)}</b> <span class="mut">${qty(p.realized_qty)} ${p.asset_type === "OPTION" ? "ct" : "sh"}</span></span>
+      <span class="k">Total <b class="num ${cls(total)}">${total == null ? "unknown" : money(total)}</b>${tR != null ? ` <b class="num ${cls(tR)}">${fmtR(tR)}</b>` : ""}</span></div>`;
+  }
   function cockpitWorkspace(p, st) {
     const r = p.r, sym = p.symbol, noR = !r;
     const nOrders = (st.orders || []).filter(o => o.symbol === sym).length;
@@ -428,7 +440,7 @@
           <span class="tags"><span class="tag ${p.side.toLowerCase()}">${p.side} ${qty(p.qty)}</span>${prot}${p.held !== "INTRADAY" ? `<span class="tag">${p.held}</span>` : ""}${p.ledger === "MISMATCH" ? `<span class="tag est" title="Fill history does not match Schwab's quantity yet">ledger?</span>` : ""}</span>
           <div class="sub">${r ? "companion ticket" : "opened outside the ticket"}${p.opened ? ` · opened ${tET(p.opened)}` : ""} · entry ${px(r ? r.entry : p.avg_price)} · 1R ${r ? `${px(r.rps)} · ${money(r.rps * Math.abs(p.qty) * (p.multiplier || 1), false)}` : "not set"} · at stop ${p.pnl_at_stop == null ? "unknown" : money(p.pnl_at_stop)}</div></div>
         <div class="hero"><div class="h"><span class="k">Open P&amp;L</span><span class="v num ${cls(p.open_pnl)}">${money(p.open_pnl)}</span></div>
-          <div class="h"><span class="k">Live R</span><span class="v num ${r ? cls(r.live_r) : "mut small"}">${r ? fmtR(r.live_r) : "not set"}</span></div></div>
+          <div class="h"><span class="k">Live R</span><span class="v num ${r ? cls(r.live_r) : "mut small"}">${r ? fmtR(r.live_r) : "not set"}</span></div>${partsHtml(p, r)}</div>
         <div class="exits">${actionBtn(`sc:${sym}`, `Cancel orders (${nOrders})`, "symcancel", {symbol: sym}, "", nOrders === 0, "danger")}
           ${actionBtn(`cl:${sym}`, "Close position", "close", {symbol: sym}, "", !open, "danger-solid")}</div>
       </div>
